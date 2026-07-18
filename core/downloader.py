@@ -42,6 +42,48 @@ def net_opts(proxy: str | None = None, cookies_browser: str | None = None,
     return opts
 
 
+# YouTube does not gate every video the same way: from a datacenter IP some play
+# fine while others answer "Sign in to confirm you're not a bot". Which of
+# YouTube's player clients yt-dlp pretends to be changes that answer, so rather
+# than give up on the first refusal we work down this list. Order matters — the
+# default client is tried first and is fastest when it works.
+PLAYER_CLIENTS = [c.strip() for c in os.environ.get(
+    "YTDLP_PLAYER_CLIENTS", "default,tv_simply,ios,android_vr,mweb,web_embedded"
+).split(",") if c.strip()]
+
+_BOT_BLOCK_SIGNS = ("not a bot", "sign in to confirm", "http error 403", "forbidden",
+                    "unable to extract", "failed to extract")
+
+
+def _client_opts(client: str) -> dict:
+    """Extractor args pinning yt-dlp to one YouTube player client."""
+    if client == "default":
+        return {}
+    return {"extractor_args": {"youtube": {"player_client": [client]}}}
+
+
+def _with_client_fallback(url: str, base_opts: dict, run):
+    """Run `run(opts)` against each player client until one gets through.
+
+    Only bot-style refusals are retried; a genuinely missing or private video
+    fails the same way on every client and should surface at once.
+    """
+    if not is_youtube(url):
+        return run(base_opts)
+
+    last_error: Exception | None = None
+    for client in PLAYER_CLIENTS:
+        opts = {**base_opts, **_client_opts(client)}
+        try:
+            return run(opts)
+        except Exception as e:
+            low = str(e).lower()
+            if not any(sign in low for sign in _BOT_BLOCK_SIGNS):
+                raise
+            last_error = e
+    raise last_error if last_error else RuntimeError("Download failed")
+
+
 def get_available_qualities(url: str, proxy: str | None = None, cookies_browser: str | None = None,
                             cookies_file: str | None = None) -> list[str]:
     """Return available video heights like ['1080p', '720p', ...] (descending).
@@ -51,8 +93,12 @@ def get_available_qualities(url: str, proxy: str | None = None, cookies_browser:
     """
     ydl_opts = {"quiet": True, "no_warnings": True}
     ydl_opts.update(net_opts(proxy, cookies_browser, cookies_file))
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+
+    def probe(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    info = _with_client_fallback(url, ydl_opts, probe)
     heights = set()
     for fmt in info.get("formats", []):
         if fmt.get("vcodec") not in (None, "none") and fmt.get("height"):
@@ -92,18 +138,21 @@ def download_video(url: str, quality: str | None = None, progress_hook=None, pro
     if progress_hook:
         ydl_opts["progress_hooks"] = [progress_hook]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        if not info:
-            raise RuntimeError("Could not extract video info")
+    def fetch(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise RuntimeError("Could not extract video info")
 
-        filename = ydl.prepare_filename(info)
-        base = os.path.splitext(filename)[0]
-        path = base + ".mp4"
-        if not os.path.exists(path):
-            # merge_output_format usually yields .mp4, but fall back to the raw name
-            path = filename
-        if not os.path.exists(path):
-            raise RuntimeError("Downloaded file not found")
+            filename = ydl.prepare_filename(info)
+            base = os.path.splitext(filename)[0]
+            path = base + ".mp4"
+            if not os.path.exists(path):
+                # merge_output_format usually yields .mp4, but fall back to the raw name
+                path = filename
+            if not os.path.exists(path):
+                raise RuntimeError("Downloaded file not found")
 
-        return path, info.get("title", "video"), info.get("duration") or 0
+            return path, info.get("title", "video"), info.get("duration") or 0
+
+    return _with_client_fallback(url, ydl_opts, fetch)
