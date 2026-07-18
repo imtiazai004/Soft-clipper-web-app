@@ -513,6 +513,8 @@ def get_config(user: str = Depends(auth.current_user)):
         "cookies_file": cfg.get("cookies_file", ""),
         # true only in the packaged .exe — the "Add to Desktop" button needs a real exe
         "packaged": bool(getattr(sys, "frozen", False)),
+        # so Settings can tell the truth about where a saved key ends up
+        "multi_user": auth.MULTI_USER,
     }
 
 

@@ -25,6 +25,7 @@ export default function App() {
   const [hasKey, setHasKey] = useState(false)
   const [keyPreview, setKeyPreview] = useState(null)
   const [packaged, setPackaged] = useState(false)
+  const [multiUser, setMultiUser] = useState(false)
   const [proxy, setProxy] = useState('')
   const [cookiesBrowser, setCookiesBrowser] = useState('')
   const [cookiesFile, setCookiesFile] = useState('')
@@ -72,6 +73,7 @@ export default function App() {
   useEffect(() => {
     api.get('/api/config').then((c) => {
       setHasKey(c.has_key); setKeyPreview(c.key_preview); setPackaged(!!c.packaged)
+      setMultiUser(!!c.multi_user)
       setProxy(c.proxy || ''); setCookiesBrowser(c.cookies_browser || ''); setCookiesFile(c.cookies_file || '')
     }).catch(() => {})
     api.get('/api/video').then((v) => { if (v.loaded) setVideo(v) }).catch(() => {})
@@ -211,8 +213,12 @@ export default function App() {
           </div>
         </div>
 
-        <button className="btn sm" onClick={() => setShowSettings(true)}>
-          {hasKey ? `🔑 API Key (${keyPreview})` : '⚠️ Set API Key'}
+        {/* the API key is only one of the things in here — proxy and cookies
+            live in the same modal, and labelling the button after the key made
+            them impossible to find */}
+        <button className="btn sm" onClick={() => setShowSettings(true)}
+                title="API key, download proxy and YouTube cookies">
+          {hasKey ? '⚙️ Settings' : '⚠️ Set API Key'}
         </button>
 
         {packaged && (
@@ -558,6 +564,8 @@ export default function App() {
       {showSettings && (
         <SettingsModal
           hasKey={hasKey}
+          keyPreview={keyPreview}
+          multiUser={multiUser}
           initialProxy={proxy}
           initialCookiesBrowser={cookiesBrowser}
           initialCookiesFile={cookiesFile}
@@ -723,7 +731,7 @@ function EditModal({ clip, index, busy, onClose, onManual, onAi }) {
   )
 }
 
-function SettingsModal({ hasKey, initialProxy, initialCookiesBrowser, initialCookiesFile,
+function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCookiesBrowser, initialCookiesFile,
                         onClose, onSaved, onError }) {
   const [key, setKey] = useState('')
   const [proxy, setProxy] = useState(initialProxy || '')
@@ -755,13 +763,19 @@ function SettingsModal({ hasKey, initialProxy, initialCookiesBrowser, initialCoo
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h3>🔑 Google Gemini API Key</h3>
+        <h2 style={{ marginBottom: 4 }}>⚙️ Settings</h2>
+
+        <h3 style={{ marginTop: 14 }}>🔑 Google Gemini API Key</h3>
         <p>
           Required for AI features (viral detection, transcription, teaser/reel).
           Get a free key at{' '}
           <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer">aistudio.google.com</a>
-          <br />Your key is stored locally on your PC (config.json).
-          {hasKey && <><br /><span style={{ opacity: 0.7 }}>A key is already saved — leave blank to keep it.</span></>}
+          <br />{multiUser
+            ? 'Your key is kept on the server for your account only, and is cleared when the app restarts.'
+            : 'Your key is stored locally on your PC (config.json).'}
+          {hasKey && <><br /><span style={{ opacity: 0.7 }}>
+            A key is already saved{keyPreview ? ` (${keyPreview})` : ''} — leave blank to keep it.
+          </span></>}
         </p>
         <input ref={inputRef} className="input mb" type="password" placeholder="AIza..." value={key}
           onChange={(e) => setKey(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && save()} />
