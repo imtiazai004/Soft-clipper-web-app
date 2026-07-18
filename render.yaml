@@ -1,0 +1,26 @@
+# Render blueprint. Step 0 runs on the free plan on purpose: we are only
+# probing whether YouTube answers a request coming from a datacenter IP, which
+# costs almost no CPU or memory. Real clip rendering needs a paid plan and a
+# persistent disk — see the notes at the bottom.
+services:
+  - type: web
+    name: soft-clipper
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/video
+    envVars:
+      # set these in the Render dashboard, not here
+      - key: GEMINI_API_KEY
+        sync: false
+      # optional: only needed if YouTube blocks Render's IP
+      - key: DOWNLOAD_PROXY
+        sync: false
+
+# Before real use, switch to a paid plan and attach a disk:
+#
+#   plan: standard          # 2 GB RAM — free tier's 512 MB will OOM on encode
+#   disk:
+#     name: media
+#     mountPath: /app/data   # downloads/ and clips/ must move here to survive
+#     sizeGB: 20             # deploys, and need a retention policy
