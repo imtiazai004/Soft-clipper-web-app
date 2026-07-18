@@ -61,17 +61,23 @@ def get_available_qualities(url: str, proxy: str | None = None, cookies_browser:
 
 
 def download_video(url: str, quality: str | None = None, progress_hook=None, proxy: str | None = None,
-                   cookies_browser: str | None = None, cookies_file: str | None = None):
+                   cookies_browser: str | None = None, cookies_file: str | None = None,
+                   out_dir: str | None = None):
     """Download best video+audio merged to mp4. quality is like '1080p' or None for best<=1080.
 
     proxy: optional http/https/socks proxy URL for users whose ISP blocks the source.
     cookies_browser / cookies_file: see net_opts() — needed to get past YouTube 403.
+    out_dir: where to write. The server passes a per-user folder so two people
+    downloading at once can't land on each other's files; the desktop app leaves
+    it unset and keeps using DOWNLOAD_DIR.
     Returns (path, title, duration_seconds).
     """
     height = int(quality.rstrip("p")) if quality else 1080
+    target_dir = out_dir or DOWNLOAD_DIR
+    os.makedirs(target_dir, exist_ok=True)
 
     ydl_opts = {
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title).60s.%(ext)s"),
+        "outtmpl": os.path.join(target_dir, "%(title).60s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
         "merge_output_format": "mp4",

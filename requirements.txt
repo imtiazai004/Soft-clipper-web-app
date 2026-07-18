@@ -1,6 +1,7 @@
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.9      # FastAPI needs this for the video upload form
+itsdangerous>=2.2.0          # signs the login cookie (Starlette SessionMiddleware)
 yt-dlp>=2026.1.1
 google-genai>=1.0.0
 youtube-transcript-api>=1.0.0

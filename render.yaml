@@ -1,26 +1,50 @@
-# Render blueprint. Step 0 runs on the free plan on purpose: we are only
-# probing whether YouTube answers a request coming from a datacenter IP, which
-# costs almost no CPU or memory. Real clip rendering needs a paid plan and a
-# persistent disk — see the notes at the bottom.
+# Render blueprint.
+#
+# The free plan is fine for smoke-testing the deploy, but not for real use: it
+# has 512 MB of RAM and no disk, so an encode will OOM and every clip vanishes
+# on restart. Switch to the paid plan and disk below before the team uses this.
 services:
   - type: web
     name: soft-clipper
     runtime: docker
     plan: free
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /api/video
+    healthCheckPath: /api/me
     envVars:
-      # set these in the Render dashboard, not here
+      # Accounts, as "alice:pw1,bob:pw2". This is what turns on multi-user mode:
+      # unset, the app runs as the single-user desktop build with no login.
+      - key: APP_USERS
+        sync: false          # set in the dashboard — it holds passwords
+
+      # Signs the login cookie. Generated once and kept, so a deploy doesn't
+      # sign the whole team out.
+      - key: SESSION_SECRET
+        generateValue: true
+
+      # Shared Gemini key, used when a user hasn't set their own in Settings.
       - key: GEMINI_API_KEY
         sync: false
-      # optional: only needed if YouTube blocks Render's IP
+
+      # How many clips may render at once. Each one can eat a core and a few
+      # hundred MB, so this is what stops a busy afternoon killing the box.
+      - key: RENDER_SLOTS
+        value: "2"
+
+      # Only needed if YouTube starts refusing the server's IP. It answered
+      # fine when this was first deployed, so it is deliberately left unset.
       - key: DOWNLOAD_PROXY
         sync: false
 
-# Before real use, switch to a paid plan and attach a disk:
+# Before the team uses this, change the above to:
 #
-#   plan: standard          # 2 GB RAM — free tier's 512 MB will OOM on encode
+#   plan: standard
+#   envVars:
+#     - key: DATA_ROOT
+#       value: /var/data          # must point at the mount below
 #   disk:
 #     name: media
-#     mountPath: /app/data   # downloads/ and clips/ must move here to survive
-#     sizeGB: 20             # deploys, and need a retention policy
+#     mountPath: /var/data
+#     sizeGB: 20
+#
+# Without DATA_ROOT on a mounted disk, every download and clip is lost on each
+# deploy and restart. 20 GB also needs a retention policy — video fills it fast.

@@ -2,16 +2,22 @@ async function json(res) {
   if (!res.ok) {
     let msg = `HTTP ${res.status}`
     try { msg = (await res.json()).detail || msg } catch { /* ignore */ }
-    throw new Error(msg)
+    const e = new Error(msg)
+    // the gate watches for this to send an expired session back to the login screen
+    e.status = res.status
+    throw e
   }
   return res.json()
 }
 
+// credentials: the login cookie must ride along, including when the frontend is
+// served from a different origin than the API
 export const api = {
-  get: (path) => fetch(path).then(json),
+  get: (path) => fetch(path, { credentials: 'include' }).then(json),
   post: (path, body) =>
     fetch(path, {
       method: 'POST',
+      credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body || {}),
     }).then(json),

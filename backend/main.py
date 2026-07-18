@@ -1,11 +1,21 @@
 """FastAPI backend for Soft Clipper.
 
 Serves the built React frontend (frontend/dist) and exposes a job-based API
-over the core/ modules. Single-user local app -> module-level session state.
+over the core/ modules.
+
+The app runs in one of two shapes, decided by whether APP_USERS is set:
+
+  * desktop  — one local user, no login, files next to the .exe (the original)
+  * server   — several signed-in users who must never see each other's videos,
+               clips, jobs or settings; each gets their own directory tree
+
+Everything that used to be module-level single-user state is now keyed by user
+id, and every endpoint resolves its caller through auth.current_user.
 
 Run:  .venv\\Scripts\\python.exe -m uvicorn backend.main:app --port 8501
 """
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -13,12 +23,14 @@ import time
 import uuid
 import zipfile
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
 
+from backend import auth
 from core import ai, captions, downloader, transcript, utils, video
 
 # ── path setup (works both as source and as a bundled PyInstaller exe) ────────
@@ -32,6 +44,10 @@ else:
 
 os.chdir(DATA_DIR)
 
+# On Render this points at the mounted disk, so clips survive a deploy. Left
+# unset it resolves to the app folder, which is what the desktop build wants.
+DATA_ROOT = os.environ.get("DATA_ROOT") or DATA_DIR
+
 # make bundled ffmpeg/ffprobe reachable via the plain "ffmpeg" calls in core/
 _bin = os.path.join(BUNDLE_DIR, "bin")
 if os.path.isdir(_bin):
@@ -39,67 +55,164 @@ if os.path.isdir(_bin):
 
 app = FastAPI(title="Soft Clipper")
 
+# signs the login cookie; harmless in desktop mode where nothing reads it
+app.add_middleware(SessionMiddleware, secret_key=auth.session_secret(),
+                   session_cookie="soft_clipper", same_site="lax", https_only=False)
+
+_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],  # vite dev
+    allow_origins=_origins or ["http://localhost:5173", "http://127.0.0.1:5173"],  # vite dev
+    allow_credentials=True,     # the login cookie has to travel with API calls
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── session state (single local user) ─────────────────────────────────────────
-session = {
-    "video_path": None,
-    "video_title": None,
-    "video_duration": 0.0,
-    "video_url": None,
-    "transcript_segments": None,
-    "transcript_source": None,
-    "proxy_path": None,
-    "clips": [],  # [{name, path, meta}]
-}
+
+# ── per-user storage ─────────────────────────────────────────────────────────
+def user_root(user: str) -> str:
+    """Where this user's files live.
+
+    Desktop mode keeps the original flat layout so an existing install still
+    finds its downloads and clips. Server mode gives every user their own
+    subtree — the first half of keeping them apart, the other half being the
+    ownership check in clip_file().
+    """
+    if not auth.MULTI_USER:
+        return DATA_ROOT
+    # the user id reaches the filesystem, so allow nothing that could climb out
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", user) or "user"
+    return os.path.join(DATA_ROOT, "users", safe)
+
+
+def user_downloads(user: str) -> str:
+    path = os.path.join(user_root(user), "downloads")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def user_clips(user: str) -> str:
+    path = os.path.join(user_root(user), "clips")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# ── session state (one per user) ─────────────────────────────────────────────
+def new_session() -> dict:
+    return {
+        "video_path": None,
+        "video_title": None,
+        "video_duration": 0.0,
+        "video_url": None,
+        "transcript_segments": None,
+        "transcript_source": None,
+        "proxy_path": None,
+        "clips": [],  # [{name, path, meta}]
+    }
+
+
+sessions: dict[str, dict] = {}
+_sessions_lock = threading.Lock()
+
+
+def get_session(user: str) -> dict:
+    with _sessions_lock:
+        return sessions.setdefault(user, new_session())
+
+
+# in-memory settings per user; desktop mode still uses config.json on disk
+user_configs: dict[str, dict] = {}
+
+
+def load_user_config(user: str) -> dict:
+    if not auth.MULTI_USER:
+        return utils.load_config()
+    return dict(user_configs.get(user, {}))
+
+
+def save_user_config(user: str, cfg: dict) -> None:
+    if not auth.MULTI_USER:
+        utils.save_config(cfg)      # desktop: persist next to the .exe
+    else:
+        user_configs[user] = cfg    # server: one user's settings stay their own
+
 
 # ── job system ────────────────────────────────────────────────────────────────
 jobs: dict[str, dict] = {}
 
+# Encoding is the expensive part: each render can eat a core and hundreds of MB,
+# so a handful of users hitting "cut" together would OOM the box. Jobs past the
+# limit wait their turn instead of all starting at once.
+_render_slots = threading.BoundedSemaphore(int(os.environ.get("RENDER_SLOTS", "2")))
 
-def start_job(target, *args) -> str:
+
+def _prune_jobs() -> None:
+    """Drop finished jobs after a while so the dict can't grow forever."""
+    cutoff = time.time() - 3600
+    for jid, j in list(jobs.items()):
+        if j["status"] in ("done", "error") and j.get("finished_at", 0) < cutoff:
+            jobs.pop(jid, None)
+
+
+def start_job(user: str, target, *args) -> str:
     job_id = uuid.uuid4().hex[:12]
-    jobs[job_id] = {"status": "running", "progress": 0.0, "message": "Starting...", "result": None, "error": None}
+    jobs[job_id] = {"status": "running", "progress": 0.0, "message": "Starting...",
+                    "result": None, "error": None, "user": user}
+    _prune_jobs()
 
     def runner():
+        job = jobs[job_id]
+        if not _render_slots.acquire(blocking=False):
+            job["message"] = "Waiting for a free slot..."
+            _render_slots.acquire()
         try:
-            result = target(jobs[job_id], *args)
-            jobs[job_id].update(status="done", progress=1.0, result=result, message="Done")
+            result = target(job, *args)
+            job.update(status="done", progress=1.0, result=result, message="Done")
         except Exception as e:
-            jobs[job_id].update(status="error", error=str(e), message=str(e))
+            job.update(status="error", error=str(e), message=str(e))
+        finally:
+            job["finished_at"] = time.time()
+            _render_slots.release()
 
     threading.Thread(target=runner, daemon=True).start()
     return job_id
 
 
+def owned_job(job_id: str, user: str) -> dict:
+    """A job the caller owns. Others are 404, not 403 — a stranger's job id
+    should not even confirm it exists."""
+    job = jobs.get(job_id)
+    if not job or job.get("user") != user:
+        raise HTTPException(404, "Job not found")
+    return job
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
-def get_api_key() -> str:
-    key = utils.load_config().get("gemini_api_key", "")
+def get_api_key(user: str) -> str:
+    """The user's own Gemini key, else the shared one from the environment."""
+    key = load_user_config(user).get("gemini_api_key", "") or os.environ.get("GEMINI_API_KEY", "")
     if not key:
         raise RuntimeError("Gemini API key is not set — add it in Settings")
     return key
 
 
-def get_proxy() -> str | None:
+def get_proxy(user: str) -> str | None:
     """Optional download proxy for users whose ISP blocks the video source."""
-    return utils.load_config().get("proxy", "").strip() or None
+    return (load_user_config(user).get("proxy", "").strip()
+            or os.environ.get("DOWNLOAD_PROXY", "").strip() or None)
 
 
-def get_cookies() -> dict:
+def get_cookies(user: str) -> dict:
     """Optional cookie source, as kwargs for the downloader.
 
     Sending a logged-in browser's cookies is what gets past YouTube's 403 /
     bot rejection, which anonymous requests hit on shared VPN and ISP IPs.
     """
-    cfg = utils.load_config()
+    cfg = load_user_config(user)
     return {
-        "cookies_browser": cfg.get("cookies_browser", "").strip() or None,
-        "cookies_file": cfg.get("cookies_file", "").strip() or None,
+        # a server has no browser to read cookies out of; only a file works there
+        "cookies_browser": (cfg.get("cookies_browser", "").strip() or None) if not auth.MULTI_USER else None,
+        "cookies_file": cfg.get("cookies_file", "").strip() or os.environ.get("COOKIES_FILE", "").strip() or None,
     }
 
 
@@ -118,7 +231,7 @@ _UNREACHABLE_SIGNS = (
 )
 
 
-def download_error_message(e: Exception) -> str:
+def download_error_message(e: Exception, user: str) -> str:
     """Turn a raw yt-dlp error into a user-friendly, actionable message.
 
     The two failure modes need opposite fixes, so keep them apart: a VPN gets you
@@ -126,7 +239,7 @@ def download_error_message(e: Exception) -> str:
     """
     raw = str(e)
     low = raw.lower()
-    cookies = get_cookies()
+    cookies = get_cookies(user)
     has_cookies = bool(cookies["cookies_browser"] or cookies["cookies_file"])
 
     if any(sign in low for sign in _BOT_BLOCK_SIGNS):
@@ -136,6 +249,12 @@ def download_error_message(e: Exception) -> str:
                 "browser that isn't signed in — sign in to YouTube in that browser, or export "
                 "a fresh cookies.txt, then try again.\n\nDetails: " + raw
             )
+        if auth.MULTI_USER:
+            return (
+                "YouTube refused this download (403) — it treated the server as a bot. "
+                "Fix: set a download proxy (DOWNLOAD_PROXY) or supply a cookies.txt "
+                "(COOKIES_FILE) on the server.\n\nDetails: " + raw
+            )
         return (
             "YouTube refused this download (403). This usually means it treated the request "
             "as a bot — common on shared VPN IPs. Fix: in Settings, set 'Cookies from browser' "
@@ -144,7 +263,7 @@ def download_error_message(e: Exception) -> str:
         )
 
     if any(sign in low for sign in _UNREACHABLE_SIGNS):
-        if get_proxy():
+        if get_proxy(user):
             return (
                 "Couldn't reach the video. Your proxy may not be working — check or change "
                 "it in Settings.\n\nDetails: " + raw
@@ -157,76 +276,81 @@ def download_error_message(e: Exception) -> str:
     return raw
 
 
-def ensure_transcript(job: dict) -> list[dict]:
-    if session["transcript_segments"]:
-        return session["transcript_segments"]
-    if not session["video_path"]:
+def ensure_transcript(job: dict, user: str) -> list[dict]:
+    sess = get_session(user)
+    if sess["transcript_segments"]:
+        return sess["transcript_segments"]
+    if not sess["video_path"]:
         raise RuntimeError("Download a video first")
 
     # 1) YouTube captions
-    if session["video_url"] and downloader.is_youtube(session["video_url"]):
+    if sess["video_url"] and downloader.is_youtube(sess["video_url"]):
         job["message"] = "Fetching YouTube captions..."
-        vid = downloader.get_youtube_id(session["video_url"])
+        vid = downloader.get_youtube_id(sess["video_url"])
         segs = transcript.fetch_youtube_transcript(vid)
         if segs:
-            session.update(transcript_segments=segs, transcript_source="youtube")
+            sess.update(transcript_segments=segs, transcript_source="youtube")
             return segs
 
     # 2) Gemini audio transcription
-    key = get_api_key()
+    key = get_api_key(user)
     job["message"] = "Extracting audio..."
-    audio_path = os.path.join(downloader.DOWNLOAD_DIR, "_audio_temp.mp3")
-    if not transcript.extract_audio(session["video_path"], audio_path):
+    audio_path = os.path.join(user_downloads(user), "_audio_temp.mp3")
+    if not transcript.extract_audio(sess["video_path"], audio_path):
         raise RuntimeError("Audio extraction failed")
     try:
         job["message"] = "Transcribing with Gemini AI..."
         segs = ai.transcribe_audio(audio_path, key)
-        session.update(transcript_segments=segs, transcript_source="gemini")
+        sess.update(transcript_segments=segs, transcript_source="gemini")
         return segs
     finally:
         if os.path.exists(audio_path):
             os.remove(audio_path)
 
 
-def ensure_proxy(job: dict) -> str:
-    if session["proxy_path"] and os.path.exists(session["proxy_path"]):
-        return session["proxy_path"]
+def ensure_proxy(job: dict, user: str) -> str:
+    sess = get_session(user)
+    if sess["proxy_path"] and os.path.exists(sess["proxy_path"]):
+        return sess["proxy_path"]
     job["message"] = "Creating low-res proxy for AI..."
-    proxy = os.path.join(downloader.DOWNLOAD_DIR, "_proxy_temp.mp4")
-    ok, err = video.make_proxy(session["video_path"], proxy)
+    proxy = os.path.join(user_downloads(user), "_proxy_temp.mp4")
+    ok, err = video.make_proxy(sess["video_path"], proxy)
     if not ok:
         raise RuntimeError(f"Proxy error: {err}")
-    session["proxy_path"] = proxy
+    sess["proxy_path"] = proxy
     return proxy
 
 
-def clip_output_dir() -> str:
-    out = os.path.join(video.CLIPS_DIR, f"{utils.sanitize(session['video_title'] or 'video')[:30]}_{int(time.time())}")
+def clip_output_dir(user: str) -> str:
+    sess = get_session(user)
+    out = os.path.join(user_clips(user),
+                       f"{utils.sanitize(sess['video_title'] or 'video')[:30]}_{int(time.time())}")
     os.makedirs(out, exist_ok=True)
     return out
 
 
-def clip_to_api(c: dict) -> dict:
-    rel = os.path.relpath(c["path"], video.CLIPS_DIR).replace("\\", "/")
+def clip_to_api(user: str, c: dict) -> dict:
+    rel = os.path.relpath(c["path"], user_clips(user)).replace("\\", "/")
     size = os.path.getsize(c["path"]) if os.path.exists(c["path"]) else 0
     return {
-        "name": c["name"], "url": f"/clips/{rel}", "size_mb": round(size / 1e6, 1),
+        "name": c["name"], "url": f"/api/clips/file/{rel}", "size_mb": round(size / 1e6, 1),
         "meta": c.get("meta", {}), "render": c.get("render"),
     }
 
 
-def render_record(job: dict, rec: dict, out_dir: str) -> None:
+def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
     """Render a clip record (single or stitched) according to rec['render']."""
+    sess = get_session(user)
     r = rec["render"]
     segs = r["segments"]
     cap = r.get("captions", {})
     ass_file = None
-    if cap.get("enabled") and session["transcript_segments"]:
+    if cap.get("enabled") and sess["transcript_segments"]:
         if len(segs) == 1:
             cs = transcript.segments_between(
-                session["transcript_segments"], segs[0]["start_sec"], segs[0]["end_sec"])
+                sess["transcript_segments"], segs[0]["start_sec"], segs[0]["end_sec"])
         else:
-            cs = transcript.segments_for_stitched(session["transcript_segments"], segs)
+            cs = transcript.segments_for_stitched(sess["transcript_segments"], segs)
         if cs:
             ass_file = captions.build_ass(
                 cs, os.path.join(out_dir, "_cap_tmp.ass"),
@@ -236,12 +360,12 @@ def render_record(job: dict, rec: dict, out_dir: str) -> None:
     try:
         if len(segs) == 1:
             ok, err = video.render_clip(
-                session["video_path"], rec["path"], segs[0]["start_sec"], segs[0]["end_sec"],
+                sess["video_path"], rec["path"], segs[0]["start_sec"], segs[0]["end_sec"],
                 ratio=r.get("ratio"), ass_file=ass_file, reframe=r.get("reframe", "smart"),
             )
         else:
             ok, err = video.render_stitched_clip(
-                session["video_path"], rec["path"], segs,
+                sess["video_path"], rec["path"], segs,
                 ratio=r.get("ratio"), ass_file=ass_file, work_dir=out_dir,
                 reframe=r.get("reframe", "smart"),
             )
@@ -252,7 +376,7 @@ def render_record(job: dict, rec: dict, out_dir: str) -> None:
         raise RuntimeError(f"{rec['name']}: {err}")
 
 
-def rerender_clip(job: dict, rec: dict) -> None:
+def rerender_clip(job: dict, user: str, rec: dict) -> None:
     """Re-render an edited clip into a new versioned file, remove the old one."""
     out_dir = os.path.dirname(rec["path"])
     old_path = rec["path"]
@@ -260,7 +384,7 @@ def rerender_clip(job: dict, rec: dict) -> None:
     base = utils.sanitize(rec["name"])[:60] or "clip"
     rec["path"] = os.path.join(out_dir, f"{base}_v{rec['version']}.mp4")
     job["message"] = f"Re-rendering: {rec['name']}"
-    render_record(job, rec, out_dir)
+    render_record(job, user, rec, out_dir)
     if old_path != rec["path"] and os.path.exists(old_path):
         try:
             os.remove(old_path)
@@ -269,6 +393,11 @@ def rerender_clip(job: dict, rec: dict) -> None:
 
 
 # ── request models ────────────────────────────────────────────────────────────
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
 class ConfigBody(BaseModel):
     # all optional so each setting can be updated independently
     api_key: str | None = None
@@ -313,14 +442,41 @@ class ReelBody(BaseModel):
     captions: CaptionOpts = CaptionOpts()
 
 
+# ── auth endpoints ────────────────────────────────────────────────────────────
+@app.get("/api/me")
+def me(request: Request):
+    """Who am I — the frontend asks this first to decide whether to show login."""
+    if not auth.MULTI_USER:
+        return {"multi_user": False, "user": auth.LOCAL_USER}
+    user = request.session.get("user")
+    return {"multi_user": True, "user": user if user in auth.USERS else None}
+
+
+@app.post("/api/login")
+def login(body: LoginBody, request: Request):
+    if not auth.MULTI_USER:
+        return {"ok": True, "user": auth.LOCAL_USER}
+    if not auth.check_password(body.username.strip(), body.password):
+        raise HTTPException(401, "Wrong username or password")
+    request.session["user"] = body.username.strip()
+    return {"ok": True, "user": body.username.strip()}
+
+
+@app.post("/api/logout")
+def logout(request: Request):
+    request.session.clear()
+    return {"ok": True}
+
+
 # ── config endpoints ──────────────────────────────────────────────────────────
 @app.get("/api/config")
-def get_config():
-    cfg = utils.load_config()
+def get_config(user: str = Depends(auth.current_user)):
+    cfg = load_user_config(user)
     key = cfg.get("gemini_api_key", "")
+    shared_key = bool(os.environ.get("GEMINI_API_KEY"))
     return {
-        "has_key": bool(key),
-        "key_preview": f"...{key[-4:]}" if key else None,
+        "has_key": bool(key) or shared_key,
+        "key_preview": f"...{key[-4:]}" if key else ("shared" if shared_key else None),
         # not secret — sent back so the user can see/edit the values in Settings
         "proxy": cfg.get("proxy", ""),
         "cookies_browser": cfg.get("cookies_browser", ""),
@@ -331,8 +487,8 @@ def get_config():
 
 
 @app.post("/api/config")
-def set_config(body: ConfigBody):
-    cfg = utils.load_config()
+def set_config(body: ConfigBody, user: str = Depends(auth.current_user)):
+    cfg = load_user_config(user)
     # update only the fields the client actually sent
     if body.api_key is not None:
         cfg["gemini_api_key"] = body.api_key.strip()
@@ -342,12 +498,12 @@ def set_config(body: ConfigBody):
         cfg["cookies_browser"] = body.cookies_browser.strip()
     if body.cookies_file is not None:
         cfg["cookies_file"] = body.cookies_file.strip()
-    utils.save_config(cfg)
+    save_user_config(user, cfg)
     return {"ok": True}
 
 
 @app.post("/api/create-shortcut")
-def create_shortcut():
+def create_shortcut(user: str = Depends(auth.current_user)):
     """Create a 'Soft Clipper' shortcut on the user's Desktop (packaged app only)."""
     if not getattr(sys, "frozen", False):
         raise HTTPException(400, "Desktop shortcuts can only be created from the installed app")
@@ -379,15 +535,16 @@ def create_shortcut():
 
 # ── video endpoints ───────────────────────────────────────────────────────────
 @app.get("/api/qualities")
-def qualities(url: str):
+def qualities(url: str, user: str = Depends(auth.current_user)):
     try:
-        return {"qualities": downloader.get_available_qualities(url, proxy=get_proxy(), **get_cookies())}
+        return {"qualities": downloader.get_available_qualities(
+            url, proxy=get_proxy(user), **get_cookies(user))}
     except Exception as e:
-        raise HTTPException(400, download_error_message(e))
+        raise HTTPException(400, download_error_message(e, user))
 
 
 @app.post("/api/jobs/download")
-def job_download(body: DownloadBody):
+def job_download(body: DownloadBody, user: str = Depends(auth.current_user)):
     def work(job):
         def hook(d):
             if d.get("status") == "downloading":
@@ -403,23 +560,24 @@ def job_download(body: DownloadBody):
         job["message"] = "Fetching video info..."
         try:
             path, title, duration = downloader.download_video(
-                body.url.strip(), body.quality, progress_hook=hook, proxy=get_proxy(), **get_cookies())
+                body.url.strip(), body.quality, progress_hook=hook,
+                proxy=get_proxy(user), out_dir=user_downloads(user), **get_cookies(user))
         except Exception as e:
-            raise RuntimeError(download_error_message(e))
+            raise RuntimeError(download_error_message(e, user))
         if not duration:
             duration = video.get_video_info(path)["duration"]
-        session.update(
+        get_session(user).update(
             video_path=path, video_title=title, video_duration=duration,
             video_url=body.url.strip(), transcript_segments=None,
             transcript_source=None, proxy_path=None, clips=[],
         )
         return {"title": title, "duration": duration, "video_url": "/api/video/stream"}
 
-    return {"job_id": start_job(work)}
+    return {"job_id": start_job(user, work)}
 
 
-def load_local_video(path: str) -> dict:
-    """Point the session at a video file already on disk."""
+def load_local_video(user: str, path: str) -> dict:
+    """Point the user's session at a video file already on disk."""
     try:
         info = video.get_video_info(path)
         duration = info.get("duration") or 0
@@ -427,7 +585,8 @@ def load_local_video(path: str) -> dict:
         duration = 0
     if not duration:
         raise HTTPException(400, "Couldn't read that file — is it a video?")
-    session.update(
+    sess = get_session(user)
+    sess.update(
         video_path=path,
         video_title=os.path.splitext(os.path.basename(path))[0],
         video_duration=duration,
@@ -437,11 +596,11 @@ def load_local_video(path: str) -> dict:
         proxy_path=None,
         clips=[],
     )
-    return {"title": session["video_title"], "duration": duration, "video_url": "/api/video/stream"}
+    return {"title": sess["video_title"], "duration": duration, "video_url": "/api/video/stream"}
 
 
 @app.post("/api/video/upload")
-async def upload_video(file: UploadFile = File(...)):
+async def upload_video(file: UploadFile = File(...), user: str = Depends(auth.current_user)):
     """Take a video the user picked or dropped in the browser.
 
     A native file dialog would avoid this copy, but Windows won't let a
@@ -450,7 +609,8 @@ async def upload_video(file: UploadFile = File(...)):
     """
     name = os.path.basename(file.filename or "video")
     ext = os.path.splitext(name)[1].lower() or ".mp4"
-    dest = os.path.join(downloader.DOWNLOAD_DIR, f"{utils.sanitize(os.path.splitext(name)[0])[:60]}{ext}")
+    dest = os.path.join(user_downloads(user),
+                        f"{utils.sanitize(os.path.splitext(name)[0])[:60]}{ext}")
     try:
         # stream to disk in chunks — a multi-GB video must never be held in memory
         with open(dest, "wb") as out:
@@ -464,7 +624,7 @@ async def upload_video(file: UploadFile = File(...)):
         await file.close()
 
     try:
-        return load_local_video(dest)
+        return load_local_video(user, dest)
     except HTTPException:
         if os.path.exists(dest):     # not a video — don't leave the junk behind
             os.remove(dest)
@@ -472,65 +632,69 @@ async def upload_video(file: UploadFile = File(...)):
 
 
 @app.get("/api/video")
-def video_state():
-    if not session["video_path"] or not os.path.exists(session["video_path"]):
+def video_state(user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    if not sess["video_path"] or not os.path.exists(sess["video_path"]):
         return {"loaded": False}
     return {
         "loaded": True,
-        "title": session["video_title"],
-        "duration": session["video_duration"],
-        "url": session["video_url"],
+        "title": sess["video_title"],
+        "duration": sess["video_duration"],
+        "url": sess["video_url"],
         "stream_url": "/api/video/stream",
-        "transcript_source": session["transcript_source"],
+        "transcript_source": sess["transcript_source"],
     }
 
 
 @app.get("/api/video/stream")
-def video_stream():
-    if not session["video_path"] or not os.path.exists(session["video_path"]):
+def video_stream(user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    if not sess["video_path"] or not os.path.exists(sess["video_path"]):
         raise HTTPException(404, "No video loaded")
-    return FileResponse(session["video_path"], media_type="video/mp4")
+    return FileResponse(sess["video_path"], media_type="video/mp4")
 
 
 # ── AI endpoints ──────────────────────────────────────────────────────────────
 @app.post("/api/jobs/detect")
-def job_detect(body: DetectBody):
-    if not session["video_path"]:
+def job_detect(body: DetectBody, user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    if not sess["video_path"]:
         raise HTTPException(400, "Download a video first")
 
     def work(job):
-        key = get_api_key()
+        key = get_api_key(user)
         if body.mode == "visual":
-            proxy = ensure_proxy(job)
+            proxy = ensure_proxy(job, user)
             job["message"] = "AI is watching the video (this can take a while)..."
             job["progress"] = 0.4
             moments = ai.detect_viral_moments_visual(
-                proxy, session["video_duration"], key,
+                proxy, sess["video_duration"], key,
                 num_clips=body.num_clips, min_len=body.min_len, max_len=body.max_len,
                 user_query=body.query,
             )
         else:
-            ensure_transcript(job)
+            ensure_transcript(job, user)
             job["message"] = "AI is finding viral moments..."
             job["progress"] = 0.5
             moments = ai.detect_viral_moments(
-                transcript.transcript_to_prompt_text(session["transcript_segments"]),
-                session["video_duration"], key,
+                transcript.transcript_to_prompt_text(sess["transcript_segments"]),
+                sess["video_duration"], key,
                 num_clips=body.num_clips, min_len=body.min_len, max_len=body.max_len,
                 user_query=body.query,
             )
-        return {"moments": moments, "transcript_source": session["transcript_source"]}
+        return {"moments": moments, "transcript_source": sess["transcript_source"]}
 
-    return {"job_id": start_job(work)}
+    return {"job_id": start_job(user, work)}
 
 
 @app.post("/api/jobs/cut")
-def job_cut(body: CutBody):
-    if not session["video_path"]:
+def job_cut(body: CutBody, user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    if not sess["video_path"]:
         raise HTTPException(400, "Download a video first")
 
     def work(job):
-        out_dir = clip_output_dir()
+        out_dir = clip_output_dir(user)
         produced = []
         n = len(body.clips)
         for i, c in enumerate(body.clips):
@@ -549,41 +713,42 @@ def job_cut(body: CutBody):
                     "captions": body.captions.model_dump(),
                 },
             }
-            render_record(job, rec, out_dir)
+            render_record(job, user, rec, out_dir)
             produced.append(rec)
 
-        session["clips"] = produced
-        return {"clips": [clip_to_api(c) for c in produced]}
+        sess["clips"] = produced
+        return {"clips": [clip_to_api(user, c) for c in produced]}
 
-    return {"job_id": start_job(work)}
+    return {"job_id": start_job(user, work)}
 
 
 @app.post("/api/jobs/reel")
-def job_reel(body: ReelBody):
-    if not session["video_path"]:
+def job_reel(body: ReelBody, user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    if not sess["video_path"]:
         raise HTTPException(400, "Download a video first")
 
     def work(job):
-        key = get_api_key()
+        key = get_api_key(user)
         if body.analysis == "visual":
-            proxy = ensure_proxy(job)
+            proxy = ensure_proxy(job, user)
             job["message"] = "AI is watching the video and planning..."
             job["progress"] = 0.3
             plan = ai.plan_reel(
-                key, session["video_duration"], mode=body.mode, theme=body.theme,
+                key, sess["video_duration"], mode=body.mode, theme=body.theme,
                 target_duration=body.target_duration, proxy_video_path=proxy,
             )
         else:
-            ensure_transcript(job)
+            ensure_transcript(job, user)
             job["message"] = "AI is planning the reel..."
             job["progress"] = 0.3
             plan = ai.plan_reel(
-                key, session["video_duration"], mode=body.mode, theme=body.theme,
+                key, sess["video_duration"], mode=body.mode, theme=body.theme,
                 target_duration=body.target_duration,
-                timestamped_transcript=transcript.transcript_to_prompt_text(session["transcript_segments"]),
+                timestamped_transcript=transcript.transcript_to_prompt_text(sess["transcript_segments"]),
             )
 
-        out_dir = clip_output_dir()
+        out_dir = clip_output_dir(user)
         name = utils.sanitize(plan["hook_title"])[:50] or body.mode
         job["message"] = f"Cutting & stitching {len(plan['segments'])} segments..."
         job["progress"] = 0.6
@@ -599,12 +764,12 @@ def job_reel(body: ReelBody):
                 "captions": body.captions.model_dump(),
             },
         }
-        render_record(job, rec, out_dir)
+        render_record(job, user, rec, out_dir)
 
-        session["clips"] = [rec]
-        return {"clips": [clip_to_api(rec)], "plan": plan}
+        sess["clips"] = [rec]
+        return {"clips": [clip_to_api(user, rec)], "plan": plan}
 
-    return {"job_id": start_job(work)}
+    return {"job_id": start_job(user, work)}
 
 
 # ── clip editing ──────────────────────────────────────────────────────────────
@@ -622,22 +787,24 @@ class AiEditBody(BaseModel):
     instruction: str
 
 
-def _get_clip(index: int) -> dict:
-    if index < 0 or index >= len(session["clips"]):
+def _get_clip(user: str, index: int) -> dict:
+    clips = get_session(user)["clips"]
+    if index < 0 or index >= len(clips):
         raise HTTPException(400, "Clip not found")
-    return session["clips"][index]
+    return clips[index]
 
 
 @app.post("/api/jobs/edit")
-def job_edit(body: EditBody):
-    rec = _get_clip(body.index)
+def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    rec = _get_clip(user, body.index)
 
     def work(job):
         segs = []
         for s in body.segments:
             st, en = float(s["start_sec"]), float(s["end_sec"])
-            if session["video_duration"]:
-                en = min(en, session["video_duration"])
+            if sess["video_duration"]:
+                en = min(en, sess["video_duration"])
                 st = max(0.0, min(st, en))
             if en - st >= 1.0:
                 segs.append({"start_sec": st, "end_sec": en})
@@ -651,34 +818,35 @@ def job_edit(body: EditBody):
             "reframe": body.reframe,
             "captions": body.captions.model_dump(),
         }
-        rerender_clip(job, rec)
-        return {"clips": [clip_to_api(c) for c in session["clips"]]}
+        rerender_clip(job, user, rec)
+        return {"clips": [clip_to_api(user, c) for c in sess["clips"]]}
 
-    return {"job_id": start_job(work)}
+    return {"job_id": start_job(user, work)}
 
 
 @app.post("/api/jobs/ai_edit")
-def job_ai_edit(body: AiEditBody):
-    rec = _get_clip(body.index)
+def job_ai_edit(body: AiEditBody, user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    rec = _get_clip(user, body.index)
     if not body.instruction.strip():
         raise HTTPException(400, "Instruction is empty")
 
     def work(job):
-        key = get_api_key()
+        key = get_api_key(user)
         job["message"] = "AI is reading your instruction..."
         job["progress"] = 0.2
 
         context = None
-        if session["transcript_segments"]:
+        if sess["transcript_segments"]:
             segs = rec["render"]["segments"]
             lo = max(0.0, min(s["start_sec"] for s in segs) - 90)
             hi = max(s["end_sec"] for s in segs) + 90
-            window = [s for s in session["transcript_segments"] if lo <= s["start"] <= hi]
+            window = [s for s in sess["transcript_segments"] if lo <= s["start"] <= hi]
             if window:
                 context = transcript.transcript_to_prompt_text(window)
 
         plan = ai.edit_clip_plan(
-            body.instruction, rec["render"], session["video_duration"], key,
+            body.instruction, rec["render"], sess["video_duration"], key,
             transcript_context=context,
         )
 
@@ -693,45 +861,58 @@ def job_ai_edit(body: AiEditBody):
             r["captions"]["enabled"] = plan["captions"] == "on"
 
         job["progress"] = 0.5
-        rerender_clip(job, rec)
+        rerender_clip(job, user, rec)
         return {
-            "clips": [clip_to_api(c) for c in session["clips"]],
+            "clips": [clip_to_api(user, c) for c in sess["clips"]],
             "explanation": plan.get("explanation", ""),
         }
 
-    return {"job_id": start_job(work)}
+    return {"job_id": start_job(user, work)}
 
 
 # ── jobs & clips ──────────────────────────────────────────────────────────────
 @app.get("/api/jobs/{job_id}")
-def job_status(job_id: str):
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    return job
+def job_status(job_id: str, user: str = Depends(auth.current_user)):
+    return owned_job(job_id, user)
 
 
 @app.get("/api/clips")
-def list_clips():
-    return {"clips": [clip_to_api(c) for c in session["clips"] if os.path.exists(c["path"])]}
+def list_clips(user: str = Depends(auth.current_user)):
+    return {"clips": [clip_to_api(user, c) for c in get_session(user)["clips"]
+                      if os.path.exists(c["path"])]}
 
 
 @app.get("/api/clips/zip")
-def clips_zip():
-    existing = [c for c in session["clips"] if os.path.exists(c["path"])]
+def clips_zip(user: str = Depends(auth.current_user)):
+    existing = [c for c in get_session(user)["clips"] if os.path.exists(c["path"])]
     if not existing:
         raise HTTPException(404, "No clips generated yet")
-    zip_path = os.path.join(video.CLIPS_DIR, "_all_clips.zip")
+    zip_path = os.path.join(user_clips(user), "_all_clips.zip")
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for c in existing:
             zf.write(c["path"], arcname=os.path.basename(c["path"]))
     return FileResponse(zip_path, media_type="application/zip", filename="clips.zip")
 
 
-# ── static serving ────────────────────────────────────────────────────────────
-os.makedirs(video.CLIPS_DIR, exist_ok=True)
-app.mount("/clips", StaticFiles(directory=video.CLIPS_DIR), name="clips")
+@app.get("/api/clips/file/{rel_path:path}")
+def clip_file(rel_path: str, user: str = Depends(auth.current_user)):
+    """Serve a clip, but only to the user who owns it.
 
+    This replaced a plain StaticFiles mount on the clips folder. That mount
+    served any path to anyone, so one user could read another's clips by
+    guessing the URL — which is exactly what separate dashboards must prevent.
+    """
+    root = os.path.realpath(user_clips(user))
+    full = os.path.realpath(os.path.join(root, rel_path))
+    # realpath first, then check containment: this also stops ../ and symlinks
+    if full != root and not full.startswith(root + os.sep):
+        raise HTTPException(404, "Not found")
+    if not os.path.isfile(full):
+        raise HTTPException(404, "Not found")
+    return FileResponse(full)
+
+
+# ── static serving ────────────────────────────────────────────────────────────
 DIST = os.path.join(BUNDLE_DIR, "frontend", "dist")
 if os.path.isdir(DIST):
     app.mount("/", StaticFiles(directory=DIST, html=True), name="frontend")
