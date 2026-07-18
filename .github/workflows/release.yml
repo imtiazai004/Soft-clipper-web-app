@@ -1,0 +1,69 @@
+name: Build & Release
+
+# Runs when you push a version tag, e.g.:  git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {}   # also allows a manual run from the Actions tab
+
+permissions:
+  contents: write          # needed to create the Release
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      PYARMOR_LICENSE: ${{ secrets.PYARMOR_LICENSE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Download ffmpeg (real static build)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_dl -Force
+          $bin = (Get-ChildItem ffmpeg_dl -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          "FFMPEG_DIR=$bin" >> $env:GITHUB_ENV
+          & "$bin\ffmpeg.exe" -version | Select-Object -First 1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyarmor pyinstaller
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      # The app is fully free WITHOUT obfuscation — this is the default.
+      # OPTIONAL: if you ever buy a PyArmor license, add it as a repo secret
+      # named PYARMOR_LICENSE. Only then does the build obfuscate the code.
+      - name: Register PyArmor license (optional)
+        if: ${{ env.PYARMOR_LICENSE != '' }}
+        run: |
+          pip install pyarmor
+          echo "$env:PYARMOR_LICENSE" > pyarmor-license.txt
+          pyarmor reg pyarmor-license.txt
+          echo "OBFUSCATE=1" >> $env:GITHUB_ENV
+
+      - name: Build release
+        run: python build_release.py
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/Soft-Clipper.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true

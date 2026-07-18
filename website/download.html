@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Soft Clipper — Turn Long Videos into Viral TikTok Clips</title>
+  <meta name="description" content="Free AI tool that turns long YouTube videos into viral vertical clips for TikTok, Reels and Shorts. Auto-detects the best moments, adds captions, and reframes to 9:16." />
+  <style>
+    :root {
+      --bg:#07070f; --panel:rgba(255,255,255,.04); --border:rgba(255,255,255,.09);
+      --text:#e8e8f2; --muted:#8b8ba3; --a1:#8b5cf6; --a2:#22d3ee;
+      --grad:linear-gradient(135deg,#8b5cf6 0%,#6366f1 50%,#22d3ee 100%);
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);font-family:'Inter','Segoe UI',system-ui,sans-serif;line-height:1.6}
+    body::before{content:'';position:fixed;inset:0;z-index:0;pointer-events:none;
+      background:radial-gradient(600px 400px at 15% -5%,rgba(139,92,246,.16),transparent 60%),
+                 radial-gradient(700px 500px at 85% 0,rgba(34,211,238,.10),transparent 60%)}
+    .wrap{position:relative;z-index:1;max-width:920px;margin:0 auto;padding:0 24px 80px}
+    header{display:flex;align-items:center;gap:12px;padding:26px 0}
+    .logo{width:44px;height:44px;border-radius:13px;background:var(--grad);display:grid;place-items:center;font-size:22px;box-shadow:0 4px 24px rgba(139,92,246,.4)}
+    header b{font-size:18px}
+    .hero{text-align:center;padding:48px 0 32px}
+    .hero h1{font-size:clamp(30px,5vw,52px);font-weight:800;letter-spacing:-1px;line-height:1.1;
+      background:linear-gradient(120deg,#fff,#c4b5fd,#67e8f9);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+    .hero p{color:var(--muted);font-size:clamp(15px,2.2vw,19px);max-width:600px;margin:18px auto 0}
+    .cta{display:inline-flex;align-items:center;gap:10px;margin-top:30px;padding:16px 30px;border:none;border-radius:14px;
+      background:var(--grad);color:#fff;font-size:17px;font-weight:700;text-decoration:none;box-shadow:0 8px 30px rgba(139,92,246,.4);transition:filter .15s,transform .1s}
+    .cta:hover{filter:brightness(1.12)}
+    .cta:active{transform:scale(.98)}
+    .sub{color:var(--muted);font-size:13px;margin-top:12px}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:48px}
+    .card{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:22px;backdrop-filter:blur(12px)}
+    .card .ico{font-size:24px}
+    .card h3{font-size:16px;margin:12px 0 6px}
+    .card p{color:var(--muted);font-size:14px}
+    section h2{font-size:26px;font-weight:800;margin:56px 0 8px;letter-spacing:-.5px}
+    section .lead{color:var(--muted);margin-bottom:20px}
+    ol.steps{list-style:none;counter-reset:s;display:grid;gap:12px}
+    ol.steps li{counter-increment:s;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px 18px 16px 56px;position:relative;font-size:15px}
+    ol.steps li::before{content:counter(s);position:absolute;left:16px;top:14px;width:26px;height:26px;border-radius:8px;background:var(--grad);color:#fff;font-weight:700;display:grid;place-items:center;font-size:14px}
+    .faq{display:grid;gap:12px;margin-top:20px}
+    .faq details{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
+    .faq summary{cursor:pointer;font-weight:600}
+    .faq p{color:var(--muted);margin-top:8px;font-size:14px}
+    footer{text-align:center;color:var(--muted);font-size:13px;margin-top:64px;padding-top:24px;border-top:1px solid var(--border)}
+    a{color:var(--a2)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="logo">🎬</div>
+      <b>Soft Clipper</b>
+    </header>
+
+    <div class="hero">
+      <h1>Turn long videos into viral clips</h1>
+      <p>An AI desktop app that finds the best moments in any long video and cuts ready-to-post vertical clips for TikTok, Reels and YouTube Shorts — with auto captions and smart reframing.</p>
+      <!-- This link always serves the newest release — you never edit this page again. -->
+      <a class="cta" href="https://github.com/imtiazai004/Soft-Clipper/releases/latest/download/Soft-Clipper.zip">⬇ Download for Windows</a>
+      <div class="sub">Free · Windows 10/11 · No installation — just unzip and run</div>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="ico">🤖</div><h3>AI moment detection</h3><p>Analyzes the transcript (or the video itself) and ranks the most viral-worthy moments with a virality score.</p></div>
+      <div class="card"><div class="ico">🎯</div><h3>Smart reframing</h3><p>Keeps the speaker centered in 9:16, 1:1 or 16:9 — with fit-blur and split-screen layouts too.</p></div>
+      <div class="card"><div class="ico">💬</div><h3>Auto captions</h3><p>Burns TikTok-style captions right onto the clip in the original language.</p></div>
+      <div class="card"><div class="ico">🎞️</div><h3>Teasers &amp; reels</h3><p>Stitches highlights from across the video into a single teaser or highlight reel.</p></div>
+      <div class="card"><div class="ico">✏️</div><h3>Edit &amp; fix</h3><p>Not happy with a clip? Fix it with a simple prompt or tweak it manually, then re-render.</p></div>
+      <div class="card"><div class="ico">#️⃣</div><h3>Captions &amp; hashtags</h3><p>Generates a ready-to-post caption and hashtags for every clip.</p></div>
+    </div>
+
+    <section>
+      <h2>How it works</h2>
+      <p class="lead">From a long video to posted clips in a few clicks.</p>
+      <ol class="steps">
+        <li>Download and unzip the app, then double-click <b>Soft Clipper.exe</b>.</li>
+        <li>Paste a YouTube (or TikTok / Facebook) link and download the video.</li>
+        <li>Let the AI detect viral moments, or make a teaser / highlight reel.</li>
+        <li>Preview the clips, fix any you don't like, and download them.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>FAQ</h2>
+      <div class="faq">
+        <details><summary>Is it free?</summary><p>Yes. The app is free. It uses Google Gemini for the AI features — you add your own free Gemini API key the first time you open it.</p></details>
+        <details><summary>Do I need to install anything?</summary><p>No. Everything is bundled, including ffmpeg. Just unzip and run on Windows 10 or 11.</p></details>
+        <details><summary>Which platforms are the clips made for?</summary><p>TikTok, Instagram Reels, YouTube Shorts and Facebook — vertical 9:16 by default, plus 1:1 and 16:9.</p></details>
+        <details><summary>Does it work on videos in other languages?</summary><p>Yes. When a video has no captions, the audio is transcribed by AI, which supports Urdu, Pashto, Hindi, English and many more.</p></details>
+      </div>
+    </section>
+
+    <footer>
+      Built by Imtiaz Ahmad · <a href="https://github.com/imtiazai004/Soft-Clipper">Source on GitHub</a>
+    </footer>
+  </div>
+</body>
+</html>

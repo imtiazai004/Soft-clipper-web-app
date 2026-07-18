@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500">
+  <defs>
+    <linearGradient id="scBg" x1="0" y1="0" x2="800" y2="500" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#050A14"/>
+      <stop offset="100%" stop-color="#0A1220"/>
+    </linearGradient>
+    <radialGradient id="scGlow" cx="50%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#1A7FE6" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#1A7FE6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="scGlow2" cx="78%" cy="40%" r="34%">
+      <stop offset="0%" stop-color="#8B5CF6" stop-opacity="0.14"/>
+      <stop offset="100%" stop-color="#8B5CF6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="scClip" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1A7FE6"/>
+      <stop offset="100%" stop-color="#22D3EE"/>
+    </linearGradient>
+    <pattern id="scDots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="14" cy="14" r="0.8" fill="rgba(26,127,230,0.13)"/>
+    </pattern>
+    <filter id="scF">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="500" fill="url(#scBg)"/>
+  <rect width="800" height="500" fill="url(#scDots)"/>
+  <rect width="800" height="500" fill="url(#scGlow)"/>
+  <rect width="800" height="500" fill="url(#scGlow2)"/>
+
+  <!-- ═══ LEFT: source 16:9 video frame ═══ -->
+  <rect x="70" y="150" width="300" height="169" rx="14" fill="#0B1826" stroke="#1A7FE640" stroke-width="2.5"/>
+  <rect x="70" y="150" width="300" height="169" rx="14" fill="none" stroke="#1A7FE615" stroke-width="1" transform="translate(6,6)"/>
+  <!-- vertical 9:16 crop guide inside the source -->
+  <rect x="177" y="158" width="86" height="153" rx="8" fill="#1A7FE614" stroke="#22D3EE" stroke-width="2" stroke-dasharray="7 6"/>
+  <!-- play button -->
+  <circle cx="220" cy="234" r="30" fill="#0B1826" stroke="#1A7FE6" stroke-width="3" opacity="0.95" filter="url(#scF)"/>
+  <path d="M211,220 L237,234 L211,248 Z" fill="#22D3EE"/>
+  <!-- source label -->
+  <text x="82" y="140" font-family="ui-monospace,monospace" font-size="12" font-weight="700" fill="#5B7089" letter-spacing="3">LONG VIDEO · 16:9</text>
+
+  <!-- ═══ ARROW: reframe ═══ -->
+  <g opacity="0.9">
+    <line x1="390" y1="234" x2="452" y2="234" stroke="#1A7FE6" stroke-width="3" stroke-linecap="round"/>
+    <path d="M446,224 L460,234 L446,244 Z" fill="#1A7FE6"/>
+    <text x="392" y="220" font-family="ui-monospace,monospace" font-size="11" font-weight="700" fill="#1A7FE6" letter-spacing="2" opacity="0.85">AI REFRAME</text>
+  </g>
+
+  <!-- ═══ RIGHT: vertical 9:16 clip (phone) ═══ -->
+  <rect x="500" y="120" width="150" height="245" rx="20" fill="#0B1826" stroke="url(#scClip)" stroke-width="3" filter="url(#scF)"/>
+  <rect x="512" y="140" width="126" height="205" rx="10" fill="#0E1E30"/>
+  <!-- speaker head kept in frame -->
+  <circle cx="575" cy="215" r="34" fill="#12253A" stroke="#1A7FE6" stroke-width="2" stroke-opacity="0.5"/>
+  <circle cx="575" cy="205" r="13" fill="#1A7FE6" opacity="0.85"/>
+  <path d="M553,250 C553,228 597,228 597,250 Z" fill="#1A7FE6" opacity="0.85"/>
+  <!-- caption bar -->
+  <rect x="524" y="300" width="102" height="16" rx="4" fill="#22D3EE" opacity="0.9"/>
+  <rect x="536" y="322" width="78" height="10" rx="3" fill="#1A7FE6" opacity="0.45"/>
+  <!-- clip label -->
+  <text x="500" y="110" font-family="ui-monospace,monospace" font-size="12" font-weight="700" fill="#22D3EE" letter-spacing="3">CLIP · 9:16</text>
+
+  <!-- ═══ TIMELINE with highlighted viral segment ═══ -->
+  <rect x="70" y="392" width="580" height="26" rx="7" fill="#0B1826" stroke="#1A7FE620" stroke-width="1.5"/>
+  <!-- scrubbed segments -->
+  <g opacity="0.5">
+    <rect x="82" y="399" width="60" height="12" rx="3" fill="#1A7FE6" opacity="0.25"/>
+    <rect x="150" y="399" width="90" height="12" rx="3" fill="#1A7FE6" opacity="0.25"/>
+    <rect x="360" y="399" width="70" height="12" rx="3" fill="#1A7FE6" opacity="0.25"/>
+    <rect x="440" y="399" width="110" height="12" rx="3" fill="#1A7FE6" opacity="0.25"/>
+  </g>
+  <!-- selected viral clip -->
+  <rect x="250" y="395" width="100" height="20" rx="5" fill="url(#scClip)" opacity="0.95" filter="url(#scF)"/>
+  <text x="300" y="409" text-anchor="middle" font-family="ui-monospace,monospace" font-size="10" font-weight="800" fill="#04101C" letter-spacing="1">VIRAL</text>
+
+  <!-- ═══ AUDIO WAVEFORM ═══ -->
+  <g stroke="#22D3EE" stroke-width="3" stroke-linecap="round" opacity="0.7">
+    <line x1="90"  y1="352" x2="90"  y2="368"/>
+    <line x1="104" y1="344" x2="104" y2="376"/>
+    <line x1="118" y1="356" x2="118" y2="364"/>
+    <line x1="132" y1="338" x2="132" y2="382"/>
+    <line x1="146" y1="350" x2="146" y2="370"/>
+    <line x1="160" y1="330" x2="160" y2="390"/>
+    <line x1="174" y1="348" x2="174" y2="372"/>
+    <line x1="188" y1="356" x2="188" y2="364"/>
+  </g>
+
+  <!-- sparkles -->
+  <g opacity="0.5">
+    <line x1="668" y1="150" x2="668" y2="164" stroke="#8B5CF6" stroke-width="2" stroke-linecap="round"/>
+    <line x1="661" y1="157" x2="675" y2="157" stroke="#8B5CF6" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <g opacity="0.4">
+    <line x1="60" y1="360" x2="60" y2="372" stroke="#1A7FE6" stroke-width="2" stroke-linecap="round"/>
+    <line x1="54" y1="366" x2="66" y2="366" stroke="#1A7FE6" stroke-width="2" stroke-linecap="round"/>
+  </g>
+  <circle cx="700" cy="300" r="4" fill="#22D3EE" opacity="0.4"/>
+  <circle cx="720" cy="285" r="2.5" fill="#8B5CF6" opacity="0.35"/>
+
+  <!-- Bottom label bar -->
+  <rect x="0" y="456" width="800" height="44" fill="rgba(0,0,0,0.42)"/>
+  <text x="400" y="483" text-anchor="middle" font-family="ui-monospace,SFMono-Regular,monospace" font-size="13" font-weight="700" fill="#1A7FE6" letter-spacing="8" opacity="0.9">SOFT CLIPPER</text>
+  <rect x="300" y="490" width="200" height="1.5" fill="#1A7FE6" opacity="0.4" rx="1"/>
+</svg>

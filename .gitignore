@@ -1,0 +1,24 @@
+# user data & secrets
+downloads/
+clips/
+config.json
+*.mp4
+*.mov
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# build artifacts (CI regenerates these)
+build/
+build_obf/
+dist/
+release/
+frontend/node_modules/
+frontend/dist/
+
+# obsolete streamlit era
+.streamlit/
+
+# keep the PyInstaller specs (build.spec, build_obf.spec) — they are source

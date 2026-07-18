@@ -1,0 +1,8 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9      # FastAPI needs this for the video upload form
+yt-dlp>=2026.1.1
+google-genai>=1.0.0
+youtube-transcript-api>=1.0.0
+opencv-python-headless>=4.10,<5
+numpy
