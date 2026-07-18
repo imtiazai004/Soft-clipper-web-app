@@ -16,6 +16,7 @@ Run:  .venv\\Scripts\\python.exe -m uvicorn backend.main:app --port 8501
 """
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -202,6 +203,34 @@ def get_proxy(user: str) -> str | None:
             or os.environ.get("DOWNLOAD_PROXY", "").strip() or None)
 
 
+_cookie_copy: dict[str, str] = {}
+
+
+def writable_cookies(path: str | None) -> str | None:
+    """A cookie file yt-dlp is allowed to write back to.
+
+    YouTube rotates cookies, and yt-dlp saves the refreshed jar to the file when
+    it finishes. Render mounts secret files read-only, so pointing straight at
+    /etc/secrets/cookies.txt turns a working download into a permission error.
+    Copy once to somewhere writable and let rotation happen there.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    if os.access(path, os.W_OK):
+        return path
+    cached = _cookie_copy.get(path)
+    if cached and os.path.isfile(cached):
+        return cached
+    dest = os.path.join(DATA_ROOT, "_cookies.txt")
+    try:
+        os.makedirs(DATA_ROOT, exist_ok=True)
+        shutil.copyfile(path, dest)
+    except OSError:
+        return path      # can't copy — better to try the original than nothing
+    _cookie_copy[path] = dest
+    return dest
+
+
 def get_cookies(user: str) -> dict:
     """Optional cookie source, as kwargs for the downloader.
 
@@ -209,10 +238,11 @@ def get_cookies(user: str) -> dict:
     bot rejection, which anonymous requests hit on shared VPN and ISP IPs.
     """
     cfg = load_user_config(user)
+    cookies_file = cfg.get("cookies_file", "").strip() or os.environ.get("COOKIES_FILE", "").strip() or None
     return {
         # a server has no browser to read cookies out of; only a file works there
         "cookies_browser": (cfg.get("cookies_browser", "").strip() or None) if not auth.MULTI_USER else None,
-        "cookies_file": cfg.get("cookies_file", "").strip() or os.environ.get("COOKIES_FILE", "").strip() or None,
+        "cookies_file": writable_cookies(cookies_file),
     }
 
 
