@@ -14,6 +14,7 @@ id, and every endpoint resolves its caller through auth.current_user.
 
 Run:  .venv\\Scripts\\python.exe -m uvicorn backend.main:app --port 8501
 """
+import json
 import os
 import re
 import shutil
@@ -121,21 +122,45 @@ def get_session(user: str) -> dict:
         return sessions.setdefault(user, new_session())
 
 
-# in-memory settings per user; desktop mode still uses config.json on disk
+# Settings per user, cached in memory and written through to that user's own
+# folder. Keeping them only in memory meant a key had to be re-entered after
+# every restart — which on a spun-down free instance is several times a day.
+#
+# The file holds an API key in plain text. It lives on the server's disk under
+# the user's directory, so it is exactly as private as the disk and the Render
+# account are; that is a fair trade for a small team, but it is the reason not
+# to put a personal key on a shared box you don't control.
 user_configs: dict[str, dict] = {}
+
+
+def _user_config_path(user: str) -> str:
+    return os.path.join(user_root(user), "config.json")
 
 
 def load_user_config(user: str) -> dict:
     if not auth.MULTI_USER:
         return utils.load_config()
-    return dict(user_configs.get(user, {}))
+    if user not in user_configs:
+        try:
+            with open(_user_config_path(user), "r", encoding="utf-8") as f:
+                user_configs[user] = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            user_configs[user] = {}
+    return dict(user_configs[user])
 
 
 def save_user_config(user: str, cfg: dict) -> None:
     if not auth.MULTI_USER:
         utils.save_config(cfg)      # desktop: persist next to the .exe
-    else:
-        user_configs[user] = cfg    # server: one user's settings stay their own
+        return
+    user_configs[user] = cfg        # server: one user's settings stay their own
+    path = _user_config_path(user)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except OSError:
+        pass                        # memory copy still serves this process
 
 
 # ── job system ────────────────────────────────────────────────────────────────

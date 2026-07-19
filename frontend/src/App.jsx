@@ -771,7 +771,7 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
           Get a free key at{' '}
           <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noreferrer">aistudio.google.com</a>
           <br />{multiUser
-            ? 'Your key is kept on the server for your account only, and is cleared when the app restarts.'
+            ? 'Your key is saved on the server under your account only — other users cannot see it.'
             : 'Your key is stored locally on your PC (config.json).'}
           {hasKey && <><br /><span style={{ opacity: 0.7 }}>
             A key is already saved{keyPreview ? ` (${keyPreview})` : ''} — leave blank to keep it.
