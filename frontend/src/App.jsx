@@ -780,6 +780,17 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
         <input ref={inputRef} className="input mb" type="password" placeholder="AIza..." value={key}
           onChange={(e) => setKey(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && save()} />
 
+        {/* Proxy and cookies are per-machine fixes: on the desktop the user's own
+            ISP is what blocks YouTube. On the server every download leaves from
+            one IP, so these belong to whoever runs it — showing them here would
+            invite ten people to buy ten proxies, or to quietly break their own
+            downloads with a bad one. */}
+        {multiUser ? (
+          <p style={{ marginTop: 18, opacity: 0.7, fontSize: 13 }}>
+            Downloads are handled by the server, so proxy and cookie settings are
+            configured there rather than per account.
+          </p>
+        ) : (<>
         <h3 style={{ marginTop: 18 }}>🌐 Download Proxy (optional)</h3>
         <p>
           If your ISP blocks YouTube/TikTok and downloads fail with a network error,
@@ -812,6 +823,7 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
         <input className="input mb" type="text" placeholder="Or full path to cookies.txt (overrides the browser above)"
           value={cookiesFile} onChange={(e) => setCookiesFile(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && save()} />
+        </>)}
 
         <div className="row" style={{ justifyContent: 'flex-end' }}>
           <button className="btn" onClick={onClose}>Cancel</button>

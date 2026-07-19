@@ -198,7 +198,15 @@ def get_api_key(user: str) -> str:
 
 
 def get_proxy(user: str) -> str | None:
-    """Optional download proxy for users whose ISP blocks the video source."""
+    """The proxy downloads go through.
+
+    On the desktop this is the user's own setting — their ISP is what blocks
+    YouTube, so the fix belongs to them. On a server the download happens from
+    one machine on one IP, so the proxy is the operator's setting and a
+    per-user override would only let someone quietly break their own downloads.
+    """
+    if auth.MULTI_USER:
+        return os.environ.get("DOWNLOAD_PROXY", "").strip() or None
     return (load_user_config(user).get("proxy", "").strip()
             or os.environ.get("DOWNLOAD_PROXY", "").strip() or None)
 
@@ -238,11 +246,14 @@ def get_cookies(user: str) -> dict:
     bot rejection, which anonymous requests hit on shared VPN and ISP IPs.
     """
     cfg = load_user_config(user)
-    cookies_file = cfg.get("cookies_file", "").strip() or os.environ.get("COOKIES_FILE", "").strip() or None
+    if auth.MULTI_USER:
+        # server-side concern, same as the proxy: there is no browser to read
+        # cookies from and no way for a user to put a file on the box
+        return {"cookies_browser": None,
+                "cookies_file": writable_cookies(os.environ.get("COOKIES_FILE", "").strip() or None)}
     return {
-        # a server has no browser to read cookies out of; only a file works there
-        "cookies_browser": (cfg.get("cookies_browser", "").strip() or None) if not auth.MULTI_USER else None,
-        "cookies_file": writable_cookies(cookies_file),
+        "cookies_browser": cfg.get("cookies_browser", "").strip() or None,
+        "cookies_file": writable_cookies(cfg.get("cookies_file", "").strip() or None),
     }
 
 
