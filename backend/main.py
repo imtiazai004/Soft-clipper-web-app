@@ -180,7 +180,13 @@ def _prune_jobs() -> None:
             jobs.pop(jid, None)
 
 
-def start_job(user: str, target, *args) -> str:
+def start_job(user: str, target, *args, heavy: bool = False) -> str:
+    """Run target(job, *args) on a background thread.
+
+    heavy jobs (video encoding) take a render slot so a busy box can't OOM;
+    light jobs (downloading, AI calls that only wait on Gemini) skip the slot,
+    so one person's long transcription no longer freezes everyone else's work.
+    """
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {"status": "running", "progress": 0.0, "message": "Starting...",
                     "result": None, "error": None, "user": user}
@@ -188,17 +194,21 @@ def start_job(user: str, target, *args) -> str:
 
     def runner():
         job = jobs[job_id]
-        if not _render_slots.acquire(blocking=False):
-            job["message"] = "Waiting for a free slot..."
-            _render_slots.acquire()
+        acquired = False
         try:
+            if heavy:
+                if not _render_slots.acquire(blocking=False):
+                    job["message"] = "Waiting for a free render slot..."
+                    _render_slots.acquire()
+                acquired = True
             result = target(job, *args)
             job.update(status="done", progress=1.0, result=result, message="Done")
         except Exception as e:
             job.update(status="error", error=str(e), message=str(e))
         finally:
+            if acquired:
+                _render_slots.release()
             job["finished_at"] = time.time()
-            _render_slots.release()
 
     threading.Thread(target=runner, daemon=True).start()
     return job_id
@@ -366,7 +376,8 @@ def ensure_transcript(job: dict, user: str) -> list[dict]:
         raise RuntimeError("Audio extraction failed")
     try:
         job["message"] = "Transcribing with Gemini AI..."
-        segs = ai.transcribe_audio(audio_path, key)
+        segs = ai.transcribe_audio(audio_path, key,
+                                   on_status=lambda m: job.__setitem__("message", m))
         sess.update(transcript_segments=segs, transcript_source="gemini")
         return segs
     finally:
@@ -787,7 +798,7 @@ def job_cut(body: CutBody, user: str = Depends(auth.current_user)):
         sess["clips"] = produced
         return {"clips": [clip_to_api(user, c) for c in produced]}
 
-    return {"job_id": start_job(user, work)}
+    return {"job_id": start_job(user, work, heavy=True)}
 
 
 @app.post("/api/jobs/reel")
@@ -837,7 +848,7 @@ def job_reel(body: ReelBody, user: str = Depends(auth.current_user)):
         sess["clips"] = [rec]
         return {"clips": [clip_to_api(user, rec)], "plan": plan}
 
-    return {"job_id": start_job(user, work)}
+    return {"job_id": start_job(user, work, heavy=True)}
 
 
 # ── clip editing ──────────────────────────────────────────────────────────────
@@ -889,7 +900,7 @@ def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
         rerender_clip(job, user, rec)
         return {"clips": [clip_to_api(user, c) for c in sess["clips"]]}
 
-    return {"job_id": start_job(user, work)}
+    return {"job_id": start_job(user, work, heavy=True)}
 
 
 @app.post("/api/jobs/ai_edit")
@@ -935,7 +946,7 @@ def job_ai_edit(body: AiEditBody, user: str = Depends(auth.current_user)):
             "explanation": plan.get("explanation", ""),
         }
 
-    return {"job_id": start_job(user, work)}
+    return {"job_id": start_job(user, work, heavy=True)}
 
 
 # ── jobs & clips ──────────────────────────────────────────────────────────────
