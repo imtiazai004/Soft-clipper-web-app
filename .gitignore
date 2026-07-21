@@ -5,6 +5,10 @@ config.json
 *.mp4
 *.mov
 
+# deployment secrets & runtime data (the .env has passwords, data/ has videos)
+deploy/.env
+deploy/data/
+
 # python
 __pycache__/
 *.pyc

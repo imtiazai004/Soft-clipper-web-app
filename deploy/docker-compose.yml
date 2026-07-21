@@ -1,0 +1,42 @@
+# Soft Clipper on a plain VPS (Hetzner).
+#
+# Two containers: the app, and Caddy in front of it for HTTPS. Caddy fetches
+# and renews a Let's Encrypt certificate on its own once DOMAIN is a real name
+# pointed at this server; until then set DOMAIN=:80 and it serves plain HTTP on
+# the IP, which is enough to test.
+#
+# All persistent data — downloads, clips, per-user config — lives in ./data on
+# the host, so `git pull && docker compose up -d --build` rebuilds the image
+# without touching anything users made.
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATA_ROOT: /data          # everything the app persists hangs off here
+    volumes:
+      - ./data:/data
+    expose:
+      - "8501"                  # reachable only to Caddy, not the public internet
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:-:80}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data        # stored certificates — keep so renewals persist
+      - caddy_config:/config
+    depends_on:
+      - app
+
+volumes:
+  caddy_data:
+  caddy_config:
