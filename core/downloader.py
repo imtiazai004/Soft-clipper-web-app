@@ -133,6 +133,13 @@ def download_video(url: str, quality: str | None = None, progress_hook=None, pro
             f"/best[height<={height}]/best"
         ),
         "noplaylist": True,
+        # Pull several pieces of the file at once instead of one long straw.
+        # A residential proxy throttles any single connection, so on the server
+        # this is most of the download slowness people notice; overridable via
+        # YTDLP_FRAGMENTS in case a proxy dislikes the parallelism.
+        "concurrent_fragment_downloads": int(os.environ.get("YTDLP_FRAGMENTS", "4")),
+        "retries": 5,
+        "fragment_retries": 5,
     }
     ydl_opts.update(net_opts(proxy, cookies_browser, cookies_file))
     if progress_hook:
