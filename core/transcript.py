@@ -17,10 +17,22 @@ from .utils import seconds_to_mmss
 PREFERRED_LANGS = ["en", "ur", "hi", "ps", "ar"]
 
 
-def fetch_youtube_transcript(video_id: str) -> list[dict] | None:
-    """Fetch captions from YouTube. Returns segments or None if unavailable."""
+def fetch_youtube_transcript(video_id: str, proxy: str | None = None) -> list[dict] | None:
+    """Fetch captions from YouTube. Returns segments or None if unavailable.
+
+    proxy: route the caption request the same way downloads go. YouTube blocks
+    these requests from datacenter IPs too (RequestBlocked), so from a server
+    the direct fetch fails for many videos that actually *do* have captions —
+    including auto-generated ones — and the caller then falls back to the slow
+    Gemini transcription for no reason. Going through the proxy fixes that.
+    """
     try:
-        ytt = YouTubeTranscriptApi()
+        if proxy:
+            from youtube_transcript_api.proxies import GenericProxyConfig
+            ytt = YouTubeTranscriptApi(
+                proxy_config=GenericProxyConfig(http_url=proxy, https_url=proxy))
+        else:
+            ytt = YouTubeTranscriptApi()
         transcript_list = ytt.list(video_id)
         transcript = None
         # manually created captions first, then auto-generated, any language

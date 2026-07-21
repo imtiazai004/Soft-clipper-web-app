@@ -363,7 +363,10 @@ def ensure_transcript(job: dict, user: str) -> list[dict]:
     if sess["video_url"] and downloader.is_youtube(sess["video_url"]):
         job["message"] = "Fetching YouTube captions..."
         vid = downloader.get_youtube_id(sess["video_url"])
-        segs = transcript.fetch_youtube_transcript(vid)
+        # same proxy as downloads: YouTube blocks caption requests from a
+        # datacenter IP too, so without it many captioned videos fall through
+        # to the slow Gemini transcription for nothing
+        segs = transcript.fetch_youtube_transcript(vid, proxy=get_proxy(user))
         if segs:
             sess.update(transcript_segments=segs, transcript_source="youtube")
             return segs
