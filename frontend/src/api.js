@@ -23,23 +23,41 @@ export const api = {
     }).then(json),
 }
 
-// Poll a job until done/error. onUpdate({progress, message}) fires on each tick.
+// Poll a job until done/error/cancelled. onUpdate({progress, message, id}) fires each tick.
 export async function runJob(startPromise, onUpdate) {
   const { job_id } = await startPromise
   for (;;) {
     const job = await api.get(`/api/jobs/${job_id}`)
-    onUpdate?.(job)
+    onUpdate?.({ ...job, id: job_id })
     if (job.status === 'done') return job.result
+    if (job.status === 'cancelled') throw cancelledError()
     if (job.status === 'error') throw new Error(job.error || 'Job failed')
     await new Promise((r) => setTimeout(r, 700))
   }
 }
+
+// A cancel is the user's own doing — callers show a neutral note, not an error.
+export function cancelledError() {
+  const e = new Error('Cancelled')
+  e.cancelled = true
+  return e
+}
+
+export const cancelJob = (jobId) => api.post(`/api/jobs/${jobId}/cancel`, {})
 
 export function secToMMSS(s) {
   s = Math.max(0, Math.round(s))
   const m = Math.floor(s / 60)
   const sec = s % 60
   return `${m}:${String(sec).padStart(2, '0')}`
+}
+
+// Frame-level editing needs sub-second precision that secToMMSS rounds away.
+export function secToClock(s, decimals = 2) {
+  s = Math.max(0, s || 0)
+  const m = Math.floor(s / 60)
+  const rest = s - m * 60
+  return `${m}:${rest.toFixed(decimals).padStart(decimals ? 3 + decimals : 2, '0')}`
 }
 
 export function mmssToSec(t) {

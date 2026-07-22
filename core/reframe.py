@@ -9,11 +9,12 @@ All returned coordinates are normalized (0..1) relative to source frame size.
 """
 import glob
 import os
-import subprocess
 import tempfile
 
 import cv2
 import numpy as np
+
+from . import proc
 
 _CASCADE = None
 
@@ -43,7 +44,7 @@ def sample_faces(video_path: str, start: float, end: float, max_samples: int = 3
             "-vf", f"fps={fps:.4f},scale=480:-2",
             "-frames:v", str(max_samples), "-q:v", "5", pattern,
         ]
-        subprocess.run(cmd, capture_output=True)
+        proc.run(cmd)
         for fp in sorted(glob.glob(os.path.join(td, "f_*.jpg"))):
             frame = cv2.imread(fp)
             if frame is None:
@@ -126,7 +127,7 @@ def sample_faces_timed(video_path: str, start: float, end: float, max_samples: i
             "-vf", f"fps={fps:.4f},scale=480:-2",
             "-frames:v", str(max_samples), "-q:v", "5", pattern,
         ]
-        subprocess.run(cmd, capture_output=True)
+        proc.run(cmd)
         for idx, fp in enumerate(sorted(glob.glob(os.path.join(td, "f_*.jpg")))):
             frame = cv2.imread(fp)
             if frame is None:

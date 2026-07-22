@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, runJob, secToMMSS, mmssToSec } from './api'
+import { api, cancelJob, runJob, secToMMSS, secToClock, mmssToSec } from './api'
 
 const RATIOS = [
   { id: '9:16', label: '9:16 TikTok' },
@@ -15,7 +15,15 @@ const REFRAMES = [
   { id: 'fit', label: '🌫️ Fit + Blur', hint: 'Full video on blurred background' },
   { id: 'split', label: '⬆⬇ Split', hint: 'Speaker top, 2nd person / scene bottom' },
   { id: 'center', label: '▣ Center', hint: 'Plain center crop' },
+  { id: 'manual', label: '✋ Manual Frame', hint: 'Place the crop yourself in the editor' },
 ]
+
+// aspect ratio as width/height, for drawing the crop box over the source video
+const RATIO_AR = { '9:16': 9 / 16, '1:1': 1, '16:9': 16 / 9 }
+
+const FRAME = 1 / 30   // one frame step at 30fps — fine for trimming by eye
+
+const clamp01 = (v) => Math.max(0, Math.min(1, v))
 
 export default function App() {
   // global
@@ -31,6 +39,7 @@ export default function App() {
   const [cookiesFile, setCookiesFile] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const fileRef = useRef(null)
+  const mainVideoRef = useRef(null)
 
   // video
   const [url, setUrl] = useState('')
@@ -44,6 +53,12 @@ export default function App() {
   const [captionsOn, setCaptionsOn] = useState(true)
   const [capStyle, setCapStyle] = useState('TikTok Bold')
   const [wordsPerLine, setWordsPerLine] = useState(4)
+  const [headlineOn, setHeadlineOn] = useState(false)
+  const [headlineText, setHeadlineText] = useState('')
+  const [headlineStyle, setHeadlineStyle] = useState('box')
+  const [headlinePos, setHeadlinePos] = useState('top')
+  const [headlineSize, setHeadlineSize] = useState(20)
+  const [crop, setCrop] = useState({ cx: 0.5, cy: 0.5, zoom: 1 })
   const [numClips, setNumClips] = useState(6)
   const [lenRange, setLenRange] = useState([15, 60])
 
@@ -69,6 +84,12 @@ export default function App() {
 
   const busy = !!job
   const captionOpts = { enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine }
+  const headlineOpts = {
+    enabled: headlineOn, text: headlineText, style: headlineStyle,
+    position: headlinePos, size: headlineSize,
+  }
+  // every render request carries the same look settings
+  const lookOpts = { ratio, reframe: reframeMode, captions: captionOpts, headline: headlineOpts, crop }
 
   useEffect(() => {
     api.get('/api/config').then((c) => {
@@ -88,10 +109,26 @@ export default function App() {
       const result = await runJob(startPromise, (j) => setJob(j))
       after?.(result)
     } catch (e) {
-      err(e.message)
+      if (e.cancelled) ok('Stopped — nothing was created')
+      else err(e.message)
     } finally {
       setJob(null)
     }
+  }
+
+  // Stop whatever is running: an upload is aborted here, a server job is asked
+  // to stop and then ends on its own (runJob sees the 'cancelled' status).
+  async function cancelCurrent() {
+    if (!job) return
+    if (job.xhr) {
+      job.xhr.abort()
+      setJob(null)
+      ok('Stopped — nothing was created')
+      return
+    }
+    if (!job.id) return
+    setJob({ ...job, message: 'Cancelling...' })
+    try { await cancelJob(job.id) } catch { /* job may have just finished */ }
   }
 
   async function fetchQualities() {
@@ -119,7 +156,8 @@ export default function App() {
     const form = new FormData()
     form.append('file', file)
     const xhr = new XMLHttpRequest()
-    setJob({ message: `Loading ${file.name}...`, progress: 0 })
+    // xhr rides along in the job so the Cancel button can abort the upload
+    setJob({ message: `Loading ${file.name}...`, progress: 0, xhr })
 
     xhr.upload.onprogress = (e) => {
       if (!e.lengthComputable) return
@@ -127,6 +165,7 @@ export default function App() {
       setJob({
         message: frac < 1 ? `Loading ${file.name}... ${Math.round(frac * 100)}%` : 'Reading video...',
         progress: frac * 0.95,
+        xhr,
       })
     }
     xhr.onload = () => {
@@ -142,6 +181,7 @@ export default function App() {
       }
     }
     xhr.onerror = () => { setJob(null); err('Upload failed') }
+    xhr.onabort = () => setJob(null)     // cancelCurrent() already told the user
     xhr.open('POST', '/api/video/upload')
     xhr.send(form)
   }
@@ -165,7 +205,7 @@ export default function App() {
         name: m.hook_title || `clip_${i + 1}`,
         start_sec: m.start_sec, end_sec: m.end_sec, meta: m,
       })),
-      ratio, reframe: reframeMode, captions: captionOpts,
+      ...lookOpts,
     }), (r) => { setClips(r.clips); ok(`${r.clips.length} clips created!`) })
   }
 
@@ -173,7 +213,7 @@ export default function App() {
     if (!hasKey) { setShowSettings(true); return err('Set your Gemini API key first') }
     exec(api.post('/api/jobs/reel', {
       mode: reelMode, analysis: reelAnalysis, theme: reelTheme,
-      target_duration: reelDur, ratio, reframe: reframeMode, captions: captionOpts,
+      target_duration: reelDur, ...lookOpts,
     }), (r) => { setClips(r.clips); ok('Reel is ready!') })
   }
 
@@ -195,7 +235,7 @@ export default function App() {
       parsed.push({ name: row.name || `clip_${parsed.length + 1}`, start_sec: s, end_sec: e })
     }
     if (!parsed.length) return err('Enter valid start/end times (MM:SS) in at least one row')
-    exec(api.post('/api/jobs/cut', { clips: parsed, ratio, reframe: reframeMode, captions: captionOpts }),
+    exec(api.post('/api/jobs/cut', { clips: parsed, ...lookOpts }),
       (r) => { setClips(r.clips); ok(`${r.clips.length} clips created!`) })
   }
 
@@ -295,6 +335,42 @@ export default function App() {
           )}
         </div>
 
+        <div className="sidebar-section">
+          <span className="sec-title">🏷️ Headline</span>
+          <div className="side-row">
+            <span className="lbl-inline">Title on video</span>
+            <label className="switch">
+              <input type="checkbox" checked={headlineOn} onChange={(e) => setHeadlineOn(e.target.checked)} />
+              <span className="track" />
+            </label>
+          </div>
+          {headlineOn && (
+            <>
+              <input
+                className="input" placeholder="Custom headline (blank = AI title)"
+                value={headlineText} onChange={(e) => setHeadlineText(e.target.value)}
+              />
+              <div className="hint">
+                Leave it blank and each clip gets its own AI hook title. Type here to force the same
+                headline on every clip.
+              </div>
+              <div className="pills">
+                <button className={`pill ${headlineStyle === 'box' ? 'active' : ''}`} onClick={() => setHeadlineStyle('box')}>▬ Box</button>
+                <button className={`pill ${headlineStyle === 'plain' ? 'active' : ''}`} onClick={() => setHeadlineStyle('plain')}>A Plain</button>
+              </div>
+              <div className="pills">
+                <button className={`pill ${headlinePos === 'top' ? 'active' : ''}`} onClick={() => setHeadlinePos('top')}>⬆ Top</button>
+                <button className={`pill ${headlinePos === 'bottom' ? 'active' : ''}`} onClick={() => setHeadlinePos('bottom')}>⬇ Bottom</button>
+              </div>
+              <div className="side-row">
+                <span className="lbl-inline">Text size</span>
+                <span className="side-val">{headlineSize}</span>
+              </div>
+              <input type="range" min={12} max={32} value={headlineSize} onChange={(e) => setHeadlineSize(+e.target.value)} />
+            </>
+          )}
+        </div>
+
         {(video || clips.length > 0) && (
           <div className="sidebar-section">
             <span className="sec-title">📊 Status</span>
@@ -377,7 +453,25 @@ export default function App() {
                   <strong>{video.title}</strong>
                   <span className="muted">{secToMMSS(video.duration)}</span>
                 </div>
-                <video className="player" src={video.stream_url || '/api/video/stream'} controls />
+                <FrameStage
+                  videoRef={mainVideoRef}
+                  src={video.stream_url || '/api/video/stream'}
+                  ratio={ratio}
+                  crop={crop}
+                  setCrop={setCrop}
+                  headline={headlineOpts}
+                  headlineFallback="Your clip headline"
+                  manual={reframeMode === 'manual'}
+                />
+                {reframeMode === 'manual' && (
+                  <div className="hint mt">
+                    ✋ Manual frame: drag inside the video to place the crop window, zoom below.
+                    Every clip is cut with this framing — per-clip tweaks live in ✏️ Edit.
+                  </div>
+                )}
+                {reframeMode === 'manual' && RATIO_AR[ratio] && (
+                  <ZoomSlider crop={crop} setCrop={setCrop} />
+                )}
               </div>
             )}
           </section>
@@ -553,7 +647,18 @@ export default function App() {
       {/* progress banner */}
       {job && (
         <div className="progress-banner">
-          <div className="msg"><span className="spinner" /> {job.message}</div>
+          <div className="msg">
+            <span className="spinner" /> {job.message}
+            {(job.id || job.xhr) && (
+              <button
+                className="btn sm danger cancel-btn"
+                onClick={cancelCurrent}
+                disabled={job.cancelled}
+              >
+                {job.cancelled ? 'Stopping...' : '✕ Cancel'}
+              </button>
+            )}
+          </div>
           <div className="progress-track">
             <div className="progress-fill" style={{ width: `${Math.max(4, (job.progress || 0) * 100)}%` }} />
           </div>
@@ -589,6 +694,7 @@ export default function App() {
           clip={clips[editing]}
           index={editing}
           busy={busy}
+          duration={video?.duration || 0}
           onClose={() => setEditing(null)}
           onManual={(payload) => {
             setEditing(null)
@@ -607,19 +713,162 @@ export default function App() {
   )
 }
 
-function EditModal({ clip, index, busy, onClose, onManual, onAi }) {
+/** Source video with a draggable crop window and a live headline preview.
+ *
+ *  The box is drawn from the same numbers ffmpeg will crop with, so what you
+ *  frame here is what the clip renders — no guessing between UI and output.
+ */
+function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFallback,
+                      manual, onTimeUpdate, onReady }) {
+  const [dims, setDims] = useState({ w: 0, h: 0 })
+  const stageRef = useRef(null)
+  const dragging = useRef(false)
+  const ar = RATIO_AR[ratio]
+  const active = manual && !!ar && dims.w > 0 && dims.h > 0
+
+  let fracW = 1, fracH = 1
+  if (active) {
+    const wide = Math.min(dims.w, dims.h * ar) / Math.max(1, crop.zoom || 1)
+    const high = Math.min(dims.h, wide / ar)
+    fracW = Math.min(1, (high * ar) / dims.w)
+    fracH = Math.min(1, high / dims.h)
+  }
+  const left = Math.max(0, Math.min(crop.cx - fracW / 2, 1 - fracW))
+  const top = Math.max(0, Math.min(crop.cy - fracH / 2, 1 - fracH))
+
+  function moveTo(e) {
+    const rect = stageRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setCrop({
+      ...crop,
+      cx: clamp01((e.clientX - rect.left) / rect.width),
+      cy: clamp01((e.clientY - rect.top) / rect.height),
+    })
+  }
+
+  const headText = (headline?.text || '').trim() || headlineFallback || ''
+  const headlineEl = headline?.enabled && headText && (
+    <div className={`hl-preview ${headline.style} ${headline.position}`}
+      style={{ fontSize: `${(headline.size / 288) * 100}cqh` }}>
+      <span>{headText}</span>
+    </div>
+  )
+
+  return (
+    <div className="stage" ref={stageRef}
+      style={{ aspectRatio: dims.w ? `${dims.w} / ${dims.h}` : '16 / 9' }}>
+      <video
+        ref={videoRef} src={src} className="stage-video" controls={!active}
+        onLoadedMetadata={(e) => {
+          setDims({ w: e.target.videoWidth, h: e.target.videoHeight })
+          onReady?.(e)
+        }}
+        onTimeUpdate={onTimeUpdate}
+      />
+      {!active && headlineEl}
+      {active && (
+        <div
+          className="crop-layer"
+          onPointerDown={(e) => {
+            e.currentTarget.setPointerCapture(e.pointerId)
+            dragging.current = true
+            moveTo(e)
+          }}
+          onPointerMove={(e) => dragging.current && moveTo(e)}
+          onPointerUp={() => { dragging.current = false }}
+          onPointerCancel={() => { dragging.current = false }}
+        >
+          <div className="crop-box" style={{
+            left: `${left * 100}%`, top: `${top * 100}%`,
+            width: `${fracW * 100}%`, height: `${fracH * 100}%`,
+          }}>
+            {headlineEl}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ZoomSlider({ crop, setCrop }) {
+  return (
+    <div className="row mb">
+      <span className="muted" style={{ minWidth: 54 }}>Zoom</span>
+      <input
+        type="range" min={1} max={3} step={0.05} value={crop.zoom}
+        onChange={(e) => setCrop({ ...crop, zoom: +e.target.value })}
+      />
+      <span className="side-val">{crop.zoom.toFixed(2)}×</span>
+      <button className="btn sm ghost" onClick={() => setCrop({ cx: 0.5, cy: 0.5, zoom: 1 })}>Reset</button>
+    </div>
+  )
+}
+
+function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   const r = clip.render
   const [tab, setTab] = useState('ai')
   const [instruction, setInstruction] = useState('')
   const [name, setName] = useState(clip.name)
   const [segments, setSegments] = useState(
-    r.segments.map((s) => ({ start: secToMMSS(s.start_sec), end: secToMMSS(s.end_sec) }))
+    r.segments.map((s) => ({ start: secToClock(s.start_sec), end: secToClock(s.end_sec) }))
   )
+  const [active, setActive] = useState(0)          // segment the player is editing
   const [ratio, setRatio] = useState(r.ratio)
   const [reframe, setReframe] = useState(r.reframe || 'smart')
   const [capOn, setCapOn] = useState(!!r.captions?.enabled)
   const [capStyle, setCapStyle] = useState(r.captions?.style || 'TikTok Bold')
   const [words, setWords] = useState(r.captions?.words_per_line || 4)
+  const [head, setHead] = useState({
+    enabled: !!r.headline?.enabled,
+    text: r.headline?.text || '',
+    style: r.headline?.style || 'box',
+    position: r.headline?.position || 'top',
+    size: r.headline?.size || 20,
+  })
+  const [crop, setCrop] = useState({
+    cx: r.crop?.cx ?? 0.5, cy: r.crop?.cy ?? 0.5, zoom: r.crop?.zoom ?? 1,
+  })
+
+  const videoRef = useRef(null)
+  const stopAt = useRef(null)                      // pause point for segment preview
+  const [now, setNow] = useState(0)
+  const aiTitle = clip.meta?.hook_title || clip.name.replace(/_/g, ' ')
+
+  function seek(t) {
+    const v = videoRef.current
+    if (!v) return
+    const max = duration || v.duration || t
+    v.currentTime = Math.max(0, Math.min(t, max))
+    setNow(v.currentTime)
+  }
+
+  function step(delta) {
+    const v = videoRef.current
+    if (!v) return
+    v.pause()
+    stopAt.current = null
+    seek(v.currentTime + delta)
+  }
+
+  function setSeg(i, key, value) {
+    setSegments(segments.map((s, j) => (j === i ? { ...s, [key]: value } : s)))
+  }
+
+  /** Write the player's exact position into a segment edge — this is the
+   *  frame-accurate trim: park on the frame you want, then claim it. */
+  function grab(i, key) {
+    setSeg(i, key, secToClock(videoRef.current?.currentTime || 0))
+    setActive(i)
+  }
+
+  function playSegment(i) {
+    const st = mmssToSec(segments[i].start), en = mmssToSec(segments[i].end)
+    if (st == null || en == null) return
+    setActive(i)
+    stopAt.current = en
+    seek(st)
+    videoRef.current?.play()
+  }
 
   function applyManual() {
     const segs = []
@@ -632,13 +881,66 @@ function EditModal({ clip, index, busy, onClose, onManual, onAi }) {
     onManual({
       index, name, segments: segs, ratio, reframe,
       captions: { enabled: capOn, style: capStyle, words_per_line: words },
+      headline: head,
+      crop,
     })
   }
 
+  const activeSeg = segments[active] || segments[0]
+
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={{ width: 'min(560px, calc(100vw - 40px))' }} onClick={(e) => e.stopPropagation()}>
-        <h3>✏️ Fix clip: {clip.name}</h3>
+      <div className="modal wide" onClick={(e) => e.stopPropagation()}>
+        <h3>✏️ Edit clip: {clip.name}</h3>
+
+        {/* live source preview — the frame you are actually cutting */}
+        <FrameStage
+          videoRef={videoRef}
+          src="/api/video/stream"
+          ratio={ratio}
+          crop={crop}
+          setCrop={setCrop}
+          headline={head}
+          headlineFallback={aiTitle}
+          manual={reframe === 'manual'}
+          // open on the clip's own first frame, not on the start of the source
+          onReady={() => seek(mmssToSec(segments[0]?.start) || 0)}
+          onTimeUpdate={(e) => {
+            const t = e.target.currentTime
+            setNow(t)
+            if (stopAt.current != null && t >= stopAt.current) {
+              e.target.pause()
+              stopAt.current = null
+            }
+          }}
+        />
+
+        <div className="frame-bar">
+          <button className="btn sm" title="Back 1 second" onClick={() => step(-1)}>⏪ 1s</button>
+          <button className="btn sm" title="Back 1 frame" onClick={() => step(-FRAME)}>◀ frame</button>
+          <button className="btn sm" onClick={() => {
+            const v = videoRef.current
+            if (!v) return
+            if (v.paused) { stopAt.current = null; v.play() } else v.pause()
+          }}>⏯ Play</button>
+          <button className="btn sm" title="Forward 1 frame" onClick={() => step(FRAME)}>frame ▶</button>
+          <button className="btn sm" title="Forward 1 second" onClick={() => step(1)}>1s ⏩</button>
+          <span className="timecode">{secToClock(now)}</span>
+        </div>
+
+        {duration > 0 && (
+          <input
+            className="scrubber" type="range" min={0} max={duration} step={0.01} value={Math.min(now, duration)}
+            onChange={(e) => { stopAt.current = null; seek(+e.target.value) }}
+          />
+        )}
+
+        {activeSeg && (
+          <div className="hint">
+            Editing segment {active + 1} — park the player on a frame, then hit
+            <b> ⤓ Start</b> or <b>⤓ End</b> to snap that edge to it.
+          </div>
+        )}
 
         <div className="tabs" style={{ marginTop: 12 }}>
           <button className={`tab ${tab === 'ai' ? 'active' : ''}`} onClick={() => setTab('ai')}>✨ AI Fix</button>
@@ -667,19 +969,32 @@ function EditModal({ clip, index, busy, onClose, onManual, onAi }) {
             <label className="lbl">CLIP NAME</label>
             <input className="input mb" value={name} onChange={(e) => setName(e.target.value)} />
 
-            <label className="lbl">SEGMENTS (source video time, MM:SS)</label>
+            <label className="lbl">SEGMENTS (source video time, M:SS.ss)</label>
             {segments.map((s, i) => (
-              <div key={i} className="row mb">
+              <div key={i} className={`seg-row ${i === active ? 'active' : ''}`} onClick={() => setActive(i)}>
                 <input className="input" placeholder="Start" value={s.start}
-                  onChange={(e) => setSegments(segments.map((x, j) => j === i ? { ...x, start: e.target.value } : x))} />
+                  onChange={(e) => setSeg(i, 'start', e.target.value)} />
+                <button className="btn sm" title="Use the player's current frame as the start"
+                  onClick={() => grab(i, 'start')}>⤓ Start</button>
                 <span className="muted">→</span>
                 <input className="input" placeholder="End" value={s.end}
-                  onChange={(e) => setSegments(segments.map((x, j) => j === i ? { ...x, end: e.target.value } : x))} />
+                  onChange={(e) => setSeg(i, 'end', e.target.value)} />
+                <button className="btn sm" title="Use the player's current frame as the end"
+                  onClick={() => grab(i, 'end')}>⤓ End</button>
+                <button className="btn sm" title="Preview this segment" onClick={() => playSegment(i)}>▶</button>
                 {segments.length > 1 && (
-                  <button className="btn sm ghost" onClick={() => setSegments(segments.filter((_, j) => j !== i))}>✕</button>
+                  <button className="btn sm ghost" onClick={() => {
+                    setSegments(segments.filter((_, j) => j !== i))
+                    setActive(0)
+                  }}>✕</button>
                 )}
               </div>
             ))}
+            <button className="btn sm mb" onClick={() => {
+              const last = segments[segments.length - 1]
+              setSegments([...segments, { start: last?.end || '0:00.00', end: '' }])
+              setActive(segments.length)
+            }}>+ Segment</button>
 
             <div className="grid2 mb">
               <div>
@@ -699,9 +1014,54 @@ function EditModal({ clip, index, busy, onClose, onManual, onAi }) {
                   <option value="fit">🌫️ Fit + Blur</option>
                   <option value="split">⬆⬇ Split</option>
                   <option value="center">▣ Center</option>
+                  <option value="manual">✋ Manual Frame</option>
                 </select>
               </div>
             </div>
+
+            {reframe === 'manual' && (
+              RATIO_AR[ratio] ? (
+                <>
+                  <div className="hint mb">
+                    Drag inside the video above to move the crop window — what's inside the box is
+                    what the clip shows.
+                  </div>
+                  <ZoomSlider crop={crop} setCrop={setCrop} />
+                </>
+              ) : (
+                <div className="hint mb">Manual framing needs a fixed aspect ratio — pick 9:16, 1:1 or 16:9 above.</div>
+              )
+            )}
+
+            <label className="lbl">HEADLINE</label>
+            <div className="row mb">
+              <label className="switch">
+                <input type="checkbox" checked={head.enabled}
+                  onChange={(e) => setHead({ ...head, enabled: e.target.checked })} />
+                <span className="track" />
+              </label>
+              <span className="muted">Title on video</span>
+              {head.enabled && (
+                <>
+                  <select className="select" style={{ width: 110 }} value={head.style}
+                    onChange={(e) => setHead({ ...head, style: e.target.value })}>
+                    <option value="box">▬ Box</option>
+                    <option value="plain">A Plain</option>
+                  </select>
+                  <select className="select" style={{ width: 110 }} value={head.position}
+                    onChange={(e) => setHead({ ...head, position: e.target.value })}>
+                    <option value="top">⬆ Top</option>
+                    <option value="bottom">⬇ Bottom</option>
+                  </select>
+                  <input type="range" min={12} max={32} value={head.size} style={{ width: 80 }}
+                    onChange={(e) => setHead({ ...head, size: +e.target.value })} />
+                </>
+              )}
+            </div>
+            {head.enabled && (
+              <input className="input mb" placeholder={`Blank = AI title: "${aiTitle}"`}
+                value={head.text} onChange={(e) => setHead({ ...head, text: e.target.value })} />
+            )}
 
             <div className="row mb">
               <label className="switch">

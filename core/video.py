@@ -7,11 +7,15 @@ Reframe modes:
   smart  — face-aware crop: crop window centers on the dominant speaker
   fit    — no crop: full video centered on a blurred background
   split  — stacked layout: speaker panel on top, second face / scene below
+  manual — user-placed crop window (cx, cy, zoom) from the frame editor
+
+Every ffmpeg call goes through proc.run so a cancelled job kills it mid-encode.
 """
 import json
 import os
 import subprocess
 
+from . import proc
 from . import reframe as face_reframe
 
 CLIPS_DIR = "clips"
@@ -69,7 +73,7 @@ def make_proxy(input_file: str, output_file: str, height: int = 360) -> tuple[bo
         "-movflags", "+faststart",
         output_file,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = proc.run(cmd)
     if result.returncode != 0:
         return False, (result.stderr or "")[-300:]
     return True, None
@@ -77,6 +81,11 @@ def make_proxy(input_file: str, output_file: str, height: int = 360) -> tuple[bo
 
 def _clamp(v, lo, hi):
     return max(lo, min(v, hi))
+
+
+def _even(v: int) -> int:
+    """h264 needs even dimensions."""
+    return max(2, int(v) // 2 * 2)
 
 
 def _ass_escape(ass_file: str) -> str:
@@ -98,6 +107,37 @@ def _smart_crop_filter(iw: int, ih: int, ratio: str, faces: list[dict]) -> str |
     cy = faces[0]["cy"] if faces else 0.42
     x = _clamp(int(cx * iw - cw / 2), 0, iw - cw)
     y = _clamp(int(cy * ih - 0.42 * ch), 0, ih - ch)
+    return f"crop={cw}:{ch}:{x}:{y},scale={tw}:{th}"
+
+
+def _manual_crop_filter(iw: int, ih: int, ratio: str, crop: dict | None) -> str:
+    """User-placed crop window from the frame editor.
+
+    crop = {"cx", "cy", "zoom"} — cx/cy are the window's center as 0..1 of the
+    source frame, zoom 1.0 is the widest window this ratio allows (>1 = tighter).
+    """
+    tw, th = TARGETS[ratio]
+    target_ar = tw / th
+    crop = crop or {}
+
+    def num(key: str, default: float) -> float:
+        # `or default` would be wrong here: 0.0 is a valid edge position
+        value = crop.get(key)
+        return default if value is None else float(value)
+
+    zoom = _clamp(num("zoom", 1.0), 1.0, 4.0)
+
+    cw = min(iw, ih * target_ar) / zoom
+    ch = cw / target_ar
+    if ch > ih:                      # never ask for more height than we have
+        ch = ih
+        cw = ch * target_ar
+    cw, ch = _even(cw), _even(ch)
+
+    cx = _clamp(num("cx", 0.5), 0.0, 1.0)
+    cy = _clamp(num("cy", 0.5), 0.0, 1.0)
+    x = _clamp(int(cx * iw - cw / 2), 0, max(0, iw - cw))
+    y = _clamp(int(cy * ih - ch / 2), 0, max(0, ih - ch))
     return f"crop={cw}:{ch}:{x}:{y},scale={tw}:{th}"
 
 
@@ -169,6 +209,7 @@ def render_clip(
     ratio: str | None = None,
     ass_file: str | None = None,
     reframe: str = "center",
+    crop: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Cut [start, end], reframe + burn captions. One ffmpeg pass.
 
@@ -188,6 +229,13 @@ def render_clip(
     if ratio and ratio in TARGETS:
         if reframe == "fit":
             filter_complex = _fit_filter_complex(ratio, ass_file)
+        elif reframe == "manual":
+            info = get_video_info(input_file)
+            iw, ih = info["width"], info["height"]
+            if iw <= 0 or ih <= 0:
+                vf_filters.append(RATIO_FILTERS[ratio])
+            else:
+                vf_filters.append(_manual_crop_filter(iw, ih, ratio, crop))
         elif reframe in ("smart", "split"):
             info = get_video_info(input_file)
             iw, ih = info["width"], info["height"]
@@ -225,7 +273,7 @@ def render_clip(
             vf_filters.append(f"ass='{_ass_escape(ass_file)}'")
         cmd = base + (["-vf", ",".join(vf_filters)] if vf_filters else []) + ENCODE + [output_file]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = proc.run(cmd)
     if result.returncode != 0:
         return False, (result.stderr or "")[-300:]
     return True, None
@@ -256,7 +304,7 @@ def _render_dynamic_smart(
                 "ffmpeg", "-y", "-ss", f"{abs_start:.3f}", "-i", input_file,
                 "-t", f"{dur:.3f}", "-vf", vf,
             ] + ENCODE + [part]
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = proc.run(cmd)
             if result.returncode != 0:
                 return False, (result.stderr or "")[-300:]
             part_files.append(part)
@@ -277,7 +325,7 @@ def _render_dynamic_smart(
         else:
             cmd += ["-c", "copy"]
         cmd += ["-movflags", "+faststart", output_file]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = proc.run(cmd)
         if result.returncode != 0:
             return False, (result.stderr or "")[-300:]
         return True, None
@@ -295,6 +343,7 @@ def render_stitched_clip(
     ass_file: str | None = None,
     work_dir: str | None = None,
     reframe: str = "center",
+    crop: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Stitch multiple [start_sec, end_sec] segments into ONE clip (teaser/highlight reel).
 
@@ -312,7 +361,7 @@ def render_stitched_clip(
             part = os.path.join(work_dir, f"_part_{i}.mp4")
             ok, err = render_clip(
                 input_file, part, seg["start_sec"], seg["end_sec"],
-                ratio=ratio, reframe=reframe,
+                ratio=ratio, reframe=reframe, crop=crop,
             )
             if not ok:
                 return False, f"Segment {i+1}: {err}"
@@ -335,7 +384,7 @@ def render_stitched_clip(
             cmd += ["-c", "copy"]
         cmd += ["-movflags", "+faststart", output_file]
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = proc.run(cmd)
         if result.returncode != 0:
             return False, (result.stderr or "")[-300:]
         return True, None

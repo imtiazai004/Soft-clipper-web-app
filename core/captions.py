@@ -1,18 +1,39 @@
-"""TikTok-style caption generation (ASS subtitle format for ffmpeg burn-in).
+"""TikTok-style caption + headline generation (ASS subtitles for ffmpeg burn-in).
 
-Segments are split into small chunks (2-4 words) shown one at a time,
+Captions: segments are split into small chunks (2-4 words) shown one at a time,
 center-positioned, bold with outline — the standard short-form look.
 Word timings inside a segment are approximated by character length.
-"""
-import os
 
+Headline: one line of text pinned for the whole clip (top or bottom), either
+plain outlined text or sitting on a solid box — the "title bar" look.
+
+Both live in a single .ass file with two styles, so ffmpeg burns them in one pass.
+"""
 CAPTION_STYLES = {
-    "Bold White": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 16},
-    "Yellow Pop": {"colour": "&H0000FFFF", "outline": "&H00000000", "fontsize": 16},
-    "Green Highlight": {"colour": "&H0000FF00", "outline": "&H00000000", "fontsize": 16},
+    "TikTok Bold": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 17},
+    "Clean White": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 14},
+    "Yellow Pop": {"colour": "&H0000FFFF", "outline": "&H00000000", "fontsize": 17},
+    "Neon": {"colour": "&H00FFFF00", "outline": "&H00800080", "fontsize": 16},
 }
 
-# ASS uses BGR hex. PlayRes below keeps font sizes consistent across resolutions.
+# earlier builds shipped these names; keep saved clip records rendering the same
+CAPTION_ALIASES = {
+    "Bold White": "TikTok Bold",
+    "Green Highlight": "Neon",
+}
+
+DEFAULT_CAPTION_STYLE = "TikTok Bold"
+
+# BorderStyle 1 = outlined text, 3 = opaque box drawn in OutlineColour.
+HEADLINE_STYLES = {
+    "plain": {"border_style": 1, "outline": 2.5, "shadow": 1, "box": "&H00000000"},
+    "box": {"border_style": 3, "outline": 8, "shadow": 0, "box": "&H1A000000"},
+}
+
+DEFAULT_HEADLINE_STYLE = "box"
+
+# ASS uses BGR hex with a leading alpha byte (00 = opaque, FF = transparent).
+# PlayRes below keeps font sizes consistent across output resolutions.
 ASS_HEADER = """[Script Info]
 ScriptType: v4.00+
 PlayResX: 384
@@ -22,6 +43,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Arial,{fontsize},{colour},&H000000FF,{outline},&H80000000,-1,0,0,0,100,100,0,0,1,2,1,2,10,10,{margin_v},1
+Style: Headline,Arial,{h_fontsize},{h_colour},&H000000FF,{h_box},&H80000000,-1,0,0,0,100,100,0,0,{h_border},{h_outline},{h_shadow},{h_align},14,14,{h_margin},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -40,18 +62,61 @@ def _chunk_words(words: list[str], max_words: int = 3) -> list[list[str]]:
     return [words[i:i + max_words] for i in range(0, len(words), max_words)]
 
 
+def _ass_text(text: str) -> str:
+    """Escape a user string so ASS treats it as plain text, not markup."""
+    return (
+        str(text).strip()
+        .replace("\\", "\\\\")
+        .replace("{", "(")
+        .replace("}", ")")
+        .replace("\r", " ")
+        .replace("\n", "\\N")
+    )
+
+
+def _wrap_headline(text: str, max_chars: int = 26) -> str:
+    """Break a long headline into balanced lines — one long line looks terrible
+    on a 1080-wide vertical video."""
+    words = text.split()
+    if not words:
+        return ""
+    lines, current = [], ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if len(candidate) > max_chars and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\\N".join(lines[:3])
+
+
+def caption_style(name: str) -> dict:
+    name = CAPTION_ALIASES.get(name, name)
+    return CAPTION_STYLES.get(name, CAPTION_STYLES[DEFAULT_CAPTION_STYLE])
+
+
 def build_ass(
     segments: list[dict],
     out_path: str,
-    style: str = "Bold White",
+    style: str = DEFAULT_CAPTION_STYLE,
     words_per_line: int = 3,
     margin_v: int = 40,
+    headline: dict | None = None,
+    clip_duration: float = 0.0,
 ) -> str | None:
-    """Write an ASS file from clip-relative segments. Returns path or None if no text."""
-    st = CAPTION_STYLES.get(style, CAPTION_STYLES["Bold White"])
+    """Write an ASS file from clip-relative caption segments and/or a headline.
+
+    headline: {"text", "style": plain|box, "position": top|bottom, "size": int}
+    clip_duration: how long the headline stays on screen (whole clip).
+    Returns the path, or None when there is nothing to burn in.
+    """
+    st = caption_style(style)
     lines = []
 
-    for seg in segments:
+    for seg in segments or []:
         text = seg["text"].strip()
         if not text:
             continue
@@ -75,11 +140,31 @@ def build_ass(
             )
             t += chunk_dur
 
+    head_text = _wrap_headline(_ass_text((headline or {}).get("text", "")))
+    if head_text and clip_duration > 0:
+        # layer 1 so the headline always wins if a caption chunk overlaps it
+        lines.append(
+            f"Dialogue: 1,{_ass_time(0)},{_ass_time(clip_duration)},Headline,,0,0,0,,{head_text}"
+        )
+
     if not lines:
         return None
 
+    hs = HEADLINE_STYLES.get(
+        (headline or {}).get("style"), HEADLINE_STYLES[DEFAULT_HEADLINE_STYLE]
+    )
+    top = (headline or {}).get("position", "top") != "bottom"
     header = ASS_HEADER.format(
-        fontsize=st["fontsize"], colour=st["colour"], outline=st["outline"], margin_v=margin_v
+        fontsize=st["fontsize"], colour=st["colour"], outline=st["outline"],
+        margin_v=margin_v,
+        h_fontsize=max(8, min(40, int((headline or {}).get("size", 20)))),
+        h_colour="&H00FFFFFF",
+        h_box=hs["box"],
+        h_border=hs["border_style"],
+        h_outline=hs["outline"],
+        h_shadow=hs["shadow"],
+        h_align=8 if top else 2,          # \an8 top-center, \an2 bottom-center
+        h_margin=30 if top else margin_v + 55,   # bottom headline sits above captions
     )
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(header + "\n".join(lines) + "\n")

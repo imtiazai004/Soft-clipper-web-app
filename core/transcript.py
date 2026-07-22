@@ -8,10 +8,10 @@ A transcript is always a list of segments:
     [{"start": float_seconds, "duration": float_seconds, "text": str}, ...]
 """
 import os
-import subprocess
 
 from youtube_transcript_api import YouTubeTranscriptApi
 
+from . import proc
 from .utils import seconds_to_mmss
 
 PREFERRED_LANGS = ["en", "ur", "hi", "ps", "ar"]
@@ -63,7 +63,7 @@ def extract_audio(video_path: str, out_path: str) -> bool:
         "-vn", "-ac", "1", "-ar", "16000", "-b:a", "48k",
         out_path,
     ]
-    result = subprocess.run(cmd, capture_output=True)
+    result = proc.run(cmd)
     return result.returncode == 0 and os.path.exists(out_path)
 
 

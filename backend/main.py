@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
-from core import ai, captions, downloader, transcript, utils, video
+from core import ai, captions, downloader, proc, transcript, utils, video
 
 # ── path setup (works both as source and as a bundled PyInstaller exe) ────────
 if getattr(sys, "frozen", False):
@@ -176,7 +176,7 @@ def _prune_jobs() -> None:
     """Drop finished jobs after a while so the dict can't grow forever."""
     cutoff = time.time() - 3600
     for jid, j in list(jobs.items()):
-        if j["status"] in ("done", "error") and j.get("finished_at", 0) < cutoff:
+        if j["status"] in ("done", "error", "cancelled") and j.get("finished_at", 0) < cutoff:
             jobs.pop(jid, None)
 
 
@@ -189,23 +189,30 @@ def start_job(user: str, target, *args, heavy: bool = False) -> str:
     """
     job_id = uuid.uuid4().hex[:12]
     jobs[job_id] = {"status": "running", "progress": 0.0, "message": "Starting...",
-                    "result": None, "error": None, "user": user}
+                    "result": None, "error": None, "user": user, "cancelled": False}
     _prune_jobs()
 
     def runner():
         job = jobs[job_id]
         acquired = False
+        # bind this thread to the job dict so core/ can see the cancel flag
+        proc.use_token(job)
         try:
             if heavy:
                 if not _render_slots.acquire(blocking=False):
                     job["message"] = "Waiting for a free render slot..."
                     _render_slots.acquire()
                 acquired = True
+            # someone can cancel while queued for a slot — don't start rendering then
+            proc.check()
             result = target(job, *args)
             job.update(status="done", progress=1.0, result=result, message="Done")
+        except proc.Cancelled:
+            job.update(status="cancelled", message="Cancelled")
         except Exception as e:
             job.update(status="error", error=str(e), message=str(e))
         finally:
+            proc.use_token(None)
             if acquired:
                 _render_slots.release()
             job["finished_at"] = time.time()
@@ -418,36 +425,60 @@ def clip_to_api(user: str, c: dict) -> dict:
     }
 
 
+def headline_text(rec: dict) -> str:
+    """What the headline should say: the user's own text, else the AI title.
+
+    The AI already writes a hook title for every clip, so "use the title" needs
+    no extra call — a blank custom text just falls back to it.
+    """
+    h = rec["render"].get("headline") or {}
+    if not h.get("enabled"):
+        return ""
+    custom = (h.get("text") or "").strip()
+    if custom:
+        return custom
+    meta = rec.get("meta") or {}
+    return (meta.get("hook_title") or rec["name"].replace("_", " ")).strip()
+
+
 def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
     """Render a clip record (single or stitched) according to rec['render']."""
     sess = get_session(user)
     r = rec["render"]
     segs = r["segments"]
     cap = r.get("captions", {})
-    ass_file = None
+    head = dict(r.get("headline") or {}, text=headline_text(rec))
+    clip_duration = sum(s["end_sec"] - s["start_sec"] for s in segs)
+
+    caption_segs = []
     if cap.get("enabled") and sess["transcript_segments"]:
         if len(segs) == 1:
-            cs = transcript.segments_between(
+            caption_segs = transcript.segments_between(
                 sess["transcript_segments"], segs[0]["start_sec"], segs[0]["end_sec"])
         else:
-            cs = transcript.segments_for_stitched(sess["transcript_segments"], segs)
-        if cs:
-            ass_file = captions.build_ass(
-                cs, os.path.join(out_dir, "_cap_tmp.ass"),
-                style=cap.get("style", "TikTok Bold"),
-                words_per_line=cap.get("words_per_line", 4),
-            )
+            caption_segs = transcript.segments_for_stitched(sess["transcript_segments"], segs)
+
+    ass_file = None
+    # one .ass carries both captions and headline — either alone is reason to build it
+    if caption_segs or head["text"]:
+        ass_file = captions.build_ass(
+            caption_segs, os.path.join(out_dir, "_cap_tmp.ass"),
+            style=cap.get("style", "TikTok Bold"),
+            words_per_line=cap.get("words_per_line", 4),
+            headline=head, clip_duration=clip_duration,
+        )
     try:
         if len(segs) == 1:
             ok, err = video.render_clip(
                 sess["video_path"], rec["path"], segs[0]["start_sec"], segs[0]["end_sec"],
                 ratio=r.get("ratio"), ass_file=ass_file, reframe=r.get("reframe", "smart"),
+                crop=r.get("crop"),
             )
         else:
             ok, err = video.render_stitched_clip(
                 sess["video_path"], rec["path"], segs,
                 ratio=r.get("ratio"), ass_file=ass_file, work_dir=out_dir,
-                reframe=r.get("reframe", "smart"),
+                reframe=r.get("reframe", "smart"), crop=r.get("crop"),
             )
     finally:
         if ass_file and os.path.exists(ass_file):
@@ -505,11 +536,29 @@ class CaptionOpts(BaseModel):
     words_per_line: int = 4
 
 
+class HeadlineOpts(BaseModel):
+    """Title bar burned across the whole clip."""
+    enabled: bool = False
+    text: str = ""                 # blank -> the clip's AI hook title is used
+    style: str = "box"             # box | plain
+    position: str = "top"          # top | bottom
+    size: int = 20
+
+
+class CropOpts(BaseModel):
+    """Manual crop window from the frame editor (reframe='manual')."""
+    cx: float = 0.5
+    cy: float = 0.5
+    zoom: float = 1.0
+
+
 class CutBody(BaseModel):
     clips: list[dict]              # [{name, start_sec, end_sec, meta?}]
     ratio: str | None = "9:16"
-    reframe: str = "smart"         # smart | fit | split | center
+    reframe: str = "smart"         # smart | fit | split | center | manual
     captions: CaptionOpts = CaptionOpts()
+    headline: HeadlineOpts = HeadlineOpts()
+    crop: CropOpts = CropOpts()
 
 
 class ReelBody(BaseModel):
@@ -518,8 +567,10 @@ class ReelBody(BaseModel):
     theme: str = ""
     target_duration: int = 45
     ratio: str | None = "9:16"
-    reframe: str = "smart"         # smart | fit | split | center
+    reframe: str = "smart"         # smart | fit | split | center | manual
     captions: CaptionOpts = CaptionOpts()
+    headline: HeadlineOpts = HeadlineOpts()
+    crop: CropOpts = CropOpts()
 
 
 # ── auth endpoints ────────────────────────────────────────────────────────────
@@ -629,6 +680,9 @@ def qualities(url: str, user: str = Depends(auth.current_user)):
 def job_download(body: DownloadBody, user: str = Depends(auth.current_user)):
     def work(job):
         def hook(d):
+            # yt-dlp has no cancel switch; raising out of the hook aborts it
+            if job.get("cancelled"):
+                raise proc.Cancelled("Cancelled")
             if d.get("status") == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
                 done = d.get("downloaded_bytes", 0)
@@ -645,6 +699,10 @@ def job_download(body: DownloadBody, user: str = Depends(auth.current_user)):
                 body.url.strip(), body.quality, progress_hook=hook,
                 proxy=get_proxy(user), out_dir=user_downloads(user), **get_cookies(user))
         except Exception as e:
+            # a cancel travels out through the hook, sometimes wrapped by yt-dlp —
+            # it must not be reported as a download failure
+            if isinstance(e, proc.Cancelled) or job.get("cancelled"):
+                raise proc.Cancelled("Cancelled")
             raise RuntimeError(download_error_message(e, user))
         if not duration:
             duration = video.get_video_info(path)["duration"]
@@ -793,6 +851,8 @@ def job_cut(body: CutBody, user: str = Depends(auth.current_user)):
                     "ratio": body.ratio,
                     "reframe": body.reframe,
                     "captions": body.captions.model_dump(),
+                    "headline": body.headline.model_dump(),
+                    "crop": body.crop.model_dump(),
                 },
             }
             render_record(job, user, rec, out_dir)
@@ -844,6 +904,8 @@ def job_reel(body: ReelBody, user: str = Depends(auth.current_user)):
                 "ratio": body.ratio,
                 "reframe": body.reframe,
                 "captions": body.captions.model_dump(),
+                "headline": body.headline.model_dump(),
+                "crop": body.crop.model_dump(),
             },
         }
         render_record(job, user, rec, out_dir)
@@ -862,6 +924,8 @@ class EditBody(BaseModel):
     ratio: str | None = "9:16"
     reframe: str = "smart"
     captions: CaptionOpts = CaptionOpts()
+    headline: HeadlineOpts = HeadlineOpts()
+    crop: CropOpts = CropOpts()
 
 
 class AiEditBody(BaseModel):
@@ -888,7 +952,8 @@ def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
             if sess["video_duration"]:
                 en = min(en, sess["video_duration"])
                 st = max(0.0, min(st, en))
-            if en - st >= 1.0:
+            # frame-level trims are legitimately short — only reject empty cuts
+            if en - st >= 0.3:
                 segs.append({"start_sec": st, "end_sec": en})
         if not segs:
             raise RuntimeError("No valid segments — check start/end times")
@@ -899,6 +964,8 @@ def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
             "ratio": body.ratio,
             "reframe": body.reframe,
             "captions": body.captions.model_dump(),
+            "headline": body.headline.model_dump(),
+            "crop": body.crop.model_dump(),
         }
         rerender_clip(job, user, rec)
         return {"clips": [clip_to_api(user, c) for c in sess["clips"]]}
@@ -956,6 +1023,21 @@ def job_ai_edit(body: AiEditBody, user: str = Depends(auth.current_user)):
 @app.get("/api/jobs/{job_id}")
 def job_status(job_id: str, user: str = Depends(auth.current_user)):
     return owned_job(job_id, user)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def job_cancel(job_id: str, user: str = Depends(auth.current_user)):
+    """Ask a running job to stop.
+
+    Only sets the flag — the job thread notices it between steps, and any ffmpeg
+    it is currently running gets killed by core.proc, usually within a second.
+    owned_job keeps one user from cancelling another user's render.
+    """
+    job = owned_job(job_id, user)
+    if job["status"] == "running":
+        job["cancelled"] = True
+        job["message"] = "Cancelling..."
+    return {"ok": True, "status": job["status"]}
 
 
 @app.get("/api/clips")
