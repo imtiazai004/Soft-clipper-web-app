@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
-from core import ai, captions, downloader, proc, transcript, utils, video
+from core import ai, captions, cleanup, downloader, proc, transcript, utils, video
 
 # ── path setup (works both as source and as a bundled PyInstaller exe) ────────
 if getattr(sys, "frozen", False):
@@ -1074,6 +1074,48 @@ def clip_file(rel_path: str, user: str = Depends(auth.current_user)):
     if not os.path.isfile(full):
         raise HTTPException(404, "Not found")
     return FileResponse(full)
+
+
+# ── disk housekeeping ─────────────────────────────────────────────────────────
+# On a server the disk is the scarce resource: a source video is 1-2 GB and
+# nothing here ever deleted itself, so a 40 GB box fills up after a couple of
+# dozen videos and then downloads and renders start failing for reasons that
+# look nothing like "disk full". Clips are meant to be downloaded and forgotten,
+# so ageing them out is housekeeping.
+#
+# Desktop mode defaults to off — there the clips are in the user's own folder
+# and are the thing they came here for; deleting them would destroy their work.
+# The tell for "this is a server" is DATA_ROOT, which the compose file sets and
+# the .exe never does. MULTI_USER would be the obvious signal but it is the
+# wrong one: a server can run with login off and still needs its disk swept.
+_IS_SERVER = bool(os.environ.get("DATA_ROOT")) or auth.MULTI_USER
+CLEANUP_HOURS = float(os.environ.get("CLEANUP_HOURS", "24" if _IS_SERVER else "0") or 0)
+
+
+def cleanup_targets() -> tuple[list[str], set[str]]:
+    """Every user's folders, and the paths their live sessions still need."""
+    roots, protected = [], set()
+    users = list(sessions) or ([] if auth.MULTI_USER else [auth.LOCAL_USER])
+    if auth.MULTI_USER:
+        # include users who have no live session, so a signed-out account's
+        # old files are cleaned up too
+        base = os.path.join(DATA_ROOT, "users")
+        if os.path.isdir(base):
+            users = sorted(set(users) | set(os.listdir(base)))
+    for user in users:
+        root = user_root(user)
+        roots.append(os.path.join(root, "downloads"))
+        roots.append(os.path.join(root, "clips"))
+    with _sessions_lock:
+        live = list(sessions.values())
+    for sess in live:
+        protected.add(sess["video_path"])
+        protected.add(sess["proxy_path"])
+        protected.update(c["path"] for c in sess["clips"])
+    return roots, protected
+
+
+cleanup.start_janitor(cleanup_targets, CLEANUP_HOURS)
 
 
 # ── static serving ────────────────────────────────────────────────────────────
