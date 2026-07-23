@@ -430,3 +430,18 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 }
 .btn.danger:hover { background: rgba(248, 113, 113, 0.22); }
 .cancel-btn { margin-left: auto; }
+
+/* clip editor — look effects */
+.look-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(84px, 1fr)); gap: 6px; }
+.look-chip {
+  padding: 7px 6px; border-radius: 10px; font-size: 12.5px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  transition: border-color .12s, background .12s;
+}
+.look-chip:hover { border-color: rgba(139, 92, 246, 0.5); }
+.look-chip.active { border-color: var(--accent); background: rgba(139, 92, 246, 0.16); }
+
+.adjust-grid { display: flex; flex-direction: column; gap: 7px; }
+.adjust-row { display: flex; align-items: center; gap: 10px; }
+.adjust-row .muted { min-width: 82px; font-size: 12.5px; }
+.adjust-row input[type="range"] { flex: 1; }

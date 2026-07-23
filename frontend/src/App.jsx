@@ -25,6 +25,36 @@ const FRAME = 1 / 30   // one frame step at 30fps — fine for trimming by eye
 
 const clamp01 = (v) => Math.max(0, Math.min(1, v))
 
+// Look presets — labels for the editor, plus a CSS approximation of what ffmpeg
+// bakes on export. The keys must match core/effects.py LOOKS; the CSS is only a
+// live preview, so it's close, not pixel-exact.
+const LOOKS = [
+  { id: 'none', label: 'None', css: 'none' },
+  { id: 'warm', label: '🔥 Warm', css: 'sepia(.2) saturate(1.12) hue-rotate(-8deg)' },
+  { id: 'cold', label: '❄️ Cold', css: 'saturate(1.06) hue-rotate(10deg) brightness(1.02)' },
+  { id: 'vintage', label: '📼 Vintage', css: 'sepia(.38) contrast(.95) saturate(.82)' },
+  { id: 'bw', label: '⬛ B&W', css: 'grayscale(1)' },
+  { id: 'cinematic', label: '🎬 Cinematic', css: 'contrast(1.1) saturate(.9) brightness(.98)' },
+  { id: 'vivid', label: '⚡ Vivid', css: 'saturate(1.4) contrast(1.06)' },
+]
+
+const DEFAULT_EFFECTS = {
+  mirror: false, brightness: 0, contrast: 1, saturation: 1, look: 'none', speed: 1,
+}
+
+// The CSS `filter` string that mirrors the baked effects for live preview.
+// eq brightness is additive (-.5...5) but CSS brightness() is multiplicative,
+// so map it to 1 + brightness; the rest line up directly.
+function effectsToCss(e) {
+  const look = LOOKS.find((l) => l.id === e.look)?.css
+  const parts = []
+  if (look && look !== 'none') parts.push(look)
+  if (e.brightness) parts.push(`brightness(${(1 + e.brightness).toFixed(3)})`)
+  if (e.contrast !== 1) parts.push(`contrast(${e.contrast})`)
+  if (e.saturation !== 1) parts.push(`saturate(${e.saturation})`)
+  return parts.length ? parts.join(' ') : 'none'
+}
+
 export default function App() {
   // global
   const [job, setJob] = useState(null)
@@ -719,7 +749,7 @@ export default function App() {
  *  frame here is what the clip renders — no guessing between UI and output.
  */
 function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFallback,
-                      manual, onTimeUpdate, onReady }) {
+                      manual, effects, onTimeUpdate, onReady }) {
   const [dims, setDims] = useState({ w: 0, h: 0 })
   const stageRef = useRef(null)
   const dragging = useRef(false)
@@ -759,6 +789,13 @@ function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFal
       style={{ aspectRatio: dims.w ? `${dims.w} / ${dims.h}` : '16 / 9' }}>
       <video
         ref={videoRef} src={src} className="stage-video" controls={!active}
+        // live look preview: filters + mirror flip. Applied to the video only,
+        // so the headline overlay stays upright and readable, exactly as ffmpeg
+        // burns it after the flip.
+        style={{
+          filter: effects ? effectsToCss(effects) : 'none',
+          transform: effects?.mirror ? 'scaleX(-1)' : 'none',
+        }}
         onLoadedMetadata={(e) => {
           setDims({ w: e.target.videoWidth, h: e.target.videoHeight })
           onReady?.(e)
@@ -787,6 +824,62 @@ function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFal
         </div>
       )}
     </div>
+  )
+}
+
+/** Look effects: mirror, colour adjust, preset looks, speed. Everything here
+ *  previews live on the stage video (CSS + playbackRate) and is baked by ffmpeg
+ *  only on Re-render, so dragging a slider costs the server nothing. */
+function EffectsPanel({ effects, setFx }) {
+  const changed =
+    effects.mirror || effects.look !== 'none' || effects.speed !== 1 ||
+    effects.brightness !== 0 || effects.contrast !== 1 || effects.saturation !== 1
+
+  return (
+    <>
+      <label className="lbl" style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <span>EFFECTS</span>
+        {changed && (
+          <button className="btn sm ghost" onClick={() => setFx({ ...DEFAULT_EFFECTS })}>Reset all</button>
+        )}
+      </label>
+
+      <div className="row mb" style={{ flexWrap: 'wrap', gap: 8 }}>
+        <button className={`pill ${effects.mirror ? 'active' : ''}`}
+          onClick={() => setFx({ mirror: !effects.mirror })}>🪞 Mirror</button>
+        <div className="grow" style={{ minWidth: 130, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className="muted" style={{ minWidth: 46 }}>Speed</span>
+          <input type="range" min={0.5} max={2} step={0.05} value={effects.speed}
+            onChange={(e) => setFx({ speed: +e.target.value })} />
+          <span className="side-val">{effects.speed.toFixed(2)}×</span>
+        </div>
+      </div>
+
+      <div className="look-grid mb">
+        {LOOKS.map((l) => (
+          <button key={l.id} className={`look-chip ${effects.look === l.id ? 'active' : ''}`}
+            onClick={() => setFx({ look: l.id })}>{l.label}</button>
+        ))}
+      </div>
+
+      <div className="adjust-grid mb">
+        <div className="adjust-row">
+          <span className="muted">Brightness</span>
+          <input type="range" min={-0.5} max={0.5} step={0.02} value={effects.brightness}
+            onChange={(e) => setFx({ brightness: +e.target.value })} />
+        </div>
+        <div className="adjust-row">
+          <span className="muted">Contrast</span>
+          <input type="range" min={0.5} max={2} step={0.02} value={effects.contrast}
+            onChange={(e) => setFx({ contrast: +e.target.value })} />
+        </div>
+        <div className="adjust-row">
+          <span className="muted">Saturation</span>
+          <input type="range" min={0} max={3} step={0.02} value={effects.saturation}
+            onChange={(e) => setFx({ saturation: +e.target.value })} />
+        </div>
+      </div>
+    </>
   )
 }
 
@@ -828,11 +921,18 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   const [crop, setCrop] = useState({
     cx: r.crop?.cx ?? 0.5, cy: r.crop?.cy ?? 0.5, zoom: r.crop?.zoom ?? 1,
   })
+  const [effects, setEffects] = useState({ ...DEFAULT_EFFECTS, ...(r.effects || {}) })
+  const setFx = (patch) => setEffects((e) => ({ ...e, ...patch }))
 
   const videoRef = useRef(null)
   const stopAt = useRef(null)                      // pause point for segment preview
   const [now, setNow] = useState(0)
   const aiTitle = clip.meta?.hook_title || clip.name.replace(/_/g, ' ')
+
+  // preview speed by actually playing the source faster/slower
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = effects.speed
+  }, [effects.speed])
 
   function seek(t) {
     const v = videoRef.current
@@ -883,6 +983,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
       captions: { enabled: capOn, style: capStyle, words_per_line: words },
       headline: head,
       crop,
+      effects,
     })
   }
 
@@ -903,6 +1004,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
           headline={head}
           headlineFallback={aiTitle}
           manual={reframe === 'manual'}
+          effects={effects}
           // open on the clip's own first frame, not on the start of the source
           onReady={() => seek(mmssToSec(segments[0]?.start) || 0)}
           onTimeUpdate={(e) => {
@@ -1032,6 +1134,8 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
                 <div className="hint mb">Manual framing needs a fixed aspect ratio — pick 9:16, 1:1 or 16:9 above.</div>
               )
             )}
+
+            <EffectsPanel effects={effects} setFx={setFx} />
 
             <label className="lbl">HEADLINE</label>
             <div className="row mb">

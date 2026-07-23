@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 
+from . import effects as fx
 from . import proc
 from . import reframe as face_reframe
 
@@ -141,7 +142,22 @@ def _manual_crop_filter(iw: int, ih: int, ratio: str, crop: dict | None) -> str:
     return f"crop={cw}:{ch}:{x}:{y},scale={tw}:{th}"
 
 
-def _fit_filter_complex(ratio: str, ass_file: str | None) -> str:
+def _tail(chain: str, vfx: list[str], ass_file: str | None) -> str:
+    """Append effect filters, then caption/headline burn-in, to a chain ending [out].
+
+    Effects come before the ass burn so a mirror flips the video but not the
+    (mirrored-would-be-unreadable) captions, and a speed retime shifts the frames
+    the captions are then drawn over.
+    """
+    steps = list(vfx)
+    if ass_file:
+        steps.append(f"ass='{_ass_escape(ass_file)}'")
+    if not steps:
+        return chain
+    return chain.replace("[out]", "[fx]") + ";[fx]" + ",".join(steps) + "[out]"
+
+
+def _fit_filter_complex(ratio: str, ass_file: str | None, vfx: list[str]) -> str:
     """Full video over blurred background, no cropping."""
     tw, th = TARGETS[ratio]
     chain = (
@@ -151,12 +167,11 @@ def _fit_filter_complex(ratio: str, ass_file: str | None) -> str:
         f"[fg]scale={tw}:{th}:force_original_aspect_ratio=decrease[fgs];"
         f"[bgb][fgs]overlay=(W-w)/2:(H-h)/2[out]"
     )
-    if ass_file:
-        chain = chain.replace("[out]", "[pre]") + f";[pre]ass='{_ass_escape(ass_file)}'[out]"
-    return chain
+    return _tail(chain, vfx, ass_file)
 
 
-def _split_filter_complex(iw: int, ih: int, faces: list[dict], ass_file: str | None) -> str | None:
+def _split_filter_complex(iw: int, ih: int, faces: list[dict], ass_file: str | None,
+                          vfx: list[str]) -> str | None:
     """Stacked 9:16 layout — NEVER shows the same person twice.
 
     - 2+ clearly separate faces  -> speaker panel top, 2nd person panel bottom
@@ -196,9 +211,7 @@ def _split_filter_complex(iw: int, ih: int, faces: list[dict], ass_file: str | N
         f"[b]crop={pw}:{ph}:{x2}:{y2},scale=1080:960[bot];"
         f"[top][bot]vstack[out]"
     )
-    if ass_file:
-        chain = chain.replace("[out]", "[pre]") + f";[pre]ass='{_ass_escape(ass_file)}'[out]"
-    return chain
+    return _tail(chain, vfx, ass_file)
 
 
 def render_clip(
@@ -210,8 +223,9 @@ def render_clip(
     ass_file: str | None = None,
     reframe: str = "center",
     crop: dict | None = None,
+    effects: dict | None = None,
 ) -> tuple[bool, str | None]:
-    """Cut [start, end], reframe + burn captions. One ffmpeg pass.
+    """Cut [start, end], reframe + look effects + burn captions. One ffmpeg pass.
 
     Returns (ok, error_message).
     """
@@ -222,13 +236,21 @@ def render_clip(
     if ass_file and not os.path.exists(ass_file):
         ass_file = None
 
-    base = ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", input_file, "-t", f"{duration:.3f}"]
+    vfx = fx.video_filters(effects)          # mirror / look / colour / speed
+    afx = fx.audio_filter(effects)           # atempo, when speed != 1
+
+    # -t goes BEFORE -i so it trims the SOURCE window, not the output. With a
+    # speed effect the two differ: as an output limit ffmpeg would keep pulling
+    # source until the (retimed) output hit `duration`, dragging in footage from
+    # past the intended end. Trimming the input first cuts [start, start+duration]
+    # of the source, then setpts retimes that to duration/speed.
+    base = ["ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", input_file]
     filter_complex = None
     vf_filters = []
 
     if ratio and ratio in TARGETS:
         if reframe == "fit":
-            filter_complex = _fit_filter_complex(ratio, ass_file)
+            filter_complex = _fit_filter_complex(ratio, ass_file, vfx)
         elif reframe == "manual":
             info = get_video_info(input_file)
             iw, ih = info["width"], info["height"]
@@ -244,16 +266,16 @@ def render_clip(
             else:
                 faces = face_reframe.analyze(input_file, start, end)
                 if reframe == "split" and ratio == "9:16":
-                    filter_complex = _split_filter_complex(iw, ih, faces, ass_file)
+                    filter_complex = _split_filter_complex(iw, ih, faces, ass_file, vfx)
                     if filter_complex is None:
                         # single centered speaker (or no faces): split would duplicate
                         # the person, so use face-centered smart crop instead
                         vf_filters.append(_smart_crop_filter(iw, ih, ratio, faces))
                 else:  # smart (or split on non-9:16 ratios)
+                    # the multi-window "follow the speaker" path can't also carry
+                    # effects cleanly, so only take it when there are no effects
                     windows = face_reframe.crop_timeline(input_file, start, end)
-                    if len(windows) > 1:
-                        # speaker changes position mid-clip: piecewise crop that
-                        # follows them (each window gets its own crop, then concat)
+                    if len(windows) > 1 and not vfx and not afx:
                         return _render_dynamic_smart(
                             input_file, output_file, start, windows,
                             iw, ih, ratio, ass_file,
@@ -264,14 +286,21 @@ def render_clip(
             vf_filters.append(RATIO_FILTERS[ratio])
 
     if filter_complex:
+        # fit/split already folded vfx + ass into the chain via _tail
+        audio_map = ["-map", "0:a?"]
+        if afx:
+            filter_complex += f";[0:a]{afx}[aout]"
+            audio_map = ["-map", "[aout]?"]
         cmd = base + [
-            "-filter_complex", filter_complex,
-            "-map", "[out]", "-map", "0:a?",
-        ] + ENCODE + [output_file]
+            "-filter_complex", filter_complex, "-map", "[out]",
+        ] + audio_map + ENCODE + [output_file]
     else:
+        # crop filter (if any) -> effects -> captions, all on the plain -vf chain
+        vf_filters.extend(vfx)
         if ass_file:
             vf_filters.append(f"ass='{_ass_escape(ass_file)}'")
-        cmd = base + (["-vf", ",".join(vf_filters)] if vf_filters else []) + ENCODE + [output_file]
+        cmd = base + (["-vf", ",".join(vf_filters)] if vf_filters else [])
+        cmd += (["-af", afx] if afx else []) + ENCODE + [output_file]
 
     result = proc.run(cmd)
     if result.returncode != 0:
@@ -344,6 +373,7 @@ def render_stitched_clip(
     work_dir: str | None = None,
     reframe: str = "center",
     crop: dict | None = None,
+    effects: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Stitch multiple [start_sec, end_sec] segments into ONE clip (teaser/highlight reel).
 
@@ -361,7 +391,7 @@ def render_stitched_clip(
             part = os.path.join(work_dir, f"_part_{i}.mp4")
             ok, err = render_clip(
                 input_file, part, seg["start_sec"], seg["end_sec"],
-                ratio=ratio, reframe=reframe, crop=crop,
+                ratio=ratio, reframe=reframe, crop=crop, effects=effects,
             )
             if not ok:
                 return False, f"Segment {i+1}: {err}"

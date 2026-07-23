@@ -33,7 +33,7 @@ from pydantic import BaseModel
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
-from core import ai, captions, cleanup, downloader, proc, transcript, utils, video
+from core import ai, captions, cleanup, downloader, effects, proc, transcript, utils, video
 
 # ── path setup (works both as source and as a bundled PyInstaller exe) ────────
 if getattr(sys, "frozen", False):
@@ -447,8 +447,10 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
     r = rec["render"]
     segs = r["segments"]
     cap = r.get("captions", {})
+    eff = r.get("effects")
     head = dict(r.get("headline") or {}, text=headline_text(rec))
-    clip_duration = sum(s["end_sec"] - s["start_sec"] for s in segs)
+    # captions and headline sit on the sped-up output timeline, so scale by speed
+    clip_duration = effects.scale_time(sum(s["end_sec"] - s["start_sec"] for s in segs), eff)
 
     caption_segs = []
     if cap.get("enabled") and sess["transcript_segments"]:
@@ -457,6 +459,7 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
                 sess["transcript_segments"], segs[0]["start_sec"], segs[0]["end_sec"])
         else:
             caption_segs = transcript.segments_for_stitched(sess["transcript_segments"], segs)
+    caption_segs = effects.scale_captions(caption_segs, eff)
 
     ass_file = None
     # one .ass carries both captions and headline — either alone is reason to build it
@@ -472,13 +475,13 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
             ok, err = video.render_clip(
                 sess["video_path"], rec["path"], segs[0]["start_sec"], segs[0]["end_sec"],
                 ratio=r.get("ratio"), ass_file=ass_file, reframe=r.get("reframe", "smart"),
-                crop=r.get("crop"),
+                crop=r.get("crop"), effects=eff,
             )
         else:
             ok, err = video.render_stitched_clip(
                 sess["video_path"], rec["path"], segs,
                 ratio=r.get("ratio"), ass_file=ass_file, work_dir=out_dir,
-                reframe=r.get("reframe", "smart"), crop=r.get("crop"),
+                reframe=r.get("reframe", "smart"), crop=r.get("crop"), effects=eff,
             )
     finally:
         if ass_file and os.path.exists(ass_file):
@@ -552,6 +555,16 @@ class CropOpts(BaseModel):
     zoom: float = 1.0
 
 
+class EffectsOpts(BaseModel):
+    """Look effects baked on export (previewed live in the browser)."""
+    mirror: bool = False
+    brightness: float = 0.0        # -0.5..0.5, 0 = unchanged
+    contrast: float = 1.0          # 0.5..2, 1 = unchanged
+    saturation: float = 1.0        # 0..3, 1 = unchanged
+    look: str = "none"             # none|warm|cold|vintage|bw|cinematic|vivid
+    speed: float = 1.0             # 0.5..2, 1 = unchanged
+
+
 class CutBody(BaseModel):
     clips: list[dict]              # [{name, start_sec, end_sec, meta?}]
     ratio: str | None = "9:16"
@@ -559,6 +572,7 @@ class CutBody(BaseModel):
     captions: CaptionOpts = CaptionOpts()
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
+    effects: EffectsOpts = EffectsOpts()
 
 
 class ReelBody(BaseModel):
@@ -571,6 +585,7 @@ class ReelBody(BaseModel):
     captions: CaptionOpts = CaptionOpts()
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
+    effects: EffectsOpts = EffectsOpts()
 
 
 # ── auth endpoints ────────────────────────────────────────────────────────────
@@ -853,6 +868,7 @@ def job_cut(body: CutBody, user: str = Depends(auth.current_user)):
                     "captions": body.captions.model_dump(),
                     "headline": body.headline.model_dump(),
                     "crop": body.crop.model_dump(),
+                    "effects": body.effects.model_dump(),
                 },
             }
             render_record(job, user, rec, out_dir)
@@ -906,6 +922,7 @@ def job_reel(body: ReelBody, user: str = Depends(auth.current_user)):
                 "captions": body.captions.model_dump(),
                 "headline": body.headline.model_dump(),
                 "crop": body.crop.model_dump(),
+                "effects": body.effects.model_dump(),
             },
         }
         render_record(job, user, rec, out_dir)
@@ -926,6 +943,7 @@ class EditBody(BaseModel):
     captions: CaptionOpts = CaptionOpts()
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
+    effects: EffectsOpts = EffectsOpts()
 
 
 class AiEditBody(BaseModel):
@@ -966,6 +984,7 @@ def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
             "captions": body.captions.model_dump(),
             "headline": body.headline.model_dump(),
             "crop": body.crop.model_dump(),
+            "effects": body.effects.model_dump(),
         }
         rerender_clip(job, user, rec)
         return {"clips": [clip_to_api(user, c) for c in sess["clips"]]}
