@@ -456,3 +456,14 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 .ov-chip:active { cursor: grabbing; }
 .ov-row { display: flex; gap: 8px; align-items: center; }
 .ov-row .input { flex: 1; min-width: 90px; }
+
+/* global "style all clips" panel */
+.style-all { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: var(--card); }
+.style-all > summary { cursor: pointer; font-weight: 700; list-style: none; }
+.style-all > summary::-webkit-details-marker { display: none; }
+.style-all > summary::before { content: '▸ '; opacity: 0.6; }
+.style-all[open] > summary::before { content: '▾ '; }
+
+/* editor Source | Result toggle */
+.seg-toggle { display: inline-flex; gap: 4px; }
+.seg-toggle .tab { font-size: 12.5px; padding: 4px 10px; }

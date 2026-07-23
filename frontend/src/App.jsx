@@ -102,6 +102,14 @@ export default function App() {
   const [headlinePos, setHeadlinePos] = useState('top')
   const [headlineSize, setHeadlineSize] = useState(20)
   const [crop, setCrop] = useState({ cx: 0.5, cy: 0.5, zoom: 1 })
+  // look effects + text overlays applied to EVERY generated clip (edit once here,
+  // fine-tune any single clip later in its own editor)
+  const [effects, setEffects] = useState({ ...DEFAULT_EFFECTS })
+  const setFx = (patch) => setEffects((e) => ({ ...e, ...patch }))
+  const [overlays, setOverlays] = useState([])
+  const [styleOpen, setStyleOpen] = useState(false)
+  const moveOverlay = (id, x, y) =>
+    setOverlays((list) => list.map((o) => (o.id === id ? { ...o, x, y } : o)))
   const [numClips, setNumClips] = useState(6)
   const [lenRange, setLenRange] = useState([15, 60])
 
@@ -126,13 +134,26 @@ export default function App() {
   const [editing, setEditing] = useState(null)   // clip index being edited
 
   const busy = !!job
+  // one-line summary of the active global look, shown on the collapsed panel
+  const styleSummary = [
+    effects.look !== 'none' && LOOKS.find((l) => l.id === effects.look)?.label,
+    effects.mirror && 'Mirror',
+    effects.speed !== 1 && `${effects.speed}×`,
+    (effects.brightness !== 0 || effects.contrast !== 1 || effects.saturation !== 1) && 'Adjusted',
+    overlays.length > 0 && `${overlays.length} text`,
+  ].filter(Boolean).join(' · ')
   const captionOpts = { enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine }
   const headlineOpts = {
     enabled: headlineOn, text: headlineText, style: headlineStyle,
     position: headlinePos, size: headlineSize,
   }
-  // every render request carries the same look settings
-  const lookOpts = { ratio, reframe: reframeMode, captions: captionOpts, headline: headlineOpts, crop }
+  // every render request carries the same look settings, so all clips share the
+  // global style; the per-clip editor overrides any of these for one clip
+  const lookOpts = {
+    ratio, reframe: reframeMode, captions: captionOpts, headline: headlineOpts, crop,
+    effects,
+    overlays: overlays.map(({ text, x, y, size, color }) => ({ text, x, y, size, color })),
+  }
 
   useEffect(() => {
     api.get('/api/config').then((c) => {
@@ -505,6 +526,9 @@ export default function App() {
                   headline={headlineOpts}
                   headlineFallback="Your clip headline"
                   manual={reframeMode === 'manual'}
+                  effects={effects}
+                  overlays={overlays}
+                  moveOverlay={moveOverlay}
                 />
                 {reframeMode === 'manual' && (
                   <div className="hint mt">
@@ -515,6 +539,19 @@ export default function App() {
                 {reframeMode === 'manual' && RATIO_AR[ratio] && (
                   <ZoomSlider crop={crop} setCrop={setCrop} />
                 )}
+
+                {/* set the look ONCE for every clip; each clip can still be tweaked
+                    on its own later with ✏️ Edit */}
+                <details className="style-all mt" open={styleOpen}
+                  onToggle={(e) => setStyleOpen(e.target.open)}>
+                  <summary>🎨 Style all clips {styleSummary && <span className="muted">— {styleSummary}</span>}</summary>
+                  <div className="hint mb">
+                    These apply to <b>every clip</b> you generate. Speed up, add a look,
+                    mirror, and drop a watermark / text on the video above — then create your clips.
+                  </div>
+                  <EffectsPanel effects={effects} setFx={setFx} />
+                  <OverlaysPanel overlays={overlays} setOverlays={setOverlays} />
+                </details>
               </div>
             )}
           </section>
@@ -993,6 +1030,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
     r.segments.map((s) => ({ start: secToClock(s.start_sec), end: secToClock(s.end_sec) }))
   )
   const [active, setActive] = useState(0)          // segment the player is editing
+  const [preview, setPreview] = useState('source') // source (edit) | clip (result)
   const [ratio, setRatio] = useState(r.ratio)
   const [reframe, setReframe] = useState(r.reframe || 'smart')
   const [capOn, setCapOn] = useState(!!r.captions?.enabled)
@@ -1085,9 +1123,24 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal wide" onClick={(e) => e.stopPropagation()}>
-        <h3>✏️ Edit clip: {clip.name}</h3>
+        <h3 style={{ justifyContent: 'space-between' }}>
+          <span>✏️ Edit clip: {clip.name}</span>
+          {/* Source = the frame you cut & style against (live preview). Result =
+              the actual rendered clip, to check the baked output. */}
+          <span className="seg-toggle">
+            <button className={`tab ${preview === 'source' ? 'active' : ''}`}
+              onClick={() => setPreview('source')}>✂️ Source</button>
+            <button className={`tab ${preview === 'clip' ? 'active' : ''}`}
+              onClick={() => setPreview('clip')}>▶ Result</button>
+          </span>
+        </h3>
 
-        {/* live source preview — the frame you are actually cutting */}
+        {preview === 'clip' ? (
+          <div className="stage">
+            <video src={clip.url} className="stage-video" controls autoPlay />
+          </div>
+        ) : (
+        /* live source preview — the frame you are actually cutting */
         <FrameStage
           videoRef={videoRef}
           src="/api/video/stream"
@@ -1111,7 +1164,9 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
             }
           }}
         />
+        )}
 
+        {preview === 'source' && (<>
         <div className="frame-bar">
           <button className="btn sm" title="Back 1 second" onClick={() => step(-1)}>⏪ 1s</button>
           <button className="btn sm" title="Back 1 frame" onClick={() => step(-FRAME)}>◀ frame</button>
@@ -1131,8 +1186,10 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
             onChange={(e) => { stopAt.current = null; seek(+e.target.value) }}
           />
         )}
+        </>
+        )}
 
-        {activeSeg && (
+        {preview === 'source' && activeSeg && (
           <div className="hint">
             Editing segment {active + 1} — park the player on a frame, then hit
             <b> ⤓ Start</b> or <b>⤓ End</b> to snap that edge to it.
