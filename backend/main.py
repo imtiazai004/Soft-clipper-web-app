@@ -29,7 +29,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
@@ -460,15 +460,16 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
         else:
             caption_segs = transcript.segments_for_stitched(sess["transcript_segments"], segs)
     caption_segs = effects.scale_captions(caption_segs, eff)
+    overlays = [o for o in (r.get("overlays") or []) if (o.get("text") or "").strip()]
 
     ass_file = None
-    # one .ass carries both captions and headline — either alone is reason to build it
-    if caption_segs or head["text"]:
+    # one .ass carries captions, headline and overlays — any of them is reason to build it
+    if caption_segs or head["text"] or overlays:
         ass_file = captions.build_ass(
             caption_segs, os.path.join(out_dir, "_cap_tmp.ass"),
             style=cap.get("style", "TikTok Bold"),
             words_per_line=cap.get("words_per_line", 4),
-            headline=head, clip_duration=clip_duration,
+            headline=head, clip_duration=clip_duration, overlays=overlays,
         )
     try:
         if len(segs) == 1:
@@ -565,6 +566,15 @@ class EffectsOpts(BaseModel):
     speed: float = 1.0             # 0.5..2, 1 = unchanged
 
 
+class OverlayOpts(BaseModel):
+    """A piece of placed text burned over the whole clip."""
+    text: str = ""
+    x: float = 0.5                 # 0..1 of frame width, text centre
+    y: float = 0.5                 # 0..1 of frame height, text centre
+    size: int = 22
+    color: str = "white"           # named palette or #rrggbb
+
+
 class CutBody(BaseModel):
     clips: list[dict]              # [{name, start_sec, end_sec, meta?}]
     ratio: str | None = "9:16"
@@ -573,6 +583,7 @@ class CutBody(BaseModel):
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
+    overlays: list[OverlayOpts] = Field(default_factory=list)
 
 
 class ReelBody(BaseModel):
@@ -586,6 +597,7 @@ class ReelBody(BaseModel):
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
+    overlays: list[OverlayOpts] = Field(default_factory=list)
 
 
 # ── auth endpoints ────────────────────────────────────────────────────────────
@@ -869,6 +881,7 @@ def job_cut(body: CutBody, user: str = Depends(auth.current_user)):
                     "headline": body.headline.model_dump(),
                     "crop": body.crop.model_dump(),
                     "effects": body.effects.model_dump(),
+                    "overlays": [o.model_dump() for o in body.overlays],
                 },
             }
             render_record(job, user, rec, out_dir)
@@ -923,6 +936,7 @@ def job_reel(body: ReelBody, user: str = Depends(auth.current_user)):
                 "headline": body.headline.model_dump(),
                 "crop": body.crop.model_dump(),
                 "effects": body.effects.model_dump(),
+                "overlays": [o.model_dump() for o in body.overlays],
             },
         }
         render_record(job, user, rec, out_dir)
@@ -944,6 +958,7 @@ class EditBody(BaseModel):
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
+    overlays: list[OverlayOpts] = Field(default_factory=list)
 
 
 class AiEditBody(BaseModel):
@@ -985,6 +1000,7 @@ def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
             "headline": body.headline.model_dump(),
             "crop": body.crop.model_dump(),
             "effects": body.effects.model_dump(),
+            "overlays": [o.model_dump() for o in body.overlays],
         }
         rerender_clip(job, user, rec)
         return {"clips": [clip_to_api(user, c) for c in sess["clips"]]}

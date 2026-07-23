@@ -445,3 +445,14 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 .adjust-row { display: flex; align-items: center; gap: 10px; }
 .adjust-row .muted { min-width: 82px; font-size: 12.5px; }
 .adjust-row input[type="range"] { flex: 1; }
+
+/* clip editor — text overlays */
+.ov-chip {
+  position: absolute; transform: translate(-50%, -50%);
+  font-weight: 800; line-height: 1.1; white-space: nowrap; cursor: grab;
+  text-shadow: 0 0 2px #000, 0 1px 2px #000; padding: 2px 4px;
+  touch-action: none; user-select: none; z-index: 5;
+}
+.ov-chip:active { cursor: grabbing; }
+.ov-row { display: flex; gap: 8px; align-items: center; }
+.ov-row .input { flex: 1; min-width: 90px; }

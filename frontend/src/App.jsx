@@ -42,6 +42,19 @@ const DEFAULT_EFFECTS = {
   mirror: false, brightness: 0, contrast: 1, saturation: 1, look: 'none', speed: 1,
 }
 
+// Text-overlay colours. Keys match core/captions.py OVERLAY_COLORS; the hex here
+// is just the live-preview swatch, close to what libass burns.
+const OVERLAY_COLORS = {
+  white: '#ffffff', black: '#000000', yellow: '#ffe600', red: '#ff2d2d',
+  green: '#22c55e', blue: '#3c6bff', pink: '#ff69b4', cyan: '#00e5ff',
+}
+const overlayCss = (c) => (c && c.startsWith('#') ? c : OVERLAY_COLORS[c] || '#ffffff')
+
+const newOverlay = () => ({
+  id: (crypto.randomUUID?.() || String(Math.random())).slice(0, 8),
+  text: 'Text', x: 0.5, y: 0.35, size: 22, color: 'white',
+})
+
 // The CSS `filter` string that mirrors the baked effects for live preview.
 // eq brightness is additive (-.5...5) but CSS brightness() is multiplicative,
 // so map it to 1 + brightness; the rest line up directly.
@@ -748,8 +761,38 @@ export default function App() {
  *  The box is drawn from the same numbers ffmpeg will crop with, so what you
  *  frame here is what the clip renders — no guessing between UI and output.
  */
+/** A draggable text overlay shown on the stage. Position is stored 0..1 of the
+ *  reference frame (the crop box when manual framing is on, else the whole
+ *  video), so what you drag here is where ffmpeg burns it. */
+function OverlayChip({ ov, onMove }) {
+  const dragging = useRef(false)
+  function move(e) {
+    const rect = e.currentTarget.offsetParent?.getBoundingClientRect()
+    if (!rect) return
+    onMove(ov.id, clamp01((e.clientX - rect.left) / rect.width),
+      clamp01((e.clientY - rect.top) / rect.height))
+  }
+  return (
+    <div className="ov-chip" title="Drag to move"
+      style={{
+        left: `${ov.x * 100}%`, top: `${ov.y * 100}%`,
+        color: overlayCss(ov.color), fontSize: `${(ov.size / 288) * 100}cqh`,
+      }}
+      onPointerDown={(e) => {
+        e.stopPropagation()
+        e.currentTarget.setPointerCapture(e.pointerId)
+        dragging.current = true
+        move(e)
+      }}
+      onPointerMove={(e) => { if (dragging.current) { e.stopPropagation(); move(e) } }}
+      onPointerUp={() => { dragging.current = false }}
+      onPointerCancel={() => { dragging.current = false }}
+    >{ov.text || 'Text'}</div>
+  )
+}
+
 function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFallback,
-                      manual, effects, onTimeUpdate, onReady }) {
+                      manual, effects, overlays, moveOverlay, onTimeUpdate, onReady }) {
   const [dims, setDims] = useState({ w: 0, h: 0 })
   const stageRef = useRef(null)
   const dragging = useRef(false)
@@ -783,6 +826,15 @@ function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFal
       <span>{headText}</span>
     </div>
   )
+  // headline + overlays share the same reference box so both preview where they burn
+  const burnEls = (
+    <>
+      {headlineEl}
+      {(overlays || []).map((ov) => (
+        <OverlayChip key={ov.id} ov={ov} onMove={moveOverlay} />
+      ))}
+    </>
+  )
 
   return (
     <div className="stage" ref={stageRef}
@@ -802,7 +854,7 @@ function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFal
         }}
         onTimeUpdate={onTimeUpdate}
       />
-      {!active && headlineEl}
+      {!active && burnEls}
       {active && (
         <div
           className="crop-layer"
@@ -819,7 +871,7 @@ function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFal
             left: `${left * 100}%`, top: `${top * 100}%`,
             width: `${fracW * 100}%`, height: `${fracH * 100}%`,
           }}>
-            {headlineEl}
+            {burnEls}
           </div>
         </div>
       )}
@@ -883,6 +935,41 @@ function EffectsPanel({ effects, setFx }) {
   )
 }
 
+/** Text overlays / stickers: add lines of text, colour and size them, and drag
+ *  them on the stage above. Previewed live; burned by ffmpeg on Re-render. */
+function OverlaysPanel({ overlays, setOverlays }) {
+  const update = (id, patch) =>
+    setOverlays(overlays.map((o) => (o.id === id ? { ...o, ...patch } : o)))
+  const remove = (id) => setOverlays(overlays.filter((o) => o.id !== id))
+
+  return (
+    <>
+      <label className="lbl" style={{ display: 'flex', justifyContent: 'space-between' }}>
+        <span>TEXT OVERLAYS</span>
+        <button className="btn sm" onClick={() => setOverlays([...overlays, newOverlay()])}>+ Text</button>
+      </label>
+
+      {overlays.length === 0 && (
+        <div className="hint mb">Add text or emoji, then drag it on the video above to place it.</div>
+      )}
+
+      {overlays.map((ov) => (
+        <div key={ov.id} className="ov-row mb">
+          <input className="input" placeholder="Text / emoji" value={ov.text}
+            onChange={(e) => update(ov.id, { text: e.target.value })} />
+          <select className="select" style={{ width: 96 }} value={ov.color}
+            onChange={(e) => update(ov.id, { color: e.target.value })}>
+            {Object.keys(OVERLAY_COLORS).map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+          <input type="range" min={10} max={48} value={ov.size} style={{ width: 74 }}
+            title="Size" onChange={(e) => update(ov.id, { size: +e.target.value })} />
+          <button className="btn sm ghost" title="Remove" onClick={() => remove(ov.id)}>✕</button>
+        </div>
+      ))}
+    </>
+  )
+}
+
 function ZoomSlider({ crop, setCrop }) {
   return (
     <div className="row mb">
@@ -923,6 +1010,11 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   })
   const [effects, setEffects] = useState({ ...DEFAULT_EFFECTS, ...(r.effects || {}) })
   const setFx = (patch) => setEffects((e) => ({ ...e, ...patch }))
+  const [overlays, setOverlays] = useState(
+    (r.overlays || []).map((o) => ({ ...newOverlay(), ...o }))
+  )
+  const moveOverlay = (id, x, y) =>
+    setOverlays((list) => list.map((o) => (o.id === id ? { ...o, x, y } : o)))
 
   const videoRef = useRef(null)
   const stopAt = useRef(null)                      // pause point for segment preview
@@ -984,6 +1076,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
       headline: head,
       crop,
       effects,
+      overlays: overlays.map(({ text, x, y, size, color }) => ({ text, x, y, size, color })),
     })
   }
 
@@ -1005,6 +1098,8 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
           headlineFallback={aiTitle}
           manual={reframe === 'manual'}
           effects={effects}
+          overlays={overlays}
+          moveOverlay={moveOverlay}
           // open on the clip's own first frame, not on the start of the source
           onReady={() => seek(mmssToSec(segments[0]?.start) || 0)}
           onTimeUpdate={(e) => {
@@ -1136,6 +1231,8 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
             )}
 
             <EffectsPanel effects={effects} setFx={setFx} />
+
+            <OverlaysPanel overlays={overlays} setOverlays={setOverlays} />
 
             <label className="lbl">HEADLINE</label>
             <div className="row mb">
