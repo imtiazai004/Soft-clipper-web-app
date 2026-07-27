@@ -10,6 +10,9 @@ const RATIOS = [
 
 const CAPTION_STYLES = ['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon']
 
+// Mirrors core/silence.py LENGTHS
+const SPLIT_LENGTHS = [30, 45, 60, 90, 120]
+
 const REFRAMES = [
   { id: 'smart', label: '🎯 Smart Crop', hint: 'AI keeps the speaker centered' },
   { id: 'fit', label: '🌫️ Fit + Blur', hint: 'Full video on blurred background' },
@@ -116,6 +119,7 @@ export default function App() {
   // create
   const [tab, setTab] = useState('auto')
   const [mode, setMode] = useState('transcript')
+  const [splitLen, setSplitLen] = useState(60)
   const [query, setQuery] = useState('')
   const [moments, setMoments] = useState([])
   const [selected, setSelected] = useState(new Set())
@@ -248,6 +252,16 @@ export default function App() {
     xhr.onabort = () => setJob(null)     // cancelCurrent() already told the user
     xhr.open('POST', '/api/video/upload')
     xhr.send(form)
+  }
+
+  // Fixed-length splitting deliberately skips the API-key check — this is the
+  // one path that works with no AI account at all.
+  function split() {
+    exec(api.post('/api/jobs/split', { length: splitLen }), (r) => {
+      setMoments(r.moments || [])
+      setSelected(new Set((r.moments || []).map((_, i) => i)))
+      if (!r.moments?.length) err('Could not split this video — try a shorter clip length')
+    })
   }
 
   function detect() {
@@ -575,15 +589,36 @@ export default function App() {
                       <div className="pills">
                         <button className={`pill ${mode === 'transcript' ? 'active' : ''}`} onClick={() => setMode('transcript')}>📝 Transcript (talking videos)</button>
                         <button className={`pill ${mode === 'visual' ? 'active' : ''}`} onClick={() => setMode('visual')}>👁️ Visual (songs / sports / gameplay)</button>
+                        <button className={`pill ${mode === 'split' ? 'active' : ''}`} onClick={() => setMode('split')}>✂️ Fixed length (no AI)</button>
                       </div>
                     </div>
-                    <div className="row">
-                      <div className="grow">
-                        <input className="input" placeholder='🔍 Looking for something specific? (optional) — e.g. "funny moments", "every goal"'
-                          value={query} onChange={(e) => setQuery(e.target.value)} disabled={busy} />
+
+                    {mode === 'split' ? (
+                      <div className="row">
+                        <div className="grow">
+                          <label className="lbl">CLIP LENGTH</label>
+                          <div className="pills">
+                            {SPLIT_LENGTHS.map((s) => (
+                              <button key={s} className={`pill ${splitLen === s ? 'active' : ''}`}
+                                onClick={() => setSplitLen(s)}>{s}s</button>
+                            ))}
+                          </div>
+                          <span className="muted small">
+                            Cuts the whole video into {splitLen}-second clips, each ending on a pause.
+                            No API key needed.
+                          </span>
+                        </div>
+                        <button className="btn primary" onClick={split} disabled={busy}>✂️ Split Video</button>
                       </div>
-                      <button className="btn primary" onClick={detect} disabled={busy}>✨ Detect Moments</button>
-                    </div>
+                    ) : (
+                      <div className="row">
+                        <div className="grow">
+                          <input className="input" placeholder='🔍 Looking for something specific? (optional) — e.g. "funny moments", "every goal"'
+                            value={query} onChange={(e) => setQuery(e.target.value)} disabled={busy} />
+                        </div>
+                        <button className="btn primary" onClick={detect} disabled={busy}>✨ Detect Moments</button>
+                      </div>
+                    )}
 
                     {moments.length > 0 && (
                       <div className="mt">

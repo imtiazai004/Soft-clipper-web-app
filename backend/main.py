@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
-from core import ai, captions, cleanup, downloader, effects, proc, transcript, utils, video
+from core import ai, captions, cleanup, downloader, effects, proc, silence, transcript, utils, video
 
 # ── path setup (works both as source and as a bundled PyInstaller exe) ────────
 if getattr(sys, "frozen", False):
@@ -534,6 +534,11 @@ class DetectBody(BaseModel):
     max_len: int = 60
 
 
+class SplitBody(BaseModel):
+    """Fixed-length splitting — no AI, no API key, no transcript."""
+    length: int = 60               # seconds per clip
+
+
 class CaptionOpts(BaseModel):
     enabled: bool = True
     style: str = "TikTok Bold"
@@ -819,6 +824,29 @@ def video_stream(user: str = Depends(auth.current_user)):
     if not sess["video_path"] or not os.path.exists(sess["video_path"]):
         raise HTTPException(404, "No video loaded")
     return FileResponse(sess["video_path"], media_type="video/mp4")
+
+
+@app.post("/api/jobs/split")
+def job_split(body: SplitBody, user: str = Depends(auth.current_user)):
+    """Cut the video into fixed-length pieces, each ending on a pause.
+
+    Returns the same shape as /api/jobs/detect so the results list, selection
+    and render path are all the existing ones. Not marked heavy=True: reading
+    the audio track for pauses is cheap next to a render, and it should not
+    queue behind someone else's export.
+    """
+    sess = get_session(user)
+    if not sess["video_path"]:
+        raise HTTPException(400, "Download a video first")
+
+    def work(job):
+        job["message"] = "Listening for pauses..."
+        job["progress"] = 0.3
+        moments = silence.split_video(sess["video_path"], sess["video_duration"], body.length)
+        job["progress"] = 0.9
+        return {"moments": moments, "transcript_source": None}
+
+    return {"job_id": start_job(user, work)}
 
 
 # ── AI endpoints ──────────────────────────────────────────────────────────────
