@@ -15,6 +15,7 @@ import time
 from google import genai
 from google.genai import types
 
+from . import llm
 from .utils import load_config, seconds_to_mmss, time_to_seconds
 
 # Rolling alias that always points to the latest stable Gemini Flash and stays
@@ -103,12 +104,17 @@ TRANSCRIPT_SCHEMA = {
 
 
 def _client(api_key: str) -> genai.Client:
-    # Cap any single request. Without this a stalled Gemini call hangs the job
-    # forever — and with one render slot, everything queued behind it too.
-    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=300_000))
+    return genai.Client(api_key=api_key)
 
 
 def _generate_json(client, contents, schema, temperature=0.4):
+    # A plain string prompt can go to any provider. Anything else means an
+    # uploaded video or audio file, which only Gemini can take, so those calls
+    # stay on Gemini whatever the setting says — see transcribe_audio and the
+    # visual detectors.
+    if isinstance(contents, str) and not llm.is_gemini():
+        return llm.generate_json(contents, schema, temperature)
+
     response = client.models.generate_content(
         model=_model(),
         contents=contents,
@@ -121,17 +127,10 @@ def _generate_json(client, contents, schema, temperature=0.4):
     return json.loads(response.text)
 
 
-def _upload_and_wait(client, path: str, timeout_s: int = 300, on_status=None):
-    """Upload a file to Gemini Files API and wait until it is ACTIVE.
-
-    on_status(msg) is called with human-readable progress so a long upload
-    doesn't look frozen to the user.
-    """
-    if on_status:
-        on_status("Uploading to Gemini...")
+def _upload_and_wait(client, path: str, timeout_s: int = 300):
+    """Upload a file to Gemini Files API and wait until it is ACTIVE."""
     uploaded = client.files.upload(file=path)
-    start = time.time()
-    deadline = start + timeout_s
+    deadline = time.time() + timeout_s
     while time.time() < deadline:
         f = client.files.get(name=uploaded.name)
         state = str(f.state)
@@ -139,8 +138,6 @@ def _upload_and_wait(client, path: str, timeout_s: int = 300, on_status=None):
             return uploaded
         if "FAILED" in state:
             raise RuntimeError("Gemini file processing failed")
-        if on_status:
-            on_status(f"Gemini is processing the audio... ({int(time.time() - start)}s)")
         time.sleep(3)
     raise RuntimeError("Gemini file processing timeout")
 
@@ -398,19 +395,14 @@ def _validate_moments(moments: list[dict], duration: float, min_len: int, max_le
     return valid
 
 
-def transcribe_audio(audio_path: str, api_key: str, on_status=None) -> list[dict]:
+def transcribe_audio(audio_path: str, api_key: str) -> list[dict]:
     """Transcribe audio via Gemini Files API. Returns transcript segments
     [{"start": sec, "duration": sec, "text": ...}] or raises on failure.
     Works for Urdu, Pashto, Hindi, English, etc.
-
-    on_status(msg) reports progress (upload, processing, transcribing) so a
-    long job shows movement instead of a frozen "Transcribing..." line.
     """
     client = _client(api_key)
-    uploaded = _upload_and_wait(client, audio_path, on_status=on_status)
+    uploaded = _upload_and_wait(client, audio_path)
     try:
-        if on_status:
-            on_status("Gemini is transcribing the speech...")
         prompt = """Transcribe this audio with accurate timestamps.
 Split into short segments of at most 8-10 words each.
 Keep the ORIGINAL language of the speech (do not translate).
