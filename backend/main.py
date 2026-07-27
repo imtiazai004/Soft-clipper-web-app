@@ -469,6 +469,7 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
             caption_segs, os.path.join(out_dir, "_cap_tmp.ass"),
             style=cap.get("style", "TikTok Bold"),
             words_per_line=cap.get("words_per_line", 4),
+            highlight=bool(cap.get("highlight", False)),
             headline=head, clip_duration=clip_duration, overlays=overlays,
         )
     try:
@@ -543,6 +544,9 @@ class CaptionOpts(BaseModel):
     enabled: bool = True
     style: str = "TikTok Bold"
     words_per_line: int = 4
+    # Word-by-word highlighting. Off by default so existing clips re-render
+    # exactly as they did before.
+    highlight: bool = False
 
 
 class HeadlineOpts(BaseModel):

@@ -32,9 +32,26 @@ SEGMENTS = [
 
 def test_the_four_shipped_caption_styles_still_exist():
 	"""Renaming or dropping one of these would change how every previously
-	rendered clip looks if it were re-rendered."""
-	assert set(captions.CAPTION_STYLES) == {"TikTok Bold", "Clean White", "Yellow Pop", "Neon"}
+	rendered clip looks if it were re-rendered. New styles may be added — this
+	pins the originals, not the count."""
+	assert set(captions.CAPTION_STYLES) >= {"TikTok Bold", "Clean White", "Yellow Pop", "Neon"}
 	assert captions.DEFAULT_CAPTION_STYLE == "TikTok Bold"
+
+
+def test_the_original_styles_keep_their_exact_appearance():
+	"""Colour, outline and size decide what a re-rendered clip looks like."""
+	assert captions.CAPTION_STYLES["TikTok Bold"]["colour"] == "&H00FFFFFF"
+	assert captions.CAPTION_STYLES["TikTok Bold"]["outline"] == "&H00000000"
+	assert captions.CAPTION_STYLES["TikTok Bold"]["fontsize"] == 17
+	assert captions.CAPTION_STYLES["Clean White"]["fontsize"] == 14
+	assert captions.CAPTION_STYLES["Yellow Pop"]["colour"] == "&H0000FFFF"
+	assert captions.CAPTION_STYLES["Neon"]["outline"] == "&H00800080"
+
+
+def test_the_original_styles_still_draw_an_outline_not_a_box():
+	"""BorderStyle 3 was added for the Boxed style; the others must stay at 1."""
+	for name in ("TikTok Bold", "Clean White", "Yellow Pop", "Neon"):
+		assert not captions.CAPTION_STYLES[name].get("box")
 
 
 def test_old_style_names_still_resolve():
@@ -81,15 +98,28 @@ def test_nothing_to_burn_in_returns_none(tmp_path):
 
 
 def test_special_characters_do_not_break_the_ass_file(tmp_path):
-	"""Braces and backslashes are ASS markup — a transcript containing them must
-	not turn into override tags."""
+	"""Braces and backslashes are ASS markup. A transcript containing them must
+	come out as text, not as override tags — anything inside braces is silently
+	swallowed by the renderer, so a stray `{` eats the rest of the caption.
+
+	The only braces on the line should be the ones we put there ourselves.
+	"""
 	out = captions.build_ass(
 		[{"start": 0, "duration": 2, "text": r"price {is} 50\50 split"}],
 		str(tmp_path / "s.ass"),
 	)
-	body = open(out, encoding="utf-8").read()
-	dialogue = [l for l in body.splitlines() if l.startswith("Dialogue:")][0]
-	assert "{is}" not in dialogue
+	texts = [
+		l.rsplit(",,", 1)[1]   # everything after the last field separator
+		for l in open(out, encoding="utf-8")
+		if l.startswith("Dialogue:")
+	]
+	for text in texts:
+		assert text.count("{") == 1 and text.startswith("{\\an2}")
+
+	# The words survive, only the markup characters are neutralised. Five words
+	# at three per line means the last one is on the second dialogue line.
+	joined = " ".join(texts)
+	assert "IS" in joined and "SPLIT" in joined
 
 
 def test_headline_and_overlays_are_written(tmp_path):

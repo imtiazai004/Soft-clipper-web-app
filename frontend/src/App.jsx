@@ -8,7 +8,7 @@ const RATIOS = [
   { id: null, label: 'Original' },
 ]
 
-const CAPTION_STYLES = ['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon']
+const CAPTION_STYLES = ['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon', 'Bounce', 'Boxed']
 
 // Mirrors core/silence.py LENGTHS
 const SPLIT_LENGTHS = [30, 45, 60, 90, 120]
@@ -98,6 +98,7 @@ export default function App() {
   const [reframeMode, setReframeMode] = useState('smart')
   const [captionsOn, setCaptionsOn] = useState(true)
   const [capStyle, setCapStyle] = useState('TikTok Bold')
+  const [capHighlight, setCapHighlight] = useState(false)
   const [wordsPerLine, setWordsPerLine] = useState(4)
   const [headlineOn, setHeadlineOn] = useState(false)
   const [headlineText, setHeadlineText] = useState('')
@@ -146,7 +147,7 @@ export default function App() {
     (effects.brightness !== 0 || effects.contrast !== 1 || effects.saturation !== 1) && 'Adjusted',
     overlays.length > 0 && `${overlays.length} text`,
   ].filter(Boolean).join(' · ')
-  const captionOpts = { enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine }
+  const captionOpts = { enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine, highlight: capHighlight }
   const headlineOpts = {
     enabled: headlineOn, text: headlineText, style: headlineStyle,
     position: headlinePos, size: headlineSize,
@@ -409,6 +410,11 @@ export default function App() {
                 <span className="side-val">{wordsPerLine}</span>
               </div>
               <input type="range" min={2} max={8} value={wordsPerLine} onChange={(e) => setWordsPerLine(+e.target.value)} />
+              <label className="side-row" style={{ cursor: 'pointer' }}>
+                <span className="lbl-inline">Highlight each word</span>
+                <input type="checkbox" checked={capHighlight}
+                  onChange={(e) => setCapHighlight(e.target.checked)} />
+              </label>
             </>
           )}
         </div>
@@ -1070,6 +1076,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   const [reframe, setReframe] = useState(r.reframe || 'smart')
   const [capOn, setCapOn] = useState(!!r.captions?.enabled)
   const [capStyle, setCapStyle] = useState(r.captions?.style || 'TikTok Bold')
+  const [capHi, setCapHi] = useState(!!r.captions?.highlight)
   const [words, setWords] = useState(r.captions?.words_per_line || 4)
   const [head, setHead] = useState({
     enabled: !!r.headline?.enabled,
@@ -1145,7 +1152,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
     if (!segs.length) return
     onManual({
       index, name, segments: segs, ratio, reframe,
-      captions: { enabled: capOn, style: capStyle, words_per_line: words },
+      captions: { enabled: capOn, style: capStyle, words_per_line: words, highlight: capHi },
       headline: head,
       crop,
       effects,
@@ -1365,10 +1372,13 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
               {capOn && (
                 <>
                   <select className="select" style={{ width: 140 }} value={capStyle} onChange={(e) => setCapStyle(e.target.value)}>
-                    {['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon'].map((s) => <option key={s}>{s}</option>)}
+                    {CAPTION_STYLES.map((s) => <option key={s}>{s}</option>)}
                   </select>
                   <input type="range" min={2} max={8} value={words} style={{ width: 80 }} onChange={(e) => setWords(+e.target.value)} />
                   <span className="muted">{words} w/line</span>
+                  <label className="muted" style={{ cursor: 'pointer' }}>
+                    <input type="checkbox" checked={capHi} onChange={(e) => setCapHi(e.target.checked)} /> highlight
+                  </label>
                 </>
               )}
             </div>

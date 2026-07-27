@@ -9,11 +9,18 @@ plain outlined text or sitting on a solid box — the "title bar" look.
 
 Both live in a single .ass file with two styles, so ffmpeg burns them in one pass.
 """
+# `highlight` is the colour the currently-spoken word turns when word-by-word
+# highlighting is on. It is ignored otherwise, so adding it changed nothing for
+# the four styles that already shipped.
 CAPTION_STYLES = {
-    "TikTok Bold": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 17},
-    "Clean White": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 14},
-    "Yellow Pop": {"colour": "&H0000FFFF", "outline": "&H00000000", "fontsize": 17},
-    "Neon": {"colour": "&H00FFFF00", "outline": "&H00800080", "fontsize": 16},
+    "TikTok Bold": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 17, "highlight": "&H0000FFFF"},
+    "Clean White": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 14, "highlight": "&H0000FF00"},
+    "Yellow Pop": {"colour": "&H0000FFFF", "outline": "&H00000000", "fontsize": 17, "highlight": "&H00FFFFFF"},
+    "Neon": {"colour": "&H00FFFF00", "outline": "&H00800080", "fontsize": 16, "highlight": "&H00FF00FF"},
+    # Added alongside word-by-word highlighting. Bounce pops the spoken word;
+    # Boxed is the karaoke look that reads on a busy background.
+    "Bounce": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 18, "highlight": "&H0000D7FF", "pop": True},
+    "Boxed": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 16, "highlight": "&H0000FFFF", "box": True},
 }
 
 # earlier builds shipped these names; keep saved clip records rendering the same
@@ -56,7 +63,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{fontsize},{colour},&H000000FF,{outline},&H80000000,-1,0,0,0,100,100,0,0,1,2,1,2,10,10,{margin_v},1
+Style: Default,Arial,{fontsize},{colour},&H000000FF,{outline},&H80000000,-1,0,0,0,100,100,0,0,{c_border},{c_outline},1,2,10,10,{margin_v},1
 Style: Headline,Arial,{h_fontsize},{h_colour},&H000000FF,{h_box},&H80000000,-1,0,0,0,100,100,0,0,{h_border},{h_outline},{h_shadow},{h_align},14,14,{h_margin},1
 Style: Overlay,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,1,5,10,10,10,1
 
@@ -160,6 +167,45 @@ def _clamp01(v) -> float:
         return 0.5
 
 
+def _karaoke_lines(chunk: list[str], start: float, duration: float, st: dict) -> list[str]:
+    """One line per word, with the spoken word coloured.
+
+    ASS has a \\k karaoke tag, but how it renders depends on the player and
+    libass ignores it for burn-in in the way we want. Repeating the chunk once
+    per word with an inline colour override is uglier in the file and exactly
+    right on screen — the whole phrase stays readable while the current word
+    lights up, which is what makes these captions hold attention.
+
+    Word timings are split by character count. Without word-level timestamps
+    from the transcript that is an approximation, but a long word does take
+    longer to say, so it tracks speech better than an even split would.
+    """
+    chars = [max(1, len(w)) for w in chunk]
+    total = sum(chars)
+    active = st.get("highlight", "&H0000FFFF")
+    base = st["colour"]
+    pop = st.get("pop")
+
+    lines = []
+    t = start
+    for i, word in enumerate(chunk):
+        word_dur = duration * (chars[i] / total)
+        parts = []
+        for j, other in enumerate(chunk):
+            text = _ass_text(other.upper())
+            if j == i:
+                scale = "\\fscx112\\fscy112" if pop else ""
+                parts.append(f"{{\\c{active}{scale}}}{text}{{\\c{base}\\fscx100\\fscy100}}")
+            else:
+                parts.append(text)
+        lines.append(
+            f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + word_dur)},Default,,0,0,0,,"
+            f"{{\\an2}}{' '.join(parts)}"
+        )
+        t += word_dur
+    return lines
+
+
 def build_ass(
     segments: list[dict],
     out_path: str,
@@ -169,6 +215,7 @@ def build_ass(
     headline: dict | None = None,
     clip_duration: float = 0.0,
     overlays: list[dict] | None = None,
+    highlight: bool = False,
 ) -> str | None:
     """Write an ASS file from clip-relative caption segments, a headline, overlays.
 
@@ -196,12 +243,16 @@ def build_ass(
         for chunk in chunks:
             chunk_chars = sum(len(w) for w in chunk)
             chunk_dur = seg_dur * (chunk_chars / total_chars)
-            chunk_text = " ".join(chunk).upper()
-            # \an2 = bottom-center anchor
-            lines.append(
-                f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + chunk_dur)},Default,,0,0,0,,"
-                f"{{\\an2}}{chunk_text}"
-            )
+
+            if highlight:
+                lines.extend(_karaoke_lines(chunk, t, chunk_dur, st))
+            else:
+                # \an2 = bottom-center anchor
+                chunk_text = _ass_text(" ".join(chunk).upper())
+                lines.append(
+                    f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + chunk_dur)},Default,,0,0,0,,"
+                    f"{{\\an2}}{chunk_text}"
+                )
             t += chunk_dur
 
     head_text = _wrap_headline(_ass_text((headline or {}).get("text", "")))
@@ -222,6 +273,11 @@ def build_ass(
     top = (headline or {}).get("position", "top") != "bottom"
     header = ASS_HEADER.format(
         fontsize=st["fontsize"], colour=st["colour"], outline=st["outline"],
+        # BorderStyle 3 draws an opaque box behind the words instead of an
+        # outline around them — the only way captions stay readable over a
+        # bright, busy frame.
+        c_border=3 if st.get("box") else 1,
+        c_outline=6 if st.get("box") else 2,
         margin_v=margin_v,
         h_fontsize=max(8, min(40, int((headline or {}).get("size", 20)))),
         h_colour="&H00FFFFFF",
