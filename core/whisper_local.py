@@ -9,7 +9,7 @@ Two deliberate choices:
 **The model is not bundled.** Putting even the small model in the executable
 would take the download from about 160 MB to well over a gigabyte for everyone,
 including the majority who never turn this on. Instead the model is fetched the
-first time it is used and cached in %APPDATA%, so the cost falls on the people
+first time it is used and cached in the app-support folder, so the cost falls on the people
 who asked for it.
 
 **The import is optional.** If faster-whisper is missing the feature reports
@@ -19,6 +19,8 @@ problem must never take the whole app down with it.
 from __future__ import annotations
 
 import os
+
+from . import platform_paths
 
 # Bigger is more accurate and slower. `base` is the useful middle for
 # short-form work: it gets names wrong that `small` gets right, but it runs at
@@ -51,10 +53,7 @@ def available() -> bool:
 def cache_dir() -> str:
 	"""Models live beside the licence, not in the app folder — re-extracting the
 	app should not mean downloading a model again."""
-	base = os.environ.get("APPDATA") or os.path.expanduser("~")
-	path = os.path.join(base, "SoftClipper", "models")
-	os.makedirs(path, exist_ok=True)
-	return path
+	return platform_paths.app_data_dir("models")
 
 
 def is_downloaded(name: str = DEFAULT_MODEL) -> bool:
