@@ -22,6 +22,22 @@ services:
     expose:
       - "8501"                  # reachable only to Caddy, not the public internet
 
+  # Sells and activates the desktop app. Separate container from `app` on
+  # purpose: rebuilding the video webapp takes minutes, and a customer who has
+  # just paid must still be able to activate during that window.
+  licence:
+    build:
+      context: ..
+      dockerfile: licence/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LICENCE_DB: /data/licences.db
+    volumes:
+      - ./data-licence:/data
+    expose:
+      - "8600"
+
   caddy:
     image: caddy:2
     restart: unless-stopped
@@ -36,6 +52,7 @@ services:
       - caddy_config:/config
     depends_on:
       - app
+      - licence
 
 volumes:
   caddy_data:
