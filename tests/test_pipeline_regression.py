@@ -251,3 +251,44 @@ def test_speed_of_one_adds_nothing():
 @pytest.mark.parametrize("look", ["none", "nonexistent-look"])
 def test_unknown_or_empty_look_is_ignored(look):
 	assert effects.video_filters({"look": look}) == []
+
+
+# ── gameplay + facecam layout ────────────────────────────────────────────────
+
+
+def test_gamecam_stacks_the_camera_above_fitted_gameplay():
+	chain = video._gamecam_filter_complex(1920, 1080, {"corner": "bottom-left"}, None, [])
+	assert "vstack" in chain
+	# The game panel is fitted and padded, never cropped — cropping a game to
+	# 9:16 throws away the half of the screen where everything happens.
+	assert "force_original_aspect_ratio=decrease" in chain and "pad=1080:1320" in chain
+
+
+def test_the_two_panels_fill_a_9x16_frame_exactly():
+	chain = video._gamecam_filter_complex(1920, 1080, None, None, [])
+	assert "scale=1080:600" in chain      # camera
+	assert "pad=1080:1320" in chain       # gameplay — 600 + 1320 = 1920
+
+
+@pytest.mark.parametrize("corner", list(video.FACECAM_CORNERS))
+def test_each_corner_crops_a_different_part_of_the_frame(corner):
+	chain = video._gamecam_filter_complex(1920, 1080, {"corner": corner}, None, [])
+	crop = chain.split("crop=")[1].split(",")[0]
+	w, h, x, y = (int(v) for v in crop.split(":"))
+	assert x >= 0 and y >= 0 and x + w <= 1920 and y + h <= 1080
+
+
+def test_the_camera_crop_stays_inside_the_frame_at_the_edges():
+	chain = video._gamecam_filter_complex(1920, 1080, {"cx": 0.0, "cy": 1.0}, None, [])
+	w, h, x, y = (int(v) for v in chain.split("crop=")[1].split(",")[0].split(":"))
+	assert x == 0 and y + h <= 1080
+
+
+def test_an_unreadable_source_gives_up_instead_of_guessing():
+	assert video._gamecam_filter_complex(0, 0, None, None, []) is None
+
+
+def test_an_unknown_corner_falls_back_to_the_default():
+	unknown = video._gamecam_filter_complex(1920, 1080, {"corner": "middle"}, None, [])
+	default = video._gamecam_filter_complex(1920, 1080, {"corner": video.DEFAULT_FACECAM}, None, [])
+	assert unknown == default

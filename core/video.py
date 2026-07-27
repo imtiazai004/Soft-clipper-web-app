@@ -32,15 +32,8 @@ RATIO_FILTERS = {
     "16:9": "crop='min(iw,ih*16/9)':'min(ih,iw*9/16)',scale=1920:1080",
 }
 
-# Encoding speed is set by the x264 preset. On a small server "ultrafast" cuts
-# render time ~3.6x versus "veryfast" (measured: 85s -> 24s for a 30s clip) for
-# a modestly larger file — a good trade when a core is the bottleneck. The
-# desktop build leaves RENDER_PRESET unset and keeps the slower, smaller default.
-PRESET = os.environ.get("RENDER_PRESET", "veryfast")
-CRF = os.environ.get("RENDER_CRF", "20")
-
 ENCODE = [
-    "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
     "-c:a", "aac", "-b:a", "128k",
     "-movflags", "+faststart",
 ]
@@ -214,6 +207,54 @@ def _split_filter_complex(iw: int, ih: int, faces: list[dict], ass_file: str | N
     return _tail(chain, vfx, ass_file)
 
 
+# Where a streamer's camera box usually sits. The corner is a choice in the UI
+# because it is the one thing that varies between setups; the size barely does.
+FACECAM_CORNERS = {
+    "bottom-left": {"cx": 0.135, "cy": 0.79},
+    "bottom-right": {"cx": 0.865, "cy": 0.79},
+    "top-left": {"cx": 0.135, "cy": 0.21},
+    "top-right": {"cx": 0.865, "cy": 0.21},
+}
+DEFAULT_FACECAM = "bottom-left"
+FACECAM_W, FACECAM_H = 0.25, 0.30      # share of the source frame
+
+
+def _gamecam_filter_complex(iw: int, ih: int, facecam: dict | None, ass_file: str | None,
+                            vfx: list[str]) -> str | None:
+    """Gameplay below, the streamer's camera above — the layout every gaming
+    clip uses.
+
+    The gameplay panel is *fitted*, never cropped: cropping a game to 9:16
+    throws away the half of the screen where everything happens. The camera
+    panel is cropped out of the corner the user points at, since a facecam is a
+    small box in a fixed place rather than something to detect.
+    """
+    if iw <= 0 or ih <= 0:
+        return None
+
+    corner = FACECAM_CORNERS.get((facecam or {}).get("corner"), FACECAM_CORNERS[DEFAULT_FACECAM])
+    cx = _clamp(float((facecam or {}).get("cx", corner["cx"])), 0.0, 1.0)
+    cy = _clamp(float((facecam or {}).get("cy", corner["cy"])), 0.0, 1.0)
+
+    cw = _even(min(iw, iw * FACECAM_W))
+    ch = _even(min(ih, ih * FACECAM_H))
+    x = _clamp(int(cx * iw - cw / 2), 0, max(0, iw - cw))
+    y = _clamp(int(cy * ih - ch / 2), 0, max(0, ih - ch))
+
+    # 600 + 1320 = 1920. The camera gets under a third: it is context, and the
+    # game is what people came to watch.
+    cam_h, game_h = 600, 1320
+
+    chain = (
+        f"[0:v]split=2[cam][game];"
+        f"[cam]crop={cw}:{ch}:{x}:{y},scale=1080:{cam_h}[camout];"
+        f"[game]scale=1080:{game_h}:force_original_aspect_ratio=decrease,"
+        f"pad=1080:{game_h}:(ow-iw)/2:(oh-ih)/2:black[gameout];"
+        f"[camout][gameout]vstack[out]"
+    )
+    return _tail(chain, vfx, ass_file)
+
+
 def render_clip(
     input_file: str,
     output_file: str,
@@ -224,6 +265,7 @@ def render_clip(
     reframe: str = "center",
     crop: dict | None = None,
     effects: dict | None = None,
+    facecam: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Cut [start, end], reframe + look effects + burn captions. One ffmpeg pass.
 
@@ -258,6 +300,17 @@ def render_clip(
                 vf_filters.append(RATIO_FILTERS[ratio])
             else:
                 vf_filters.append(_manual_crop_filter(iw, ih, ratio, crop))
+        elif reframe == "gamecam":
+            info = get_video_info(input_file)
+            iw, ih = info["width"], info["height"]
+            filter_complex = (
+                _gamecam_filter_complex(iw, ih, facecam, ass_file, vfx)
+                if ratio == "9:16" else None
+            )
+            if filter_complex is None:
+                # Only 9:16 has room for two stacked panels; anything else falls
+                # back rather than producing a squashed frame.
+                vf_filters.append(RATIO_FILTERS[ratio])
         elif reframe in ("smart", "split"):
             info = get_video_info(input_file)
             iw, ih = info["width"], info["height"]
@@ -348,7 +401,7 @@ def _render_dynamic_smart(
         if ass_file and os.path.exists(ass_file):
             cmd += [
                 "-vf", f"ass='{_ass_escape(ass_file)}'",
-                "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-c:a", "aac", "-b:a", "128k",
             ]
         else:
@@ -374,6 +427,7 @@ def render_stitched_clip(
     reframe: str = "center",
     crop: dict | None = None,
     effects: dict | None = None,
+    facecam: dict | None = None,
 ) -> tuple[bool, str | None]:
     """Stitch multiple [start_sec, end_sec] segments into ONE clip (teaser/highlight reel).
 
@@ -391,7 +445,7 @@ def render_stitched_clip(
             part = os.path.join(work_dir, f"_part_{i}.mp4")
             ok, err = render_clip(
                 input_file, part, seg["start_sec"], seg["end_sec"],
-                ratio=ratio, reframe=reframe, crop=crop, effects=effects,
+                ratio=ratio, reframe=reframe, crop=crop, effects=effects, facecam=facecam,
             )
             if not ok:
                 return False, f"Segment {i+1}: {err}"
@@ -407,7 +461,7 @@ def render_stitched_clip(
         if ass_file and os.path.exists(ass_file):
             cmd += [
                 "-vf", f"ass='{_ass_escape(ass_file)}'",
-                "-c:v", "libx264", "-preset", PRESET, "-crf", CRF,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-c:a", "aac", "-b:a", "128k",
             ]
         else:

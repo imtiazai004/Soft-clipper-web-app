@@ -476,14 +476,14 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
         if len(segs) == 1:
             ok, err = video.render_clip(
                 sess["video_path"], rec["path"], segs[0]["start_sec"], segs[0]["end_sec"],
-                ratio=r.get("ratio"), ass_file=ass_file, reframe=r.get("reframe", "smart"),
+                ratio=r.get("ratio"), ass_file=ass_file, reframe=r.get("reframe", "smart"), facecam=r.get("facecam"),
                 crop=r.get("crop"), effects=eff,
             )
         else:
             ok, err = video.render_stitched_clip(
                 sess["video_path"], rec["path"], segs,
                 ratio=r.get("ratio"), ass_file=ass_file, work_dir=out_dir,
-                reframe=r.get("reframe", "smart"), crop=r.get("crop"), effects=eff,
+                reframe=r.get("reframe", "smart"), facecam=r.get("facecam"), crop=r.get("crop"), effects=eff,
             )
     finally:
         if ass_file and os.path.exists(ass_file):
@@ -584,11 +584,17 @@ class OverlayOpts(BaseModel):
     color: str = "white"           # named palette or #rrggbb
 
 
+class FacecamOpts(BaseModel):
+    """Where the streamer's camera box sits, for the gameplay + facecam layout."""
+    corner: str = "bottom-left"    # bottom-left | bottom-right | top-left | top-right
+
+
 class CutBody(BaseModel):
     clips: list[dict]              # [{name, start_sec, end_sec, meta?}]
     ratio: str | None = "9:16"
-    reframe: str = "smart"         # smart | fit | split | center | manual
+    reframe: str = "smart"         # smart | fit | split | center | manual | gamecam
     captions: CaptionOpts = CaptionOpts()
+    facecam: FacecamOpts = FacecamOpts()
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
@@ -601,8 +607,9 @@ class ReelBody(BaseModel):
     theme: str = ""
     target_duration: int = 45
     ratio: str | None = "9:16"
-    reframe: str = "smart"         # smart | fit | split | center | manual
+    reframe: str = "smart"         # smart | fit | split | center | manual | gamecam
     captions: CaptionOpts = CaptionOpts()
+    facecam: FacecamOpts = FacecamOpts()
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
@@ -987,6 +994,7 @@ class EditBody(BaseModel):
     ratio: str | None = "9:16"
     reframe: str = "smart"
     captions: CaptionOpts = CaptionOpts()
+    facecam: FacecamOpts = FacecamOpts()
     headline: HeadlineOpts = HeadlineOpts()
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()

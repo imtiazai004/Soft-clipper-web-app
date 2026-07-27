@@ -13,11 +13,20 @@ const CAPTION_STYLES = ['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon', 'Bou
 // Mirrors core/silence.py LENGTHS
 const SPLIT_LENGTHS = [30, 45, 60, 90, 120]
 
+// Mirrors core/video.py FACECAM_CORNERS
+const FACECAM_CORNERS = [
+  { id: 'bottom-left', label: '↙ Bottom left' },
+  { id: 'bottom-right', label: '↘ Bottom right' },
+  { id: 'top-left', label: '↖ Top left' },
+  { id: 'top-right', label: '↗ Top right' },
+]
+
 const REFRAMES = [
   { id: 'smart', label: '🎯 Smart Crop', hint: 'AI keeps the speaker centered' },
   { id: 'fit', label: '🌫️ Fit + Blur', hint: 'Full video on blurred background' },
   { id: 'split', label: '⬆⬇ Split', hint: 'Speaker top, 2nd person / scene bottom' },
   { id: 'center', label: '▣ Center', hint: 'Plain center crop' },
+  { id: 'gamecam', label: '🎮 Game + Cam', hint: 'Gameplay below, your camera above' },
   { id: 'manual', label: '✋ Manual Frame', hint: 'Place the crop yourself in the editor' },
 ]
 
@@ -106,6 +115,7 @@ export default function App() {
   const [headlinePos, setHeadlinePos] = useState('top')
   const [headlineSize, setHeadlineSize] = useState(20)
   const [crop, setCrop] = useState({ cx: 0.5, cy: 0.5, zoom: 1 })
+  const [facecamCorner, setFacecamCorner] = useState('bottom-left')
   // look effects + text overlays applied to EVERY generated clip (edit once here,
   // fine-tune any single clip later in its own editor)
   const [effects, setEffects] = useState({ ...DEFAULT_EFFECTS })
@@ -156,6 +166,7 @@ export default function App() {
   // global style; the per-clip editor overrides any of these for one clip
   const lookOpts = {
     ratio, reframe: reframeMode, captions: captionOpts, headline: headlineOpts, crop,
+    facecam: { corner: facecamCorner },
     effects,
     overlays: overlays.map(({ text, x, y, size, color }) => ({ text, x, y, size, color })),
   }
@@ -376,6 +387,23 @@ export default function App() {
               </button>
             ))}
           </div>
+          {reframeMode === 'gamecam' && (
+            <>
+              <div className="side-row">
+                <span className="lbl-inline">Where is your camera?</span>
+              </div>
+              <div className="pills">
+                {FACECAM_CORNERS.map((c) => (
+                  <button key={c.id} className={`pill ${facecamCorner === c.id ? 'active' : ''}`}
+                    onClick={() => setFacecamCorner(c.id)}>{c.label}</button>
+                ))}
+              </div>
+              <span className="muted small">
+                Gameplay is fitted, never cropped — a game cut to 9:16 loses the half of the
+                screen where everything happens.
+              </span>
+            </>
+          )}
         </div>
 
         <div className="sidebar-section">
