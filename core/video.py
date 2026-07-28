@@ -164,7 +164,7 @@ def _fit_filter_complex(ratio: str, ass_file: str | None, vfx: list[str]) -> str
 
 
 def _split_filter_complex(iw: int, ih: int, faces: list[dict], ass_file: str | None,
-                          vfx: list[str]) -> str | None:
+                          vfx: list[str], min_weight: float = 0.20) -> str | None:
     """Stacked 9:16 layout — NEVER shows the same person twice.
 
     - 2+ clearly separate faces  -> speaker panel top, 2nd person panel bottom
@@ -184,7 +184,7 @@ def _split_filter_complex(iw: int, ih: int, faces: list[dict], ass_file: str | N
     two_people = (
         len(faces) >= 2
         and abs(faces[0]["cx"] - faces[1]["cx"]) >= 0.20   # genuinely different positions
-        and faces[1]["weight"] >= 0.20                      # 2nd person seen often enough
+        and faces[1]["weight"] >= min_weight                # 2nd person seen often enough
     )
 
     if two_people:
@@ -266,6 +266,7 @@ def render_clip(
     crop: dict | None = None,
     effects: dict | None = None,
     facecam: dict | None = None,
+    note=None,
 ) -> tuple[bool, str | None]:
     """Cut [start, end], reframe + look effects + burn captions. One ffmpeg pass.
 
@@ -316,6 +317,17 @@ def render_clip(
             iw, ih = info["width"], info["height"]
             if iw <= 0 or ih <= 0:
                 vf_filters.append(RATIO_FILTERS[ratio])
+            elif face_reframe.face_coverage(input_file, start, end) < face_reframe.MIN_COVERAGE:
+                # Nobody findable in most of this window. Cropping anyway is how
+                # a clip ends up framed on a lamp: keep the whole picture and
+                # say why, rather than committing to a guess.
+                if note:
+                    note(
+                        "No faces found in most of this clip, so the whole frame was "
+                        "kept instead of cropping. Try Fit + blur or place the crop "
+                        "yourself in the editor."
+                    )
+                filter_complex = _fit_filter_complex(ratio, ass_file, vfx)
             else:
                 faces = face_reframe.analyze(input_file, start, end)
                 if reframe == "split" and ratio == "9:16":
@@ -327,14 +339,21 @@ def render_clip(
                 else:  # smart (or split on non-9:16 ratios)
                     # the multi-window "follow the speaker" path can't also carry
                     # effects cleanly, so only take it when there are no effects
-                    windows = face_reframe.crop_timeline(input_file, start, end)
-                    if len(windows) > 1 and not vfx and not afx:
-                        return _render_dynamic_smart(
-                            input_file, output_file, start, windows,
-                            iw, ih, ratio, ass_file,
+                    samples = face_reframe.sample_faces_timed(input_file, start, end)
+                    windows = face_reframe.crop_timeline(
+                        input_file, start, end, frames=samples
+                    )
+
+                    if not filter_complex:
+                        if len(windows) > 1 and not vfx and not afx:
+                            return _render_dynamic_smart(
+                                input_file, output_file, start, windows,
+                                iw, ih, ratio, ass_file,
+                            )
+                        wf = windows[0]["face"] if windows else None
+                        vf_filters.append(
+                            _smart_crop_filter(iw, ih, ratio, [wf] if wf else faces)
                         )
-                    wf = windows[0]["face"]
-                    vf_filters.append(_smart_crop_filter(iw, ih, ratio, [wf] if wf else faces))
         else:  # center
             vf_filters.append(RATIO_FILTERS[ratio])
 
@@ -428,6 +447,7 @@ def render_stitched_clip(
     crop: dict | None = None,
     effects: dict | None = None,
     facecam: dict | None = None,
+    note=None,
 ) -> tuple[bool, str | None]:
     """Stitch multiple [start_sec, end_sec] segments into ONE clip (teaser/highlight reel).
 
@@ -446,6 +466,7 @@ def render_stitched_clip(
             ok, err = render_clip(
                 input_file, part, seg["start_sec"], seg["end_sec"],
                 ratio=ratio, reframe=reframe, crop=crop, effects=effects, facecam=facecam,
+                note=note,
             )
             if not ok:
                 return False, f"Segment {i+1}: {err}"

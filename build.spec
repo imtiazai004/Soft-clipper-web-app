@@ -48,6 +48,11 @@ if os.path.isdir(cv2_data):
 # built React frontend
 datas += [("frontend/dist", "frontend/dist")]
 
+# The face detector's model. Without it the app falls back to the Haar cascade,
+# which is the detector that framed clips on a painting — and it would do it
+# silently, in the packaged build only, which is the worst way to find out.
+datas += [("core/models", "core/models")]
+
 # bundle ffmpeg + ffprobe into BUNDLE/bin (added to PATH at runtime)
 import glob
 
