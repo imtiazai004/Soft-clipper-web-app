@@ -9,6 +9,8 @@ plain outlined text or sitting on a solid box — the "title bar" look.
 
 Both live in a single .ass file with two styles, so ffmpeg burns them in one pass.
 """
+import re
+
 # `highlight` is the colour the currently-spoken word turns when word-by-word
 # highlighting is on. It is ignored otherwise, so adding it changed nothing for
 # the four styles that already shipped.
@@ -57,7 +59,7 @@ DEFAULT_OVERLAY_COLOR = "white"
 # PlayRes below keeps font sizes consistent across output resolutions.
 ASS_HEADER = """[Script Info]
 ScriptType: v4.00+
-PlayResX: 384
+PlayResX: {play_x}
 PlayResY: 288
 ScaledBorderAndShadow: yes
 
@@ -80,8 +82,128 @@ def _ass_time(seconds: float) -> str:
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def _chunk_words(words: list[str], max_words: int = 3) -> list[list[str]]:
-    return [words[i:i + max_words] for i in range(0, len(words), max_words)]
+# Average glyph advance as a fraction of the font size. Captions are rendered
+# upper-cased, and capitals in bold Arial are appreciably wider than the mixed-
+# case average — 0.55 was the first guess and still let "CAN SEE THROUGH" wrap.
+_GLYPH_WIDTH = 0.62
+
+# Left and right margins in the Default style.
+_SIDE_MARGINS = 20
+
+
+def line_budget(fontsize: int, play_x: int) -> int:
+    """How many characters actually fit on one line.
+
+    Guessing a fixed number was the first attempt and it was wrong: at
+    fontsize 17 on a 9:16 canvas only about fifteen characters fit, so a
+    twenty-character chunk still wrapped and still ended up two lines tall in
+    the middle of the picture. The budget has to come from the font size and
+    the canvas width, and then it adjusts itself for every style and ratio.
+    """
+    usable = max(40, play_x - _SIDE_MARGINS)
+    return max(8, int(usable / (_GLYPH_WIDTH * max(8, fontsize))))
+
+
+def _chunk_words(words: list[str], max_words: int = 3, max_chars: int = 15) -> list[list[str]]:
+    """Split into chunks of at most `max_words`, and never wider than a line.
+
+    A chunk that the renderer has to wrap is a chunk that ends up two lines
+    tall in the middle of the picture, so the width limit wins over the word
+    count. A single word longer than the budget still gets its own chunk —
+    there is nothing else to do with it.
+    """
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    width = 0
+
+    for word in words:
+        added = len(word) + (1 if current else 0)
+        too_many = len(current) >= max_words
+        too_wide = current and width + added > max_chars
+        if too_many or too_wide:
+            chunks.append(current)
+            current, width = [], 0
+            added = len(word)
+        current.append(word)
+        width += added
+
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# YouTube's auto-captions carry markup meant for a caption track, not for
+# burning into a picture: ">>" for a speaker change, bracketed sound events,
+# and "NAME:" labels. Left in, they get rendered onto the video as-is.
+_CAPTION_NOISE = re.compile(
+    r"""
+      ^\s*>>+\s*            # >> speaker change, at the start of a line
+    | \[[^\]]{0,40}\]       # [Music], [Applause], [inaudible]
+    | \([^)]{0,40}\)        # (laughs), (crosstalk)
+    | ^\s*[A-Z][A-Z .'-]{1,20}:\s   # SPEAKER NAME:
+    """,
+    re.VERBOSE,
+)
+
+
+def _clean_caption_text(text: str) -> str:
+    return re.sub(r"\s+", " ", _CAPTION_NOISE.sub(" ", str(text or ""))).strip()
+
+
+def tidy_segments(segments: list[dict]) -> list[dict]:
+    """Put caption segments in a state fit to burn into a picture.
+
+    Three things go wrong with real transcripts, and all three were visible in
+    a rendered clip:
+
+    * **They overlap.** YouTube's captions roll — the next line starts before
+      the previous one ends — so two captions were on screen at once, stacked,
+      climbing into the middle of the frame. Each segment is cut off where the
+      next one begins.
+    * **They repeat.** Rolling captions restate the tail of the previous line.
+      A repeated opening is dropped.
+    * **They carry markup.** ">>" and "[Music]" were being burned into video.
+    """
+    cleaned = []
+    for seg in segments or []:
+        text = _clean_caption_text(seg.get("text", ""))
+        if not text:
+            continue
+        start = float(seg.get("start", 0.0))
+        cleaned.append(
+            {"start": start, "duration": float(seg.get("duration", 2.0)), "text": text}
+        )
+
+    cleaned.sort(key=lambda s: s["start"])
+
+    out: list[dict] = []
+    for i, seg in enumerate(cleaned):
+        # Drop a repeated opening left over from a rolling caption. Rolling
+        # captions restate the whole previous line before adding new words, so
+        # the repeat can be any length — take the longest prefix that already
+        # appeared, not a fixed window.
+        if out:
+            previous = out[-1]["text"].lower()
+            words = seg["text"].split()
+            for take in range(min(len(words), 12), 1, -1):
+                if " ".join(words[:take]).lower() in previous:
+                    words = words[take:]
+                    break
+            seg["text"] = " ".join(words)
+            if not seg["text"]:
+                continue
+
+        end = seg["start"] + max(0.2, seg["duration"])
+        if i + 1 < len(cleaned):
+            end = min(end, cleaned[i + 1]["start"])
+        duration = end - seg["start"]
+        # A sliver left after clamping is not readable; give it a floor and let
+        # the next caption replace it rather than showing a flicker.
+        if duration < 0.25:
+            continue
+        out.append({"start": seg["start"], "duration": duration, "text": seg["text"]})
+
+    return out
 
 
 def _ass_text(text: str) -> str:
@@ -216,6 +338,7 @@ def build_ass(
     clip_duration: float = 0.0,
     overlays: list[dict] | None = None,
     highlight: bool = False,
+    ratio: str | None = "9:16",
 ) -> str | None:
     """Write an ASS file from clip-relative caption segments, a headline, overlays.
 
@@ -227,6 +350,18 @@ def build_ass(
     st = caption_style(style)
     lines = []
 
+    # The caption canvas has to be the same shape as the video. A 4:3 PlayRes
+    # over a 9:16 frame stretches every glyph sideways, which is why the text
+    # came out fat and only about seventeen characters fitted on a line.
+    play_x = {"9:16": 162, "1:1": 288, "16:9": 512}.get(ratio or "9:16", 162)
+
+    # Overlapping, repeated and marked-up segments are not this function's
+    # problem to reason about further down — they are fixed once, here.
+    segments = tidy_segments(segments)
+
+    # How much text fits on one line at this style's size, on this canvas.
+    budget = line_budget(st["fontsize"], play_x)
+
     for seg in segments or []:
         text = seg["text"].strip()
         if not text:
@@ -236,7 +371,7 @@ def build_ass(
             continue
         seg_start = seg["start"]
         seg_dur = max(0.5, seg.get("duration", 2.0))
-        chunks = _chunk_words(words, words_per_line)
+        chunks = _chunk_words(words, words_per_line, budget)
         total_chars = sum(len(w) for w in words) or 1
 
         t = seg_start
@@ -272,6 +407,7 @@ def build_ass(
     )
     top = (headline or {}).get("position", "top") != "bottom"
     header = ASS_HEADER.format(
+        play_x=play_x,
         fontsize=st["fontsize"], colour=st["colour"], outline=st["outline"],
         # BorderStyle 3 draws an opaque box behind the words instead of an
         # outline around them — the only way captions stay readable over a

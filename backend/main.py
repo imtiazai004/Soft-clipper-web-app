@@ -471,6 +471,7 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
             words_per_line=cap.get("words_per_line", 4),
             highlight=bool(cap.get("highlight", False)),
             headline=head, clip_duration=clip_duration, overlays=overlays,
+            ratio=r.get("ratio"),
         )
     try:
         if len(segs) == 1:

@@ -9,6 +9,7 @@ what the previous build wrote, because customers re-render old clips.
 from __future__ import annotations
 
 import os
+import re
 import sys
 
 import pytest
@@ -61,11 +62,14 @@ def test_highlighting_produces_one_line_per_word(tmp_path):
 
 
 def test_the_whole_phrase_stays_on_screen(tmp_path):
-	"""Only the colour moves. Showing one word at a time would lose the phrase."""
+	"""Only the colour moves. Showing one word at a time would lose the phrase.
+
+	"Phrase" means the chunk, not the whole segment — chunks are limited by how
+	much fits on one line, so a four-word segment may be two chunks.
+	"""
 	line = dialogues(build(tmp_path, words_per_line=4, highlight=True))[0]
 	body = text_of(line)
-	for word in ("THIS", "IS", "THE", "HOOK"):
-		assert word in body
+	assert len([w for w in ("THIS", "IS", "THE", "HOOK") if w in body]) >= 2
 
 
 def test_exactly_one_word_is_highlighted_per_line(tmp_path):
@@ -75,9 +79,19 @@ def test_exactly_one_word_is_highlighted_per_line(tmp_path):
 
 
 def test_the_highlight_walks_forward_through_the_chunk(tmp_path):
-	lines = dialogues(build(tmp_path, words_per_line=4, highlight=True))[:4]
+	"""Within one chunk the lit word moves left to right. It resets at the start
+	of the next chunk, so compare only lines that share the same words."""
+	lines = dialogues(build(tmp_path, words_per_line=4, highlight=True))
 	active = captions.CAPTION_STYLES["TikTok Bold"]["highlight"]
-	positions = [text_of(l).index(active) for l in lines]
+
+	def words_of(line):
+		# Strip every override block, not just the colour, or two lines from the
+		# same chunk never compare equal — the reset tag differs.
+		return re.sub(r"\{[^}]*\}", "", text_of(line)).split()
+
+	first_chunk = [l for l in lines if words_of(l) == words_of(lines[0])]
+	positions = [text_of(l).index(active) for l in first_chunk]
+	assert len(positions) > 1
 	assert positions == sorted(positions), "the highlight jumped backwards"
 
 
@@ -117,10 +131,11 @@ def test_special_characters_are_escaped_in_highlighted_lines(tmp_path):
 		str(tmp_path / "s.ass"),
 		highlight=True,
 	)
-	for line in dialogues(out):
-		body = text_of(line)
+	bodies = [text_of(l) for l in dialogues(out)]
+	for body in bodies:
 		assert "{x}" not in body.lower()
-		assert "(X)" in body
+	# The escaped brace survives somewhere — which chunk depends on line width.
+	assert any("(X)" in b for b in bodies)
 
 
 # ── the two new styles ───────────────────────────────────────────────────────
@@ -165,3 +180,126 @@ def test_styles_without_pop_do_not_scale(tmp_path):
 def test_every_style_renders_both_with_and_without_highlighting(tmp_path, style):
 	assert build(tmp_path, f"{style}-off.ass", style=style)
 	assert build(tmp_path, f"{style}-on.ass", style=style, highlight=True)
+
+
+# ── tidying real transcripts ─────────────────────────────────────────────────
+# Every case here came out of one rendered clip that looked broken on screen.
+
+
+def test_overlapping_segments_are_cut_at_the_next_one(tmp_path):
+	"""YouTube's captions roll: the next line starts before the last one ends.
+	Burned in as-is, two captions sit on screen at once, stacked, climbing into
+	the middle of the picture. That is exactly what the first test render did."""
+	segs = [
+		{"start": 0.0, "duration": 5.0, "text": "and then you get"},
+		{"start": 2.0, "duration": 5.0, "text": "laser on the wall"},
+	]
+	tidy = captions.tidy_segments(segs)
+	assert tidy[0]["start"] + tidy[0]["duration"] <= tidy[1]["start"] + 1e-6
+
+
+def test_no_two_captions_are_ever_on_screen_together(tmp_path):
+	segs = [
+		{"start": 0.0, "duration": 4.0, "text": "one two three"},
+		{"start": 1.0, "duration": 4.0, "text": "four five six"},
+		{"start": 2.0, "duration": 4.0, "text": "seven eight nine"},
+	]
+	out = captions.build_ass(segs, str(tmp_path / "o.ass"), words_per_line=4)
+	spans = []
+	for line in open(out, encoding="utf-8"):
+		if line.startswith("Dialogue: 0"):
+			parts = line.split(",")
+			spans.append((parts[1].strip(), parts[2].strip()))
+	spans.sort()
+	for (s1, e1), (s2, _) in zip(spans, spans[1:]):
+		assert e1 <= s2, f"caption {s1}-{e1} was still on screen when {s2} began"
+
+
+def test_youtube_markup_is_not_burned_into_the_video():
+	"""'>>' means a speaker change and '[Music]' is a sound event. Both were
+	being rendered onto the picture."""
+	segs = [
+		{"start": 0, "duration": 2, "text": ">> you can see wall."},
+		{"start": 3, "duration": 2, "text": "[Music] the next bit"},
+		{"start": 6, "duration": 2, "text": "(laughs) and then this"},
+	]
+	texts = [s["text"] for s in captions.tidy_segments(segs)]
+	assert texts == ["you can see wall.", "the next bit", "and then this"]
+
+
+def test_a_rolling_caption_does_not_repeat_itself():
+	"""Rolling captions restate the previous line before adding new words."""
+	segs = [
+		{"start": 0, "duration": 2, "text": "and then you get"},
+		{"start": 2, "duration": 2, "text": "and then you get laser on the wall"},
+	]
+	assert [s["text"] for s in captions.tidy_segments(segs)] == [
+		"and then you get",
+		"laser on the wall",
+	]
+
+
+def test_a_segment_left_with_nothing_is_dropped():
+	segs = [
+		{"start": 0, "duration": 2, "text": "the same words"},
+		{"start": 2, "duration": 2, "text": "the same words"},
+	]
+	assert len(captions.tidy_segments(segs)) == 1
+
+
+def test_segments_are_sorted_before_anything_else():
+	segs = [
+		{"start": 5, "duration": 2, "text": "second"},
+		{"start": 0, "duration": 2, "text": "first"},
+	]
+	assert [s["text"] for s in captions.tidy_segments(segs)] == ["first", "second"]
+
+
+def test_chunks_never_exceed_a_readable_line_width():
+	"""'LASER ON / THE WALL.' — four words, but wide ones, so libass wrapped it
+	and the caption became two lines tall in the middle of the frame."""
+	budget = captions.line_budget(17, 162)
+	for chunk in captions._chunk_words("laser on the wall. through the wall.".split(), 4, budget):
+		assert len(" ".join(chunk)) <= budget
+
+
+def test_one_very_long_word_still_gets_a_chunk():
+	"""Nothing sensible can be done with a word wider than the line, so it gets
+	its own chunk rather than being dropped or split mid-word."""
+	assert captions._chunk_words(["antidisestablishmentarianism"], 4, 12) == [
+		["antidisestablishmentarianism"]
+	]
+
+
+def test_the_caption_canvas_matches_the_video_shape(tmp_path):
+	"""A 4:3 PlayRes over a 9:16 frame stretches every glyph sideways."""
+	def play_x(ratio):
+		out = captions.build_ass(SEGMENTS, str(tmp_path / f"{ratio.replace(':','-')}.ass"), ratio=ratio)
+		line = [l for l in open(out, encoding="utf-8") if l.startswith("PlayResX")][0]
+		return int(line.split(":")[1])
+
+	assert play_x("9:16") / 288 == pytest.approx(9 / 16, abs=0.02)
+	assert play_x("1:1") / 288 == pytest.approx(1.0, abs=0.02)
+	assert play_x("16:9") / 288 == pytest.approx(16 / 9, abs=0.03)
+
+
+def test_the_line_budget_comes_from_the_font_and_canvas():
+	"""A fixed character limit was the first attempt and it was wrong — at
+	fontsize 17 on a 9:16 canvas only about thirteen characters fit, so a
+	twenty-character chunk still wrapped."""
+	narrow = captions.line_budget(17, 162)     # 9:16
+	square = captions.line_budget(17, 288)     # 1:1
+	wide = captions.line_budget(17, 512)       # 16:9
+	assert narrow < square < wide
+	assert 10 <= narrow <= 16
+
+	# A smaller style fits more on the same canvas.
+	assert captions.line_budget(14, 162) > narrow
+
+
+def test_no_chunk_is_wide_enough_to_wrap_on_a_vertical_clip(tmp_path):
+	"""Wrapping is what put captions two lines tall in the middle of the frame."""
+	budget = captions.line_budget(captions.CAPTION_STYLES["TikTok Bold"]["fontsize"], 162)
+	words = "and then you get laser on the wall you can see through the wall".split()
+	for chunk in captions._chunk_words(words, 4, budget):
+		assert len(" ".join(chunk)) <= budget

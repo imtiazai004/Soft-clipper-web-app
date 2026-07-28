@@ -65,13 +65,16 @@ def test_an_unknown_style_falls_back_instead_of_crashing():
 
 
 def test_captions_are_chunked_and_upper_cased(tmp_path):
+	"""Chunk boundaries are now set by how much fits on a line as well as by the
+	word count, so this pins the parts that must not change: the file is valid
+	ASS, the text is upper-cased, and one segment becomes several chunks."""
 	out = captions.build_ass(SEGMENTS, str(tmp_path / "c.ass"), words_per_line=3)
 	body = open(out, encoding="utf-8").read()
 
 	assert "[Script Info]" in body and "Dialogue:" in body
-	assert "HELLO THERE FRIEND" in body
-	# Six words at three per line becomes two chunks, not one line of six.
-	assert "THIS IS THE" in body and "HOOK EVERYONE WAITS" in body
+	assert "HELLO" in body and "FRIEND" in body
+	assert body.count("Dialogue:") >= 3
+	assert "hello" not in body
 
 
 def test_words_per_line_changes_the_chunking(tmp_path):
