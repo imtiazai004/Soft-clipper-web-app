@@ -17,7 +17,10 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
-FROM = os.environ.get("MAIL_FROM", "info@aisofttechsolution.com")
+# The domain the customer just bought from. Sending a licence key from anywhere
+# else reads as phishing to the buyer and scores badly with spam filters, which
+# both end the same way: the key never gets used.
+FROM = os.environ.get("MAIL_FROM", "info@softclipper.pro")
 DOWNLOAD_URL = os.environ.get("DOWNLOAD_URL", "")
 SUPPORT_WHATSAPP = os.environ.get("SUPPORT_WHATSAPP", "+44 7462 086661")
 MAC_GUIDE_URL = os.environ.get("MAC_GUIDE_URL", "https://softclipper.pro/help/install-mac/")
