@@ -16,8 +16,10 @@ import logging
 import os
 import time
 
+import pathlib
+
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import crypto, mail, store
 
@@ -304,6 +306,24 @@ def admin_revoke(key: str, body: dict = Body(default={}), x_admin_token: str = H
 		raise HTTPException(404, "Unknown key")
 	store.revoke(key, body.get("reason", "manual"))
 	return {"ok": True}
+
+
+_ADMIN_PAGE = pathlib.Path(__file__).with_name("admin.html")
+
+
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+def admin_page():
+	"""The page a human uses to do the four things support actually needs.
+
+	Serving it here rather than anywhere else means no second deployment, no
+	build step and no new hostname — it is one file next to the API it calls.
+
+	The page itself is not a secret and needs no auth to load: it is empty until
+	someone supplies the admin token, and every endpoint behind it checks that
+	token on every call. Guarding the HTML would protect nothing that the API
+	does not already protect.
+	"""
+	return HTMLResponse(_ADMIN_PAGE.read_text(encoding="utf-8"))
 
 
 @app.exception_handler(HTTPException)

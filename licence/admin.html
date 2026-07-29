@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Soft Clipper — licences</title>
+<style>
+	:root {
+		--bg: #0f0e1e; --panel: #17152e; --panel-2: #1e1c3a;
+		--line: rgba(255,255,255,.11); --line-2: rgba(255,255,255,.2);
+		--text: #eeecf8; --muted: #a8a3c8; --dim: #918cb2;
+		--violet: #a78bfa; --cyan: #22d3ee; --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+		--mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+	}
+	* { box-sizing: border-box; margin: 0; padding: 0; }
+	body {
+		background: var(--bg); color: var(--text); min-height: 100vh;
+		font: 15px/1.55 "Inter", "Segoe UI", system-ui, sans-serif;
+		padding: 22px clamp(14px, 4vw, 40px) 60px;
+	}
+	h1 { font-size: 1.35rem; letter-spacing: -.02em; }
+	.head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
+	.sub { color: var(--dim); font-size: .88rem; margin-bottom: 22px; }
+	.spacer { margin-left: auto; }
+
+	button, input, select {
+		font: inherit; color: inherit; border-radius: 9px; border: 1px solid var(--line);
+		background: var(--panel); padding: 8px 12px;
+	}
+	input:focus, button:focus-visible { outline: 2px solid var(--violet); outline-offset: 1px; }
+	button { cursor: pointer; transition: border-color .15s, background .15s; }
+	button:hover { border-color: var(--line-2); background: var(--panel-2); }
+	button.primary { background: linear-gradient(135deg,#7c3aed,#5b53f0 55%,#0d7f9c); border-color: transparent; font-weight: 600; }
+	button.danger:hover { border-color: var(--bad); color: var(--bad); }
+	button:disabled { opacity: .5; cursor: not-allowed; }
+
+	.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 18px; }
+	.card h2 { font-size: .74rem; letter-spacing: .13em; text-transform: uppercase; color: var(--dim); margin-bottom: 14px; }
+	.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+	.grow { flex: 1; min-width: 180px; }
+
+	table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+	th { text-align: left; font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); font-weight: 700; padding: 0 10px 10px; }
+	td { padding: 11px 10px; border-top: 1px solid var(--line); vertical-align: middle; }
+	tr:hover td { background: rgba(255,255,255,.02); }
+	.key { font-family: var(--mono); font-size: .84rem; white-space: nowrap; }
+	.email { color: var(--muted); }
+	.wrapscroll { overflow-x: auto; }
+
+	.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .72rem; font-weight: 700; }
+	.pill.active { background: rgba(52,211,153,.15); color: var(--ok); }
+	.pill.revoked { background: rgba(248,113,113,.15); color: var(--bad); }
+	.pill.unused { background: rgba(255,255,255,.08); color: var(--dim); }
+
+	.msg { padding: 11px 14px; border-radius: 10px; margin-bottom: 16px; font-size: .9rem; display: none; }
+	.msg.show { display: block; }
+	.msg.good { background: rgba(52,211,153,.12); border: 1px solid var(--ok); }
+	.msg.bad { background: rgba(248,113,113,.12); border: 1px solid var(--bad); }
+
+	.gate { max-width: 420px; margin: 12vh auto; }
+	.hint { color: var(--dim); font-size: .82rem; margin-top: 10px; }
+	.events { font-family: var(--mono); font-size: .78rem; color: var(--muted); white-space: pre-wrap; }
+	.empty { color: var(--dim); padding: 26px 10px; text-align: center; }
+	.acts { display: flex; gap: 6px; justify-content: flex-end; }
+	.acts button { padding: 5px 10px; font-size: .8rem; }
+</style>
+</head>
+<body>
+
+<!-- The token is asked for, never stored on the server side of this page. -->
+<div id="gate" class="gate card">
+	<h2>Licence admin</h2>
+	<div class="row">
+		<input id="token" class="grow" type="password" placeholder="Admin token" autocomplete="off">
+		<button class="primary" onclick="signIn()">Open</button>
+	</div>
+	<p class="hint">
+		Kept in this tab only, and forgotten when you close it.
+	</p>
+	<div id="gateMsg" class="msg bad" style="margin-top:14px"></div>
+</div>
+
+<div id="app" hidden>
+	<div class="head">
+		<h1>Licences</h1>
+		<span id="count" class="sub" style="margin:0"></span>
+		<span class="spacer"></span>
+		<button onclick="load()">Refresh</button>
+		<button onclick="signOut()">Lock</button>
+	</div>
+	<p class="sub">Soft Clipper · app.softclipper.pro</p>
+
+	<div id="msg" class="msg"></div>
+
+	<div class="card">
+		<h2>Issue a licence by hand</h2>
+		<div class="row">
+			<input id="newEmail" class="grow" type="email" placeholder="customer@example.com">
+			<input id="newNote" class="grow" placeholder="Why — tester, refund replacement, invoiced sale">
+			<label class="row" style="gap:6px;color:var(--muted);font-size:.86rem">
+				<input id="sendEmail" type="checkbox" checked style="width:16px;height:16px;padding:0">
+				email it
+			</label>
+			<button class="primary" onclick="createLicence()">Create</button>
+		</div>
+	</div>
+
+	<div class="card">
+		<div class="row" style="margin-bottom:14px">
+			<h2 style="margin:0">All licences</h2>
+			<span class="spacer"></span>
+			<input id="filter" placeholder="Filter by email or key" oninput="render()" style="min-width:240px">
+		</div>
+		<div class="wrapscroll">
+			<table>
+				<thead>
+					<tr>
+						<th>Key</th><th>Email</th><th>Status</th><th>Machine</th>
+						<th>Created</th><th>Last seen</th><th>Source</th><th></th>
+					</tr>
+				</thead>
+				<tbody id="rows"></tbody>
+			</table>
+		</div>
+		<div id="empty" class="empty" hidden>Nothing here yet.</div>
+	</div>
+
+	<div id="detail" class="card" hidden>
+		<div class="row" style="margin-bottom:12px">
+			<h2 style="margin:0">History — <span id="detailKey" class="key"></span></h2>
+			<span class="spacer"></span>
+			<button onclick="closeDetail()">Close</button>
+		</div>
+		<div id="events" class="events"></div>
+	</div>
+</div>
+
+<script>
+const KEY = "sc-admin-token";
+let all = [];
+
+const tok = () => sessionStorage.getItem(KEY) || "";
+const $ = (id) => document.getElementById(id);
+
+function say(text, good) {
+	const m = $("msg");
+	m.textContent = text;
+	m.className = "msg show " + (good ? "good" : "bad");
+	if (good) setTimeout(() => (m.className = "msg"), 4000);
+}
+
+async function api(path, options = {}) {
+	const res = await fetch("/api/admin" + path, {
+		...options,
+		headers: { "Content-Type": "application/json", "X-Admin-Token": tok(), ...(options.headers || {}) },
+	});
+	const body = await res.json().catch(() => ({}));
+	if (!res.ok) throw new Error(body.error || body.detail || `HTTP ${res.status}`);
+	return body;
+}
+
+async function signIn() {
+	const t = $("token").value.trim();
+	if (!t) return;
+	sessionStorage.setItem(KEY, t);
+	try {
+		await api("/licences?limit=1");
+		$("gate").hidden = true;
+		$("app").hidden = false;
+		load();
+	} catch (e) {
+		sessionStorage.removeItem(KEY);
+		const m = $("gateMsg");
+		m.textContent = String(e.message).includes("401") || String(e.message).toLowerCase().includes("unauthor")
+			? "That token was not accepted."
+			: e.message;
+		m.className = "msg bad show";
+	}
+}
+
+function signOut() {
+	sessionStorage.removeItem(KEY);
+	location.reload();
+}
+
+async function load() {
+	try {
+		const d = await api("/licences?limit=500");
+		all = d.licences || [];
+		$("count").textContent = all.length + (all.length === 1 ? " licence" : " licences");
+		render();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+// "3 days ago" is what you want when someone is on the phone; a timestamp is
+// something you then have to do arithmetic on.
+function ago(unix) {
+	if (!unix) return "—";
+	const s = Math.max(0, Math.floor(Date.now() / 1000 - unix));
+	if (s < 90) return "just now";
+	const m = Math.floor(s / 60);
+	if (m < 60) return m + "m ago";
+	const h = Math.floor(m / 60);
+	if (h < 48) return h + "h ago";
+	return Math.floor(h / 24) + "d ago";
+}
+
+function render() {
+	const q = $("filter").value.trim().toLowerCase();
+	const list = q
+		? all.filter((l) => (l.email || "").toLowerCase().includes(q) || (l.key || "").toLowerCase().includes(q))
+		: all;
+
+	$("empty").hidden = list.length > 0;
+	$("rows").innerHTML = list.map((l) => {
+		const status = l.status === "revoked"
+			? '<span class="pill revoked">revoked</span>'
+			: l.machine
+				? '<span class="pill active">active</span>'
+				: '<span class="pill unused">not used</span>';
+		const machine = l.machine ? l.machine.slice(0, 10) + "…" : "—";
+		const releases = l.releases ? ` <span style="color:var(--warn)">(moved ${l.releases}×)</span>` : "";
+		const source = (l.source || "").startsWith("cs_") ? "Stripe" : (l.source || "manual");
+		return `<tr>
+			<td class="key">${l.key}</td>
+			<td class="email">${l.email || ""}</td>
+			<td>${status}</td>
+			<td title="${l.machine || ""}" style="font-family:var(--mono);color:var(--dim)">${machine}${releases}</td>
+			<td style="color:var(--muted)">${ago(l.created_at)}</td>
+			<td style="color:var(--muted)">${ago(l.last_seen_at)}</td>
+			<td style="color:var(--dim)">${source}</td>
+			<td><div class="acts">
+				<button onclick="history_('${l.key}')">History</button>
+				<button onclick="release('${l.key}')" ${l.machine ? "" : "disabled"}>Release</button>
+				<button class="danger" onclick="revoke('${l.key}')" ${l.status === "revoked" ? "disabled" : ""}>Revoke</button>
+			</div></td>
+		</tr>`;
+	}).join("");
+}
+
+async function createLicence() {
+	const email = $("newEmail").value.trim();
+	if (!email) return say("An email address is required — the key is sent there.", false);
+	try {
+		const d = await api("/licences", {
+			method: "POST",
+			body: JSON.stringify({ email, note: $("newNote").value.trim(), send_email: $("sendEmail").checked }),
+		});
+		$("newEmail").value = "";
+		$("newNote").value = "";
+		say(`Created ${d.key}` + ($("sendEmail").checked ? ` and emailed it to ${email}.` : " — not emailed."), true);
+		load();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function release(key) {
+	if (!confirm(`Unbind ${key} from its computer?\n\nThe customer can then activate on a new PC. Their current install stops working when its token expires.`)) return;
+	try {
+		await api(`/licences/${key}/release`, { method: "POST" });
+		say(`${key} released — it can be activated on another computer now.`, true);
+		load();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function revoke(key) {
+	if (!confirm(`Revoke ${key}?\n\nThis kills the licence for good. Use it for a refund or a chargeback, not for moving PC — Release does that.`)) return;
+	try {
+		await api(`/licences/${key}/revoke`, { method: "POST", body: JSON.stringify({ reason: "admin" }) });
+		say(`${key} revoked.`, true);
+		load();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function history_(key) {
+	try {
+		const d = await api(`/licences/${key}`);
+		$("detailKey").textContent = key;
+		const ev = d.events || [];
+		$("events").textContent = ev.length
+			? ev.map((e) => `${new Date(e.at * 1000).toISOString().slice(0, 16).replace("T", " ")}  ${e.kind.padEnd(12)} ${e.detail || ""}`).join("\n")
+			: "No events recorded.";
+		$("detail").hidden = false;
+		$("detail").scrollIntoView({ behavior: "smooth", block: "nearest" });
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function closeDetail() { $("detail").hidden = true; }
+
+$("token").addEventListener("keydown", (e) => { if (e.key === "Enter") signIn(); });
+if (tok()) { $("gate").hidden = true; $("app").hidden = false; load(); }
+</script>
+</body>
+</html>
