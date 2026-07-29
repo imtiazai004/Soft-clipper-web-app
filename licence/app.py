@@ -21,7 +21,7 @@ import pathlib
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import crypto, mail, store
+from . import crypto, mail, store, stripe_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("licence")
@@ -34,6 +34,13 @@ TOKEN_DAYS = int(os.environ.get("LICENCE_TOKEN_DAYS", "14"))
 MAX_RELEASES = int(os.environ.get("LICENCE_MAX_RELEASES", "10"))
 ADMIN_TOKEN = os.environ.get("LICENCE_ADMIN_TOKEN", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+# What a new affiliate gets unless they are given their own rate.
+AFFILIATE_RATE_PCT = int(os.environ.get("AFFILIATE_RATE_PCT", "30"))
+# Commission is held until the refund window has closed and then some. Paying on
+# the day of the sale means paying out on orders that come back, and clawing
+# money back from someone who has already spent it is not a database operation.
+AFFILIATE_HOLD_DAYS = int(os.environ.get("AFFILIATE_HOLD_DAYS", "30"))
 
 app = FastAPI(title="Soft Clipper licences", docs_url=None, redoc_url=None)
 
@@ -207,6 +214,44 @@ def _verify_stripe(payload: bytes, sig_header: str) -> bool:
 	return hmac.compare_digest(expected, signature)
 
 
+def _credit_affiliate(ref: str, key: str, session_id: str, session: dict):
+	"""Record what an affiliate earned on one sale.
+
+	The commission is worked out from `amount_total` — what Stripe actually
+	collected — rather than from the list price. A discount code, a currency
+	conversion or a price change would otherwise pay a percentage of a number
+	nobody was charged.
+	"""
+	affiliate = store.get_affiliate(ref)
+	if not affiliate:
+		# Someone shared a link with a code that does not exist, or one that was
+		# deleted. The sale is real and stands; there is simply nobody to pay.
+		log.warning("session %s carried unknown ref %r", session_id, ref)
+		return
+	if affiliate["status"] != "active":
+		log.warning("session %s carried disabled ref %r", session_id, ref)
+		return
+
+	gross = int(session.get("amount_total") or 0)
+	if gross <= 0:
+		log.warning("session %s has no amount_total — not crediting %s", session_id, ref)
+		return
+
+	row = store.record_referral(
+		code=ref,
+		licence_key=key,
+		session=session_id,
+		gross=gross,
+		currency=session.get("currency") or "usd",
+		rate_pct=int(affiliate["rate_pct"]),
+		hold_days=AFFILIATE_HOLD_DAYS,
+	)
+	if row is None:
+		log.info("session %s already credited to %s", session_id, ref)
+	else:
+		log.info("credited %s: %s of %s to %s", session_id, row["commission"], gross, ref)
+
+
 @app.post("/webhooks/stripe")
 async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 	payload = await request.body()
@@ -235,10 +280,26 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 			log.error("session %s completed with no email — cannot deliver a key", session_id)
 			raise HTTPException(400, "No email on session")
 
+		# The affiliate tag, if the buyer arrived through a referral link. Stripe
+		# carries it from the Payment Link URL to here untouched, which is why the
+		# site does not need a server of its own to attribute a sale.
+		ref = store.normalise_code(obj.get("client_reference_id") or "")
+
 		key = crypto.new_key()
-		store.create(key, email, source=session_id)
+		store.create(key, email, source=session_id, ref=ref)
 		mail.send_licence(email, key)
 		log.info("licence %s created for %s", key, email)
+
+		# Attribution is deliberately after the key exists and the email has gone.
+		# A customer who paid must get their licence even if the commission
+		# bookkeeping fails, so nothing in here is allowed to fail the webhook —
+		# an unpaid affiliate is a conversation, an undelivered licence is a refund.
+		if ref:
+			try:
+				_credit_affiliate(ref, key, session_id, obj)
+			except Exception:
+				log.exception("could not credit affiliate %s for session %s", ref, session_id)
+
 		return {"ok": True, "key": key}
 
 	if kind in ("charge.refunded", "charge.dispute.created"):
@@ -249,7 +310,25 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 			if lic["email"] == (email or "").lower() and lic["status"] == "active":
 				store.revoke(lic["key"], kind)
 				log.info("revoked %s after %s", lic["key"], kind)
+				# A sale that came back earns no commission. Only unpaid commission
+				# can be taken back this way; anything already sent stays sent and
+				# shows in the admin list as paid against a revoked licence.
+				if store.void_referral(lic["key"], kind):
+					log.info("voided commission on %s after %s", lic["key"], kind)
 				break
+		return {"ok": True}
+
+	if kind == "account.updated":
+		# A Connect event: the affiliate has moved through Stripe's onboarding.
+		# This is how "ready to be paid" becomes true without anyone watching —
+		# they finish at midnight on a Sunday and the payout button works on
+		# Monday without an admin having to think to press Refresh.
+		affiliate = store.affiliate_by_stripe_account(obj.get("id", ""))
+		if affiliate:
+			ready = stripe_api.payouts_enabled(obj)
+			if bool(affiliate["stripe_ready"]) != ready:
+				store.set_affiliate_stripe(affiliate["code"], obj["id"], ready)
+				log.info("affiliate %s payouts_enabled=%s", affiliate["code"], ready)
 		return {"ok": True}
 
 	return {"ok": True, "ignored": kind}
@@ -306,6 +385,213 @@ def admin_revoke(key: str, body: dict = Body(default={}), x_admin_token: str = H
 		raise HTTPException(404, "Unknown key")
 	store.revoke(key, body.get("reason", "manual"))
 	return {"ok": True}
+
+
+# ── admin: affiliates ────────────────────────────────────────────────────────
+
+
+@app.get("/api/admin/affiliates")
+def admin_affiliates(x_admin_token: str = Header("")):
+	"""Everyone who sells for us, with what they are owed right now."""
+	_require_admin(x_admin_token)
+	return {
+		"affiliates": store.affiliate_summary(),
+		"rate_pct": AFFILIATE_RATE_PCT,
+		"hold_days": AFFILIATE_HOLD_DAYS,
+		# The page hides the automatic-payout controls when this is false rather
+		# than offering a button that can only fail.
+		"stripe_payouts": stripe_api.configured(),
+	}
+
+
+@app.post("/api/admin/affiliates")
+def admin_add_affiliate(body: dict = Body(...), x_admin_token: str = Header("")):
+	_require_admin(x_admin_token)
+	code = store.normalise_code(body.get("code", ""))
+	if len(code) < 3:
+		raise HTTPException(400, "Code must be at least 3 letters or digits")
+	if store.get_affiliate(code):
+		raise HTTPException(409, f"'{code}' is already taken")
+	if not (body.get("name") or "").strip():
+		raise HTTPException(400, "name is required")
+	if not (body.get("email") or "").strip():
+		raise HTTPException(400, "email is required — it is where the money and the questions go")
+
+	rate = int(body.get("rate_pct") or AFFILIATE_RATE_PCT)
+	# A rate over 100 would pay out more than the sale brought in; 0 is a partner
+	# who gets a tracking link but no commission, which is a real arrangement.
+	if not 0 <= rate <= 100:
+		raise HTTPException(400, "rate_pct must be between 0 and 100")
+
+	method = body.get("payout_method", "manual")
+	if method not in ("manual", "stripe"):
+		raise HTTPException(400, "payout_method must be 'manual' or 'stripe'")
+
+	return {
+		"ok": True,
+		"affiliate": store.add_affiliate(
+			code=code,
+			name=body["name"],
+			email=body["email"],
+			rate_pct=rate,
+			payout_method=method,
+			payout_to=body.get("payout_to", ""),
+			note=body.get("note", ""),
+		),
+	}
+
+
+@app.post("/api/admin/affiliates/{code}/stripe")
+def admin_affiliate_stripe(code: str, body: dict = Body(default={}), x_admin_token: str = Header("")):
+	"""Start — or resume — Stripe onboarding for one affiliate.
+
+	Returns a link to send them. They follow it, Stripe collects their identity
+	and bank details and does the compliance, and `account.updated` tells us when
+	they can actually be paid. Calling this again for an affiliate who already
+	has an account issues a fresh link rather than a second account: two accounts
+	for one person is a mess only Stripe support can untangle.
+	"""
+	_require_admin(x_admin_token)
+	if not stripe_api.configured():
+		raise HTTPException(
+			503,
+			"Stripe payouts are not switched on. Set STRIPE_SECRET_KEY on the server, "
+			"or pay this affiliate by hand.",
+		)
+
+	affiliate = store.get_affiliate(code)
+	if not affiliate:
+		raise HTTPException(404, "Unknown affiliate")
+
+	try:
+		account_id = affiliate["stripe_account"]
+		if not account_id:
+			country = (body.get("country") or "").strip()
+			if len(country) != 2:
+				raise HTTPException(400, "A two-letter country code is required, e.g. GB or DE")
+			created = stripe_api.create_express_account(affiliate["email"], country)
+			account_id = created["id"]
+			store.set_affiliate_stripe(code, account_id, ready=False)
+		return {"ok": True, "account": account_id, "url": stripe_api.onboarding_link(account_id)}
+	except stripe_api.StripeError as exc:
+		# Stripe's own message is the useful one — "country not supported" is
+		# exactly what an admin needs to read, and rewording it would hide it.
+		raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/admin/affiliates/{code}/refresh")
+def admin_affiliate_refresh(code: str, x_admin_token: str = Header("")):
+	"""Ask Stripe whether this affiliate can be paid yet."""
+	_require_admin(x_admin_token)
+	affiliate = store.get_affiliate(code)
+	if not affiliate or not affiliate["stripe_account"]:
+		raise HTTPException(404, "That affiliate has no Stripe account")
+	try:
+		acct = stripe_api.account(affiliate["stripe_account"])
+	except stripe_api.StripeError as exc:
+		raise HTTPException(400, str(exc)) from exc
+	ready = stripe_api.payouts_enabled(acct)
+	store.set_affiliate_stripe(code, affiliate["stripe_account"], ready)
+	return {
+		"ok": True,
+		"ready": ready,
+		# What Stripe is still waiting for, so an admin can tell the affiliate
+		# what to go and finish instead of guessing.
+		"needs": (acct.get("requirements") or {}).get("currently_due", []),
+	}
+
+
+@app.post("/api/admin/affiliates/{code}/pay")
+def admin_pay_affiliate(code: str, x_admin_token: str = Header("")):
+	"""Send everything owed to a Stripe-connected affiliate, in one transfer.
+
+	Only for `payout_method = 'stripe'`. Manual affiliates go through
+	`/referrals/paid`, which records a payment made elsewhere rather than making
+	one — the money for those leaves Wise or PayPal, not this endpoint.
+	"""
+	_require_admin(x_admin_token)
+	affiliate = store.get_affiliate(code)
+	if not affiliate:
+		raise HTTPException(404, "Unknown affiliate")
+	if affiliate["payout_method"] != "stripe" or not affiliate["stripe_account"]:
+		raise HTTPException(400, "This affiliate is paid by hand — send the money, then mark it paid.")
+	if not affiliate["stripe_ready"]:
+		raise HTTPException(400, "Stripe has not finished verifying this affiliate yet.")
+
+	rows = store.payable(code)
+	if not rows:
+		raise HTTPException(400, "Nothing is due — commission is held until the refund window closes.")
+
+	currencies = {r["currency"] for r in rows}
+	if len(currencies) > 1:
+		raise HTTPException(400, f"Mixed currencies ({', '.join(sorted(currencies))}) — pay these by hand.")
+
+	amount = sum(r["commission"] for r in rows)
+	ids = [r["id"] for r in rows]
+	# The key is derived from exactly what is being paid. A retry after a timeout
+	# sends the identical request and Stripe returns the original transfer
+	# instead of making a second one; a later payout covers different rows, so it
+	# gets a different key and goes through.
+	idem = f"sc-payout-{code}-{min(ids)}-{max(ids)}-{amount}"
+
+	try:
+		transfer = stripe_api.create_transfer(
+			affiliate["stripe_account"],
+			amount,
+			currencies.pop(),
+			idempotency_key=idem,
+			description=f"Soft Clipper commission — {len(ids)} sale(s)",
+		)
+	except stripe_api.StripeError as exc:
+		# Nothing is marked paid. The rows stay payable and the admin can retry,
+		# which is the right way round: a row wrongly left open is a second
+		# payment attempt, a row wrongly closed is an affiliate who never gets
+		# paid and has no way of knowing.
+		raise HTTPException(400, str(exc)) from exc
+
+	marked = store.mark_referrals_paid(ids, how="stripe", transfer_id=transfer.get("id", ""))
+	log.info("paid %s %s to %s via %s", amount, transfer.get("currency"), code, transfer.get("id"))
+	return {"ok": True, "amount": amount, "rows": marked, "transfer": transfer.get("id")}
+
+
+@app.post("/api/admin/affiliates/{code}/status")
+def admin_affiliate_status(code: str, body: dict = Body(default={}), x_admin_token: str = Header("")):
+	"""Disable stops future sales earning. It never touches commission already
+	recorded — someone can behave badly today without losing what they earned
+	honestly last month."""
+	_require_admin(x_admin_token)
+	status = body.get("status", "disabled")
+	if status not in ("active", "disabled"):
+		raise HTTPException(400, "status must be 'active' or 'disabled'")
+	if not store.get_affiliate(code):
+		raise HTTPException(404, "Unknown affiliate")
+	store.set_affiliate_status(code, status)
+	return {"ok": True}
+
+
+@app.get("/api/admin/referrals")
+def admin_referrals(code: str = "", x_admin_token: str = Header(""), limit: int = 200):
+	_require_admin(x_admin_token)
+	return {"referrals": store.referrals(code, limit)}
+
+
+@app.post("/api/admin/referrals/paid")
+def admin_mark_paid(body: dict = Body(...), x_admin_token: str = Header("")):
+	"""Mark commission as sent, after you have actually sent it.
+
+	This is a record of a payment made elsewhere, not an instruction to pay. The
+	money moves in Wise or PayPal by hand and this closes the row afterwards —
+	deliberately, because an automated transfer that goes to the wrong person or
+	goes twice cannot be undone by fixing the code.
+	"""
+	_require_admin(x_admin_token)
+	ids = body.get("ids") or []
+	if not isinstance(ids, list) or not ids:
+		raise HTTPException(400, "ids is required")
+	marked = store.mark_referrals_paid(
+		ids, how=body.get("how", "manual"), detail=body.get("detail", "")
+	)
+	return {"ok": True, "marked": marked}
 
 
 _ADMIN_PAGE = pathlib.Path(__file__).with_name("admin.html")

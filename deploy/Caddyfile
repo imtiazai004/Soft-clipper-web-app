@@ -6,7 +6,11 @@
 {$DOMAIN} {
 	# Licence traffic goes to its own service. These paths are matched first
 	# because the video app owns everything else under /api.
-	@licence path /api/licence/* /api/admin/licences* /webhooks/stripe /admin
+	# `/api/admin/*` as a whole rather than each endpoint by name: the previous
+	# form listed them individually, and adding an admin endpoint without also
+	# editing this line sends it to the video app, which answers 404 for a route
+	# that exists and works. Every admin endpoint checks its own token.
+	@licence path /api/licence/* /api/admin/* /webhooks/stripe /admin
 	handle @licence {
 		reverse_proxy licence:8600
 	}

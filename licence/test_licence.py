@@ -291,3 +291,181 @@ def test_a_refund_revokes_the_licence():
 	)
 	assert store.get(key)["status"] == "revoked"
 	assert client.post("/api/licence/validate", json={"key": key, "fingerprint": PC_A}).status_code == 403
+
+
+# ── affiliates ───────────────────────────────────────────────────────────────
+#
+# This is the part of the service that decides how much money leaves the
+# business, so what is checked here is the arithmetic and the guards around it:
+# a commission must be counted once, must come off the amount actually charged,
+# must not be payable while a refund could still cancel it, and must not survive
+# that refund.
+
+
+def _sale(session_id: str, email: str, ref: str = "", total: int = 3900) -> dict:
+	return {
+		"type": "checkout.session.completed",
+		"data": {
+			"object": {
+				"id": session_id,
+				"customer_details": {"email": email},
+				"client_reference_id": ref,
+				"amount_total": total,
+				"currency": "usd",
+			}
+		},
+	}
+
+
+def _affiliate(code: str, rate: int = 30, **extra) -> dict:
+	body = {"code": code, "name": code.title(), "email": f"{code}@example.com", "rate_pct": rate}
+	r = client.post("/api/admin/affiliates", json={**body, **extra}, headers=ADMIN)
+	assert r.status_code == 200, r.text
+	return r.json()["affiliate"]
+
+
+def test_a_referred_sale_credits_the_affiliate():
+	_affiliate("ali")
+	key = _stripe_post(_sale("cs_aff_1", "buyer1@example.com", ref="ali")).json()["key"]
+
+	assert store.get(key)["ref"] == "ali"
+	row = store.referral_for_licence(key)
+	assert row["commission"] == 1170  # 30% of $39.00, in cents
+	assert row["status"] == "pending"
+
+
+def test_commission_follows_what_was_actually_charged_not_the_list_price():
+	"""A discount code, a currency conversion or a price change must not leave us
+	paying a percentage of a number nobody was charged."""
+	_affiliate("sara", rate=25)
+	key = _stripe_post(_sale("cs_aff_2", "buyer2@example.com", ref="sara", total=2000)).json()["key"]
+	assert store.referral_for_licence(key)["commission"] == 500
+
+
+def test_a_stripe_retry_does_not_pay_the_commission_twice():
+	_affiliate("dupe")
+	_stripe_post(_sale("cs_aff_3", "buyer3@example.com", ref="dupe"))
+	_stripe_post(_sale("cs_aff_3", "buyer3@example.com", ref="dupe"))
+
+	rows = store.referrals("dupe")
+	assert len(rows) == 1
+
+
+def test_commission_is_not_payable_until_the_refund_window_closes():
+	_affiliate("held")
+	_stripe_post(_sale("cs_aff_4", "buyer4@example.com", ref="held"))
+
+	assert store.payable("held") == []
+	summary = {a["code"]: a for a in store.affiliate_summary()}["held"]
+	assert summary["holding"] == 1170 and summary["due"] == 0
+
+
+def test_a_refund_cancels_the_commission():
+	_affiliate("clawed")
+	_stripe_post(_sale("cs_aff_5", "refundme@example.com", ref="clawed"))
+
+	_stripe_post({
+		"type": "charge.refunded",
+		"data": {"object": {"billing_details": {"email": "refundme@example.com"}}},
+	})
+
+	rows = store.referrals("clawed")
+	assert rows[0]["status"] == "void"
+	summary = {a["code"]: a for a in store.affiliate_summary()}["clawed"]
+	assert summary["due"] == 0 and summary["holding"] == 0
+
+
+def test_commission_already_paid_survives_a_later_refund():
+	"""Money that has left the building is not recovered by an UPDATE. The row
+	stays paid so the books match reality and the conversation can happen."""
+	_affiliate("paidout")
+	key = _stripe_post(_sale("cs_aff_6", "late@example.com", ref="paidout")).json()["key"]
+	row = store.referral_for_licence(key)
+	store.mark_referrals_paid([row["id"]], how="manual")
+
+	_stripe_post({
+		"type": "charge.refunded",
+		"data": {"object": {"billing_details": {"email": "late@example.com"}}},
+	})
+
+	assert store.referral_for_licence(key)["status"] == "paid"
+	assert store.get(key)["status"] == "revoked"
+
+
+def test_a_row_cannot_be_marked_paid_twice():
+	_affiliate("once")
+	key = _stripe_post(_sale("cs_aff_7", "once@example.com", ref="once")).json()["key"]
+	rid = store.referral_for_licence(key)["id"]
+
+	assert store.mark_referrals_paid([rid]) == 1
+	assert store.mark_referrals_paid([rid]) == 0
+
+
+def test_an_unknown_or_disabled_code_still_sells_but_pays_nobody():
+	"""The customer's licence must never depend on the affiliate bookkeeping."""
+	ghost = _stripe_post(_sale("cs_aff_8", "ghost@example.com", ref="nosuchcode")).json()
+	assert store.get(ghost["key"])["email"] == "ghost@example.com"
+	assert store.referral_for_licence(ghost["key"]) is None
+
+	_affiliate("gone")
+	store.set_affiliate_status("gone", "disabled")
+	off = _stripe_post(_sale("cs_aff_9", "off@example.com", ref="gone")).json()
+	assert store.referral_for_licence(off["key"]) is None
+
+
+def test_a_sale_with_no_referral_records_nothing():
+	key = _stripe_post(_sale("cs_aff_10", "plain@example.com")).json()["key"]
+	assert store.get(key)["ref"] is None
+	assert store.referral_for_licence(key) is None
+
+
+def test_codes_are_normalised_so_a_link_survives_being_retyped():
+	_affiliate("Mixed-Case")
+	key = _stripe_post(_sale("cs_aff_11", "typed@example.com", ref="  MIXED-CASE ")).json()["key"]
+	assert store.referral_for_licence(key)["code"] == "mixed-case"
+
+
+def test_changing_a_rate_does_not_rewrite_what_was_already_earned():
+	_affiliate("raised", rate=20)
+	first = _stripe_post(_sale("cs_aff_12", "a@example.com", ref="raised")).json()["key"]
+	assert store.referral_for_licence(first)["commission"] == 780
+
+	with store.db() as conn:
+		conn.execute("UPDATE affiliates SET rate_pct = 50 WHERE code = 'raised'")
+
+	second = _stripe_post(_sale("cs_aff_13", "b@example.com", ref="raised")).json()["key"]
+	assert store.referral_for_licence(second)["commission"] == 1950
+	assert store.referral_for_licence(first)["commission"] == 780
+
+
+def test_affiliate_endpoints_need_the_admin_token():
+	for path in ["/api/admin/affiliates", "/api/admin/referrals"]:
+		assert client.get(path).status_code == 401, path
+	for path in [
+		"/api/admin/affiliates",
+		"/api/admin/referrals/paid",
+		"/api/admin/affiliates/x/pay",
+		"/api/admin/affiliates/x/stripe",
+		"/api/admin/affiliates/x/status",
+		"/api/admin/affiliates/x/refresh",
+	]:
+		assert client.post(path, json={}).status_code == 401, path
+
+
+def test_a_duplicate_code_is_refused():
+	_affiliate("taken")
+	r = client.post(
+		"/api/admin/affiliates",
+		json={"code": "taken", "name": "Someone Else", "email": "e@example.com"},
+		headers=ADMIN,
+	)
+	assert r.status_code == 409
+
+
+def test_automatic_payout_refuses_when_stripe_is_not_set_up():
+	"""Nothing half-works: with no secret key the button is not offered, and the
+	endpoint behind it says so rather than failing somewhere inside Stripe."""
+	_affiliate("byhand", payout_method="manual", payout_to="Wise, PK")
+	r = client.post("/api/admin/affiliates/byhand/pay", headers=ADMIN)
+	assert r.status_code == 400
+	assert "by hand" in r.json()["error"]

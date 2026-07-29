@@ -64,6 +64,21 @@
 	.empty { color: var(--dim); padding: 26px 10px; text-align: center; }
 	.acts { display: flex; gap: 6px; justify-content: flex-end; }
 	.acts button { padding: 5px 10px; font-size: .8rem; }
+
+	.tabs { display: flex; gap: 4px; margin-bottom: 18px; }
+	.tabs button { border-radius: 999px; padding: 7px 16px; font-size: .88rem; }
+	.tabs button[aria-current="true"] { background: var(--panel-2); border-color: var(--line-2); font-weight: 600; }
+
+	/* Money is right-aligned and monospaced so a column of it can be scanned for
+	   the odd one out, which is the only way anyone reads a payouts table. */
+	.num { font-family: var(--mono); text-align: right; white-space: nowrap; }
+	.due { color: var(--ok); font-weight: 700; }
+	.zero { color: var(--dim); }
+	.pill.holding { background: rgba(251,191,36,.15); color: var(--warn); }
+	.pill.paid { background: rgba(167,139,250,.16); color: var(--violet); }
+	.pill.void { background: rgba(248,113,113,.15); color: var(--bad); }
+	.reflink { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
+	.warnbar { border: 1px solid var(--warn); background: rgba(251,191,36,.1); border-radius: 10px; padding: 10px 14px; font-size: .86rem; margin-bottom: 14px; }
 </style>
 </head>
 <body>
@@ -83,7 +98,7 @@
 
 <div id="app" hidden>
 	<div class="head">
-		<h1>Licences</h1>
+		<h1 id="title">Licences</h1>
 		<span id="count" class="sub" style="margin:0"></span>
 		<span class="spacer"></span>
 		<button onclick="load()">Refresh</button>
@@ -91,8 +106,14 @@
 	</div>
 	<p class="sub">Soft Clipper · app.softclipper.pro</p>
 
+	<div class="tabs">
+		<button id="tabLicences" aria-current="true" onclick="showTab('licences')">Licences</button>
+		<button id="tabAffiliates" aria-current="false" onclick="showTab('affiliates')">Affiliates</button>
+	</div>
+
 	<div id="msg" class="msg"></div>
 
+<div id="viewLicences">
 	<div class="card">
 		<h2>Issue a licence by hand</h2>
 		<div class="row">
@@ -134,14 +155,110 @@
 		</div>
 		<div id="events" class="events"></div>
 	</div>
+</div><!-- /viewLicences -->
+
+<div id="viewAffiliates" hidden>
+	<div id="mixedCurrency" class="warnbar" hidden></div>
+
+	<div class="card">
+		<h2>Add an affiliate</h2>
+		<div class="row">
+			<input id="afCode" placeholder="code — goes in the link" style="min-width:160px">
+			<input id="afName" class="grow" placeholder="Name">
+			<input id="afEmail" class="grow" type="email" placeholder="Email">
+			<input id="afRate" type="number" min="0" max="100" style="width:96px" title="Commission %">
+			<input id="afHow" placeholder="stripe / Wise / PayPal" style="min-width:150px"
+			       title="Type 'stripe' to pay them automatically. Anything else means you send it by hand.">
+			<input id="afTo" class="grow" placeholder="Where the money goes — account, email, IBAN">
+			<button class="primary" onclick="addAffiliate()">Add</button>
+		</div>
+		<p class="hint" id="afHint"></p>
+	</div>
+
+	<div class="card">
+		<div class="row" style="margin-bottom:14px">
+			<h2 style="margin:0">Affiliates</h2>
+			<span class="spacer"></span>
+			<span id="dueTotal" class="hint" style="margin:0"></span>
+		</div>
+		<div class="wrapscroll">
+			<table>
+				<thead>
+					<tr>
+						<th>Code</th><th>Who</th><th>Rate</th><th>Sales</th>
+						<th class="num">Owed now</th><th class="num">Still held</th>
+						<th class="num">Paid</th><th>Pay to</th><th></th>
+					</tr>
+				</thead>
+				<tbody id="afRows"></tbody>
+			</table>
+		</div>
+		<div id="afEmpty" class="empty" hidden>
+			No affiliates yet. Add one above and send them their link.
+		</div>
+	</div>
+
+	<div id="sales" class="card" hidden>
+		<div class="row" style="margin-bottom:12px">
+			<h2 style="margin:0">Sales — <span id="salesCode" class="key"></span></h2>
+			<span class="spacer"></span>
+			<button id="payBtn" class="primary" onclick="markPaid()" disabled>Mark selected as paid</button>
+			<button onclick="closeSales()">Close</button>
+		</div>
+		<p class="hint" style="margin:0 0 12px">
+			Send the money in Wise or PayPal first, then tick the rows and close them here.
+			This records a payment you have made; it does not move any money itself.
+		</p>
+		<div class="wrapscroll">
+			<table>
+				<thead>
+					<tr>
+						<th style="width:34px"><input id="selAll" type="checkbox" onchange="toggleAll()" style="width:16px;height:16px;padding:0"></th>
+						<th>When</th><th>Customer</th><th>Licence</th>
+						<th class="num">Sale</th><th class="num">Commission</th><th>State</th>
+					</tr>
+				</thead>
+				<tbody id="salesRows"></tbody>
+			</table>
+		</div>
+		<div id="salesEmpty" class="empty" hidden>No sales through this link yet.</div>
+	</div>
+</div><!-- /viewAffiliates -->
 </div>
 
 <script>
 const KEY = "sc-admin-token";
+// Where an affiliate's link points. Hard-coded rather than taken from
+// location.origin, because this page is served from app.softclipper.pro and the
+// link has to send people to the shop, not to the licence API.
+const SITE = "https://softclipper.pro";
 let all = [];
+let affiliates = [];
+let salesRows = [];
+let openCode = "";
+let defaults = { rate_pct: 30, hold_days: 30 };
+let tab = "licences";
 
 const tok = () => sessionStorage.getItem(KEY) || "";
 const $ = (id) => document.getElementById(id);
+
+/** Names and payout details are free text typed by a human. Into innerHTML they go. */
+const esc = (s) =>
+	String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+		({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/** Cents to "$12.34". Amounts are integers everywhere else on purpose. */
+const money = (cents, currency) => {
+	const n = (Number(cents) || 0) / 100;
+	try {
+		return n.toLocaleString("en-GB", {
+			style: "currency",
+			currency: (currency || "usd").toUpperCase(),
+		});
+	} catch {
+		return n.toFixed(2) + " " + String(currency || "").toUpperCase();
+	}
+};
 
 function say(text, good) {
 	const m = $("msg");
@@ -184,7 +301,18 @@ function signOut() {
 	location.reload();
 }
 
+function showTab(which) {
+	tab = which;
+	$("viewLicences").hidden = which !== "licences";
+	$("viewAffiliates").hidden = which !== "affiliates";
+	$("tabLicences").setAttribute("aria-current", String(which === "licences"));
+	$("tabAffiliates").setAttribute("aria-current", String(which === "affiliates"));
+	$("title").textContent = which === "licences" ? "Licences" : "Affiliates";
+	load();
+}
+
 async function load() {
+	if (tab === "affiliates") return loadAffiliates();
 	try {
 		const d = await api("/licences?limit=500");
 		all = d.licences || [];
@@ -224,6 +352,9 @@ function render() {
 		const machine = l.machine ? l.machine.slice(0, 10) + "…" : "—";
 		const releases = l.releases ? ` <span style="color:var(--warn)">(moved ${l.releases}×)</span>` : "";
 		const source = (l.source || "").startsWith("cs_") ? "Stripe" : (l.source || "manual");
+		// Knowing a licence came through an affiliate is the first thing you want
+		// when a refund request arrives, because the commission goes with it.
+		const ref = l.ref ? ` <span class="pill paid" title="Sold through an affiliate">${esc(l.ref)}</span>` : "";
 		return `<tr>
 			<td class="key">${l.key}</td>
 			<td class="email">${l.email || ""}</td>
@@ -231,7 +362,7 @@ function render() {
 			<td title="${l.machine || ""}" style="font-family:var(--mono);color:var(--dim)">${machine}${releases}</td>
 			<td style="color:var(--muted)">${ago(l.created_at)}</td>
 			<td style="color:var(--muted)">${ago(l.last_seen_at)}</td>
-			<td style="color:var(--dim)">${source}</td>
+			<td style="color:var(--dim)">${source}${ref}</td>
 			<td><div class="acts">
 				<button onclick="history_('${l.key}')">History</button>
 				<button onclick="release('${l.key}')" ${l.machine ? "" : "disabled"}>Release</button>
@@ -296,6 +427,261 @@ async function history_(key) {
 }
 
 function closeDetail() { $("detail").hidden = true; }
+
+// ── affiliates ───────────────────────────────────────────────────────────────
+
+async function loadAffiliates() {
+	try {
+		const d = await api("/affiliates");
+		affiliates = d.affiliates || [];
+		defaults = { rate_pct: d.rate_pct, hold_days: d.hold_days, stripe: d.stripe_payouts };
+		$("count").textContent = affiliates.length + (affiliates.length === 1 ? " affiliate" : " affiliates");
+		$("afRate").placeholder = defaults.rate_pct + "%";
+		$("afHint").textContent =
+			`Default ${defaults.rate_pct}% commission, held ${defaults.hold_days} days after the sale so a refund can still cancel it. ` +
+			(defaults.stripe
+				? "Stripe payouts are on: affiliates in a supported country can be paid automatically."
+				: "Stripe payouts are off — everyone is paid by hand until STRIPE_SECRET_KEY is set on the server.");
+		renderAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function renderAffiliates() {
+	$("afEmpty").hidden = affiliates.length > 0;
+
+	const mixed = affiliates.filter((a) => a.currencies > 1);
+	$("mixedCurrency").hidden = mixed.length === 0;
+	if (mixed.length) {
+		$("mixedCurrency").textContent =
+			"Some totals below add up more than one currency (" +
+			mixed.map((a) => a.code).join(", ") +
+			"). Treat those figures as indicative and check the sales list before paying.";
+	}
+
+	const owed = affiliates.reduce((sum, a) => sum + (a.due || 0), 0);
+	$("dueTotal").textContent = owed ? "Payable right now: " + money(owed, "usd") : "Nothing due right now";
+
+	$("afRows").innerHTML = affiliates.map((a) => {
+		const link = `${SITE}/?ref=${encodeURIComponent(a.code)}`;
+		const disabled = a.status !== "active";
+
+		let pay;
+		if (a.payout_method === "stripe") {
+			pay = a.stripe_ready
+				? '<span class="pill active">Stripe ready</span>'
+				: a.stripe_account
+					? '<span class="pill holding">Stripe pending</span>'
+					: '<span class="pill unused">not started</span>';
+		} else {
+			pay = `<span class="reflink">${esc(a.payout_to || "—")}</span>`;
+		}
+
+		// Automatic payout is offered only when it can actually work: Stripe
+		// switched on, this affiliate verified, and something genuinely due.
+		const canAutoPay = defaults.stripe && a.payout_method === "stripe" && a.stripe_ready && a.due > 0;
+
+		return `<tr${disabled ? ' style="opacity:.5"' : ""}>
+			<td class="key">${esc(a.code)}</td>
+			<td>${esc(a.name)}<br><span class="email" style="font-size:.8rem">${esc(a.email)}</span></td>
+			<td>${a.rate_pct}%</td>
+			<td>${a.sales || 0}</td>
+			<td class="num ${a.due ? "due" : "zero"}">${money(a.due, a.currency)}</td>
+			<td class="num ${a.holding ? "" : "zero"}">${money(a.holding, a.currency)}</td>
+			<td class="num zero">${money(a.paid, a.currency)}</td>
+			<td>${pay}</td>
+			<td><div class="acts">
+				<button onclick="copyLink('${esc(a.code)}')" title="${esc(link)}">Copy link</button>
+				<button onclick="openSales('${esc(a.code)}')">Sales</button>
+				${defaults.stripe && a.payout_method === "stripe"
+					? `<button onclick="stripeOnboard('${esc(a.code)}')">${a.stripe_account ? "Onboarding link" : "Set up Stripe"}</button>`
+					: ""}
+				${canAutoPay ? `<button class="primary" onclick="payViaStripe('${esc(a.code)}')">Pay ${money(a.due, a.currency)}</button>` : ""}
+				<button class="danger" onclick="toggleAffiliate('${esc(a.code)}', ${disabled})">${disabled ? "Enable" : "Disable"}</button>
+			</div></td>
+		</tr>`;
+	}).join("");
+}
+
+async function addAffiliate() {
+	const code = $("afCode").value.trim();
+	const name = $("afName").value.trim();
+	const email = $("afEmail").value.trim();
+	if (!code || !name || !email) return say("Code, name and email are all required.", false);
+
+	const how = $("afHow").value.trim().toLowerCase();
+	// "stripe" in the method box means pay automatically; anything else is the
+	// name of however you will send it by hand.
+	const stripe = how === "stripe";
+
+	try {
+		await api("/affiliates", {
+			method: "POST",
+			body: JSON.stringify({
+				code, name, email,
+				rate_pct: Number($("afRate").value) || defaults.rate_pct,
+				payout_method: stripe ? "stripe" : "manual",
+				payout_to: stripe ? "" : `${$("afHow").value.trim()} ${$("afTo").value.trim()}`.trim(),
+			}),
+		});
+		["afCode", "afName", "afEmail", "afRate", "afHow", "afTo"].forEach((id) => ($(id).value = ""));
+		say(`Added. Their link is ${SITE}/?ref=${code}`, true);
+		loadAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function copyLink(code) {
+	const link = `${SITE}/?ref=${code}`;
+	try {
+		await navigator.clipboard.writeText(link);
+		say("Copied " + link, true);
+	} catch {
+		// Clipboard access needs a secure context and permission; showing the
+		// link is a worse experience but never leaves the admin with nothing.
+		prompt("Copy this link:", link);
+	}
+}
+
+async function toggleAffiliate(code, currentlyDisabled) {
+	const next = currentlyDisabled ? "active" : "disabled";
+	if (!currentlyDisabled && !confirm(
+		`Disable ${code}?\n\nFuture sales through their link earn nothing. Commission already recorded is untouched and still has to be paid.`
+	)) return;
+	try {
+		await api(`/affiliates/${code}/status`, { method: "POST", body: JSON.stringify({ status: next }) });
+		loadAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function stripeOnboard(code) {
+	const a = affiliates.find((x) => x.code === code);
+	let country = "";
+	if (!a.stripe_account) {
+		country = prompt(
+			`Which country is ${a.name} in? Two letters, e.g. GB, DE, US.\n\n` +
+			"Stripe can only pay out to countries it supports. If it refuses, pay them by hand instead."
+		);
+		if (!country) return;
+	}
+	try {
+		const d = await api(`/affiliates/${code}/stripe`, {
+			method: "POST",
+			body: JSON.stringify({ country: (country || "").trim() }),
+		});
+		loadAffiliates();
+		// The link is single-use and short-lived, so it is shown to be sent now
+		// rather than stored anywhere.
+		prompt(`Send this to ${a.name}. It expires, so generate a new one if they are slow:`, d.url);
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function payViaStripe(code) {
+	const a = affiliates.find((x) => x.code === code);
+	if (!confirm(
+		`Send ${money(a.due, a.currency)} to ${a.name} now?\n\n` +
+		"This moves real money out of the Stripe balance and cannot be undone from here."
+	)) return;
+	try {
+		const d = await api(`/affiliates/${code}/pay`, { method: "POST" });
+		say(`Sent ${money(d.amount, a.currency)} to ${a.name} — ${d.rows} sale(s), transfer ${d.transfer}.`, true);
+		loadAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function openSales(code) {
+	openCode = code;
+	try {
+		const d = await api("/referrals?code=" + encodeURIComponent(code));
+		salesRows = d.referrals || [];
+		$("salesCode").textContent = code;
+		$("salesEmpty").hidden = salesRows.length > 0;
+		$("selAll").checked = false;
+		renderSales();
+		$("sales").hidden = false;
+		$("sales").scrollIntoView({ behavior: "smooth", block: "nearest" });
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function renderSales() {
+	$("salesRows").innerHTML = salesRows.map((r) => {
+		const state = r.status === "paid"
+			? `<span class="pill paid">paid${r.transfer_id ? " · Stripe" : ""}</span>`
+			: r.status === "void"
+				? `<span class="pill void">cancelled — ${esc(r.void_reason || "")}</span>`
+				: r.payable
+					? '<span class="pill active">due</span>'
+					: `<span class="pill holding">held until ${new Date(r.due_at * 1000).toLocaleDateString("en-GB")}</span>`;
+		// Only a row that is genuinely payable can be ticked. Everything else is
+		// shown, because "why did this one not get paid" is the question the list
+		// exists to answer.
+		const tick = r.payable
+			? `<input type="checkbox" class="paySel" value="${r.id}" onchange="selChanged()" style="width:16px;height:16px;padding:0">`
+			: "";
+		return `<tr>
+			<td>${tick}</td>
+			<td style="color:var(--muted)">${ago(r.created_at)}</td>
+			<td class="email">${esc(r.customer_email || "—")}</td>
+			<td class="key">${esc(r.licence_key)}</td>
+			<td class="num zero">${money(r.gross, r.currency)}</td>
+			<td class="num">${money(r.commission, r.currency)}</td>
+			<td>${state}</td>
+		</tr>`;
+	}).join("");
+	selChanged();
+}
+
+const selected = () => [...document.querySelectorAll(".paySel:checked")].map((el) => Number(el.value));
+
+function selChanged() {
+	const ids = selected();
+	const total = salesRows.filter((r) => ids.includes(r.id)).reduce((s, r) => s + r.commission, 0);
+	const btn = $("payBtn");
+	btn.disabled = ids.length === 0;
+	btn.textContent = ids.length
+		? `Mark ${money(total, salesRows[0] && salesRows[0].currency)} as paid`
+		: "Mark selected as paid";
+}
+
+function toggleAll() {
+	const on = $("selAll").checked;
+	document.querySelectorAll(".paySel").forEach((el) => (el.checked = on));
+	selChanged();
+}
+
+async function markPaid() {
+	const ids = selected();
+	if (!ids.length) return;
+	const detail = prompt(
+		`Marking ${ids.length} commission row(s) as paid for ${openCode}.\n\n` +
+		"Send the money first — this only records it. Add a reference if you have one:",
+		""
+	);
+	if (detail === null) return;
+	try {
+		const d = await api("/referrals/paid", {
+			method: "POST",
+			body: JSON.stringify({ ids, how: "manual", detail }),
+		});
+		say(`${d.marked} row(s) closed.`, true);
+		openSales(openCode);
+		loadAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function closeSales() { $("sales").hidden = true; }
 
 $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") signIn(); });
 if (tok()) { $("gate").hidden = true; $("app").hidden = false; load(); }
