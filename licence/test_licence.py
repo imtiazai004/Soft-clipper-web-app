@@ -85,6 +85,43 @@ def test_activation_binds_to_one_machine_and_returns_a_valid_token():
 	assert payload["exp"] > time.time()
 
 
+def test_token_carries_the_fingerprint_the_client_sent():
+	"""The whole activation rests on this one equality.
+
+	The desktop app decides it is activated by comparing the token's `machine`
+	claim against its own fingerprint. If the server puts anything else in there
+	the comparison can never succeed, the app says "this activation belongs to a
+	different computer", and every paying customer is locked out — while the
+	server logs a cheerful 200 for every attempt.
+
+	That shipped. It was caught by installing the built app and typing a real key
+	into it, not here: the test above checks the token verifies and carries the
+	right key, and never looked at `machine` at all.
+	"""
+	key = make_licence()
+	r = client.post("/api/licence/activate", json={"key": key, "fingerprint": PC_A})
+	payload = crypto.verify_token(r.json()["token"], crypto.public_key_b64())
+	assert payload["machine"] == PC_A
+
+	# Refresh has to agree, or the app deactivates itself a month after it was
+	# bought — the worst possible moment to find out.
+	v = client.post("/api/licence/validate", json={"key": key, "fingerprint": PC_A})
+	assert v.status_code == 200
+	assert crypto.verify_token(v.json()["token"], crypto.public_key_b64())["machine"] == PC_A
+
+
+def test_the_database_stores_a_hash_not_the_raw_fingerprint():
+	"""Why the server hashes at all: a dump of this table must not hand anyone a
+	working machine identity. That property has to survive the fix above — the
+	token gets the raw value, storage does not."""
+	key = make_licence()
+	client.post("/api/licence/activate", json={"key": key, "fingerprint": PC_A})
+
+	stored = store.get(key)["machine"]
+	assert stored != PC_A
+	assert stored == hashlib.sha256(f"sc:{PC_A}".encode()).hexdigest()
+
+
 def test_same_machine_can_reactivate():
 	key = make_licence()
 	client.post("/api/licence/activate", json={"key": key, "fingerprint": PC_A})

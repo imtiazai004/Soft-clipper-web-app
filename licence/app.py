@@ -63,12 +63,24 @@ def _client_ip(request: Request) -> str:
 	return fwd.split(",")[0].strip() if fwd else (request.client.host if request.client else "?")
 
 
-def _machine(fingerprint: str) -> str:
-	"""Never store the raw fingerprint the client sent — hash it again here so a
-	dump of this database cannot be replayed as a machine identity."""
+def _clean_fingerprint(fingerprint: str) -> str:
+	"""The client's fingerprint, checked but otherwise untouched.
+
+	This is what goes into the signed token, because the token is read by the
+	client, and the client can only compare it against the one thing it knows:
+	its own fingerprint. Putting anything else in there — a hash, a truncation,
+	an id of our own — means the comparison can never succeed and every
+	activation silently fails. It did, for exactly that reason.
+	"""
 	if not fingerprint or len(fingerprint) < 8:
 		raise HTTPException(400, "Missing machine fingerprint")
-	return hashlib.sha256(f"sc:{fingerprint}".encode()).hexdigest()
+	return fingerprint
+
+
+def _stored_machine(fingerprint: str) -> str:
+	"""What the database holds — hashed, so a dump of it cannot be replayed as a
+	machine identity. Never put this in a token."""
+	return hashlib.sha256(f"sc:{_clean_fingerprint(fingerprint)}".encode()).hexdigest()
 
 
 def _require_admin(token: str | None):
@@ -87,7 +99,8 @@ def activate(request: Request, body: dict = Body(...)):
 	key = crypto.normalise(body.get("key", ""))
 	if not key:
 		raise HTTPException(400, "That does not look like a licence key. Check the email again.")
-	machine = _machine(body.get("fingerprint", ""))
+	fingerprint = _clean_fingerprint(body.get("fingerprint", ""))
+	machine = _stored_machine(fingerprint)
 
 	lic = store.get(key)
 	if not lic:
@@ -105,7 +118,8 @@ def activate(request: Request, body: dict = Body(...)):
 	store.bind(key, machine)
 	return {
 		"ok": True,
-		"token": crypto.make_token(key, machine, TOKEN_DAYS),
+		# The raw fingerprint, not the stored hash: see _clean_fingerprint.
+		"token": crypto.make_token(key, fingerprint, TOKEN_DAYS),
 		"email": lic["email"],
 		"expires_days": TOKEN_DAYS,
 	}
@@ -117,7 +131,8 @@ def validate(request: Request, body: dict = Body(...)):
 	_throttle(_client_ip(request))
 
 	key = crypto.normalise(body.get("key", ""))
-	machine = _machine(body.get("fingerprint", ""))
+	fingerprint = _clean_fingerprint(body.get("fingerprint", ""))
+	machine = _stored_machine(fingerprint)
 	lic = store.get(key) if key else None
 
 	if not lic:
@@ -128,7 +143,7 @@ def validate(request: Request, body: dict = Body(...)):
 		raise HTTPException(409, "This licence is active on a different computer.")
 
 	store.touch(key)
-	return {"ok": True, "token": crypto.make_token(key, machine, TOKEN_DAYS)}
+	return {"ok": True, "token": crypto.make_token(key, fingerprint, TOKEN_DAYS)}
 
 
 @app.post("/api/licence/release")
@@ -139,7 +154,7 @@ def release(request: Request, body: dict = Body(...)):
 	_throttle(_client_ip(request))
 
 	key = crypto.normalise(body.get("key", ""))
-	machine = _machine(body.get("fingerprint", ""))
+	machine = _stored_machine(body.get("fingerprint", ""))
 	lic = store.get(key) if key else None
 
 	if not lic:
