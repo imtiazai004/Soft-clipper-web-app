@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { mergeDecisions, tally } from './review'
+import { TARGETS, drawFrame } from './preview'
 import { api, cancelJob, del, runJob, secToMMSS, secToClock, mmssToSec } from './api'
 
 const RATIOS = [
@@ -1100,6 +1101,7 @@ export default function App() {
           busy={busy}
           duration={video?.duration || 0}
           shell={shell}
+          brand={brand}
           onClose={() => setEditing(null)}
           onManual={(payload) => {
             setEditing(null)
@@ -1351,7 +1353,7 @@ function ZoomSlider({ crop, setCrop }) {
   )
 }
 
-function EditModal({ clip, index, busy, duration, shell, onClose, onManual, onAi }) {
+function EditModal({ clip, index, busy, duration, shell, brand, onClose, onManual, onAi }) {
   const r = clip.render
   const [tab, setTab] = useState('ai')
   const [instruction, setInstruction] = useState('')
@@ -1464,6 +1466,8 @@ function EditModal({ clip, index, busy, duration, shell, onClose, onManual, onAi
           <span className="seg-toggle">
             <button className={`tab ${preview === 'source' ? 'active' : ''}`}
               onClick={() => setPreview('source')}>✂️ Source</button>
+            <button className={`tab ${preview === 'live' ? 'active' : ''}`}
+              onClick={() => setPreview('live')}>👁 Preview</button>
             <button className={`tab ${preview === 'clip' ? 'active' : ''}`}
               onClick={() => setPreview('clip')}>▶ Result</button>
           </span>
@@ -1473,6 +1477,26 @@ function EditModal({ clip, index, busy, duration, shell, onClose, onManual, onAi
           <div className="stage">
             <video src={clip.url} className="stage-video" controls autoPlay />
           </div>
+        ) : preview === 'live' ? (
+          /* The composed clip, drawn the way it will export — captions in the
+             real typeface, the real crop, the logo where it will land. This is
+             the tab that replaces guessing and re-rendering. */
+          <LivePreview
+            src="/api/video/stream"
+            start={mmssToSec(segments[0]?.start) || 0}
+            end={mmssToSec(segments[0]?.end) || 0}
+            ratio={ratio}
+            reframe={reframe}
+            crop={crop}
+            captions={{ enabled: capOn, style: capStyle, font: capFont,
+                        words_per_line: words, highlight: capHi,
+                        x: null, y: null, overrides: {} }}
+            headline={{ ...head, text: head.text || aiTitle }}
+            overlays={overlays}
+            brand={brand}
+            fonts={shell?.captionFonts}
+            onError={() => {}}
+          />
         ) : (
         /* live source preview — the frame you are actually cutting */
         <FrameStage
@@ -1699,6 +1723,138 @@ function EditModal({ clip, index, busy, duration, shell, onClose, onManual, onAi
  *  bottom-centre lands on a chin, a logo, or a platform's own UI often enough
  *  that "move the captions" is the first request every clipper makes.
  */
+/** The clip, drawn the way it will be exported.
+ *
+ *  What it replaces: a source video with chips floating over it, saying where a
+ *  caption would land and nothing about what it would look like. Every choice in
+ *  the sidebar was a guess paid for in render minutes.
+ *
+ *  Everything positional comes from the same numbers ffmpeg is given, and the
+ *  caption chunking is not done here at all — core/captions.py computes it and
+ *  this fetches it, so the two cannot drift. See preview.js.
+ *
+ *  It is honest about the two things a canvas cannot do: smart crop follows a
+ *  face that only OpenCV can find, and libass draws outlines and karaoke pops
+ *  its own way. Both are said out loud under the frame rather than faked.
+ */
+function LivePreview({ src, start, end, ratio, reframe, crop, captions, headline,
+                      overlays, brand, fonts, onError }) {
+  const canvasRef = useRef(null)
+  const videoRef = useRef(null)
+  const logoRef = useRef(null)
+  const [lines, setLines] = useState([])
+  const [metrics, setMetrics] = useState(null)
+  const [playing, setPlaying] = useState(false)
+
+  const [w, h] = TARGETS[ratio] || TARGETS['9:16']
+
+  // The typeface has to be in the browser too, or the canvas draws a system
+  // fallback with total confidence and the preview shows the wrong shapes.
+  useEffect(() => {
+    const wanted = (fonts || []).find((f) => f.name === captions.font)
+    if (!wanted?.bundled) return
+    let dead = false
+    const face = new FontFace(wanted.family || wanted.name,
+      `url(/api/preview/font/${encodeURIComponent(wanted.name)})`)
+    face.load().then((loaded) => { if (!dead) document.fonts.add(loaded) }).catch(() => {})
+    return () => { dead = true }
+  }, [captions.font, fonts])
+
+  // What actually changes the caption chunks. Flattened to a string so the
+  // dependency is something React can compare, and so a re-render that only
+  // moved a slider does not re-fetch.
+  const capKey = [captions.enabled, captions.style, captions.font,
+                  captions.words_per_line, JSON.stringify(captions.overrides || {})].join('|')
+  // The effect below sends the whole caption object but must not re-run when its
+  // identity changes — it is rebuilt on every render of the editor. Held in a ref
+  // so the dependency list can be honest and short at the same time.
+  const latest = useRef({ captions, onError })
+  latest.current = { captions, onError }
+
+  // The caption lines, from the code that burns them in.
+  useEffect(() => {
+    let dead = false
+    const timer = setTimeout(() => {
+      api.post('/api/preview/captions', {
+        start_sec: start, end_sec: end, ratio,
+        captions: latest.current.captions, effects: {},
+      }).then((r) => {
+        if (dead) return
+        setLines(r.lines || [])
+        setMetrics(r.metrics || null)
+      }).catch((e) => { if (!dead) latest.current.onError?.(e.message) })
+    }, 180)   // a slider being dragged should not be a request per pixel
+    return () => { dead = true; clearTimeout(timer) }
+    // Listed rather than depending on `captions` itself: that object is rebuilt
+    // on every render of the editor, so the whole effect — and a request with it
+    // — would fire on every keystroke anywhere in the panel.
+  }, [start, end, ratio, capKey])
+
+  // The logo, once, so drawFrame has something ready to paint.
+  useEffect(() => {
+    if (!brand?.enabled) { logoRef.current = null; return }
+    const img = new Image()
+    img.src = `/api/brand/logo?t=${brand.path || ''}`
+    logoRef.current = img
+  }, [brand?.enabled, brand?.path])
+
+  // Draw whenever anything moves. requestAnimationFrame rather than the video's
+  // own timeupdate, which fires about four times a second — captions would
+  // appear a quarter of a second late and look like a bug in the timings.
+  useEffect(() => {
+    let frame
+    function tick() {
+      const canvas = canvasRef.current
+      const video = videoRef.current
+      if (canvas && video) {
+        const ctx = canvas.getContext('2d')
+        // Loop inside the clip: this is a window on a longer video.
+        if (video.currentTime < start || video.currentTime > end) video.currentTime = start
+        drawFrame(ctx, {
+          video, ratio, reframe, crop,
+          canvasW: canvas.width, canvasH: canvas.height,
+          time: video.currentTime - start,
+          lines, metrics,
+          captionsOn: !!captions.enabled,
+          highlight: !!captions.highlight,
+          capPos: captions.x == null ? null : { x: captions.x, y: captions.y ?? 0.82 },
+          headline, overlays, brand,
+          logoImage: logoRef.current,
+        })
+      }
+      frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  })
+
+  function toggle() {
+    const v = videoRef.current
+    if (!v) return
+    if (v.paused) { v.currentTime = Math.max(v.currentTime, start); v.play(); setPlaying(true) }
+    else { v.pause(); setPlaying(false) }
+  }
+
+  const approximate = reframe === 'smart' || reframe === 'split' || reframe === 'gamecam'
+
+  return (
+    <div className="live-preview">
+      {/* The source. Never shown — it is the texture the canvas draws from. */}
+      <video ref={videoRef} src={src} style={{ display: 'none' }} playsInline muted={false}
+        onLoadedMetadata={(e) => { e.currentTarget.currentTime = start }} />
+      <canvas ref={canvasRef} width={w} height={h} className="live-canvas" onClick={toggle} />
+      <div className="live-bar">
+        <button className="btn sm" onClick={toggle}>{playing ? '⏸ Pause' : '▶ Play'}</button>
+        <span className="hint-sm" style={{ margin: 0 }}>
+          {approximate
+            ? 'Framing here is the centre crop — the export follows the speaker’s face, which only the render can work out.'
+            : 'This is what the export will look like.'}
+        </span>
+      </div>
+    </div>
+  )
+}
+
 /** Watch each suggestion and decide on it, one at a time.
  *
  *  The moments list arrives with every box already ticked, which means the app

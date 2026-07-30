@@ -106,6 +106,88 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
+# The coordinate space caption sizes and positions are expressed in. ffmpeg
+# scales it to whatever the real output is, which is what keeps a fontsize
+# meaning the same thing at 1080p and at 720p — and what lets a preview on a
+# 300-pixel-wide canvas place text exactly where the render will.
+PLAY_Y = 288
+PLAY_X = {"9:16": 162, "1:1": 288, "16:9": 512}
+DEFAULT_PLAY_X = 162
+
+
+def play_size(ratio: str | None) -> tuple[int, int]:
+	return PLAY_X.get(ratio or "9:16", DEFAULT_PLAY_X), PLAY_Y
+
+
+def caption_metrics(style: str = None, ratio: str | None = "9:16",
+                    font: str | None = None) -> dict:
+	"""Everything needed to draw a caption, in the coordinate space above.
+
+	Served to the preview so the canvas can size and colour text the way the
+	renderer will. Worked out here rather than in the UI because these come from
+	four places at once — the style table, the font's own metrics, the ratio and
+	the caption's own size — and a second implementation of that sum in
+	JavaScript would be a preview that quietly stops matching.
+	"""
+	st = caption_style(style or DEFAULT_CAPTION_STYLE)
+	play_x, play_y = play_size(ratio)
+	fontsize = max(6, int(round(st["fontsize"] * fonts.size_scale(font))))
+	return {
+		"play_x": play_x,
+		"play_y": play_y,
+		"fontsize": fontsize,
+		"family": fonts.resolve(font),
+		"colour": _ass_to_hex(st["colour"]),
+		"outline": _ass_to_hex(st["outline"]),
+		"highlight": _ass_to_hex(st.get("highlight", st["colour"])),
+		"boxed": bool(st.get("box")),
+		"pop": bool(st.get("pop")),
+		# The Default style's own bottom margin, which is where a caption sits
+		# when nobody has dragged it.
+		"margin_v": 40,
+		"rtl": fonts.is_rtl(font),
+	}
+
+
+def caption_timeline(segments: list[dict], style: str = None, words_per_line: int = 3,
+                     ratio: str | None = "9:16", overrides: dict | None = None,
+                     font: str | None = None) -> list[dict]:
+	"""The chunks a render would burn in: [{start, end, text, words}].
+
+	This is the chunking build_ass does, lifted out so that a preview can draw
+	precisely what the renderer will draw. It is called by build_ass rather than
+	copied from it — the point of extracting it is that the two cannot drift, and
+	a preview that disagrees with the render is worse than no preview, because it
+	makes a promise the export then breaks.
+	"""
+	metrics = caption_metrics(style, ratio, font)
+	budget = line_budget(metrics["fontsize"], metrics["play_x"], fonts.glyph_width(font))
+
+	out = []
+	for seg in tidy_segments(segments) or []:
+		text = apply_overrides(seg["text"].strip(), overrides)
+		if not text:
+			continue
+		words = text.split()
+		if not words:
+			continue
+		seg_dur = max(0.5, seg.get("duration", 2.0))
+		chunks = _chunk_words(words, words_per_line, budget)
+		total_chars = sum(len(w) for w in words) or 1
+
+		t = seg["start"]
+		for chunk in chunks:
+			chunk_dur = seg_dur * (sum(len(w) for w in chunk) / total_chars)
+			out.append({
+				"start": t,
+				"end": t + chunk_dur,
+				"words": list(chunk),
+				"text": " ".join(chunk),
+			})
+			t += chunk_dur
+	return out
+
+
 def _ass_time(seconds: float) -> str:
     seconds = max(0.0, seconds)
     h = int(seconds // 3600)
@@ -495,45 +577,25 @@ def build_ass(
     # The caption canvas has to be the same shape as the video. A 4:3 PlayRes
     # over a 9:16 frame stretches every glyph sideways, which is why the text
     # came out fat and only about seventeen characters fitted on a line.
-    play_x = {"9:16": 162, "1:1": 288, "16:9": 512}.get(ratio or "9:16", 162)
-
-    # Overlapping, repeated and marked-up segments are not this function's
-    # problem to reason about further down — they are fixed once, here.
-    segments = tidy_segments(segments)
-
-    # How much text fits on one line at this style's size, on this canvas.
-    budget = line_budget(fontsize, play_x, fonts.glyph_width(font))
+    play_x, _ = play_size(ratio)
 
     # Worked out once, not per chunk: it is the same tag for every line.
     anchor = caption_anchor(position, play_x)
 
-    for seg in segments or []:
-        text = apply_overrides(seg["text"].strip(), overrides)
-        if not text:
-            continue
-        words = text.split()
-        if not words:
-            continue
-        seg_start = seg["start"]
-        seg_dur = max(0.5, seg.get("duration", 2.0))
-        chunks = _chunk_words(words, words_per_line, budget)
-        total_chars = sum(len(w) for w in words) or 1
-
-        t = seg_start
-        for chunk in chunks:
-            chunk_chars = sum(len(w) for w in chunk)
-            chunk_dur = seg_dur * (chunk_chars / total_chars)
-
-            if highlight:
-                lines.extend(_karaoke_lines(chunk, t, chunk_dur, st, anchor))
-            else:
-                # \an2 = bottom-center anchor, unless a position was placed
-                chunk_text = _ass_text(" ".join(chunk).upper())
-                lines.append(
-                    f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + chunk_dur)},Default,,0,0,0,,"
-                    f"{{{anchor}}}{chunk_text}"
-                )
-            t += chunk_dur
+    # The chunking lives in caption_timeline so the live preview can draw exactly
+    # these chunks at exactly these times. Called rather than copied — a preview
+    # that disagrees with the render is worse than no preview.
+    for chunk in caption_timeline(segments, style, words_per_line, ratio, overrides, font):
+        t, chunk_dur, words = chunk["start"], chunk["end"] - chunk["start"], chunk["words"]
+        if highlight:
+            lines.extend(_karaoke_lines(words, t, chunk_dur, st, anchor))
+        else:
+            # \an2 = bottom-center anchor, unless a position was placed
+            chunk_text = _ass_text(" ".join(words).upper())
+            lines.append(
+                f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + chunk_dur)},Default,,0,0,0,,"
+                f"{{{anchor}}}{chunk_text}"
+            )
 
     head_text = _wrap_headline(_ass_text((headline or {}).get("text", "")))
     if head_text and clip_duration > 0:

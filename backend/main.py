@@ -908,6 +908,76 @@ def get_config(user: str = Depends(auth.current_user)):
 
 
 
+
+# ── live preview ──────────────────────────────────────────────────────────────
+class PreviewBody(BaseModel):
+    """One clip's window, and the same look settings a render would get."""
+    start_sec: float = 0.0
+    end_sec: float = 0.0
+    ratio: str | None = "9:16"
+    captions: CaptionOpts = CaptionOpts()
+    effects: EffectsOpts = EffectsOpts()
+
+
+@app.post("/api/preview/captions")
+def preview_captions(body: PreviewBody, user: str = Depends(auth.current_user)):
+    """The caption chunks a render of this window would burn in.
+
+    Computed by the code that does the burning rather than reimplemented in the
+    browser. The chunking depends on the style's size, the font's own width, the
+    aspect ratio and words-per-line all at once, and a second version of that sum
+    in JavaScript is a preview that quietly stops agreeing with the export —
+    worse than no preview, because it makes a promise the render then breaks.
+
+    Read from this caller's own session, so one account's preview can only ever
+    be built from that account's transcript.
+    """
+    sess = get_session(user)
+    cap = body.captions.model_dump()
+    eff = body.effects.model_dump()
+
+    segments = []
+    if cap.get("enabled") and sess["transcript_segments"]:
+        segments = transcript.segments_between(
+            sess["transcript_segments"], body.start_sec, body.end_sec)
+    # Captions sit on the sped-up output timeline, exactly as they do in a render.
+    segments = effects.scale_captions(segments, eff)
+
+    return {
+        "lines": captions.caption_timeline(
+            segments,
+            style=cap.get("style"),
+            words_per_line=cap.get("words_per_line", 4),
+            ratio=body.ratio,
+            overrides=cap.get("overrides") or None,
+            font=cap.get("font"),
+        ),
+        "metrics": captions.caption_metrics(cap.get("style"), body.ratio, cap.get("font")),
+        "duration": effects.scale_time(max(0.0, body.end_sec - body.start_sec), eff),
+    }
+
+
+@app.get("/api/preview/font/{name}")
+def preview_font(name: str, user: str = Depends(auth.current_user)):
+    """One of the bundled caption fonts, for the browser to draw with.
+
+    The preview claims to show the typeface a clip will be captioned in, and the
+    only way that is true is if the browser has the same file ffmpeg does. Noto
+    Nastaliq Urdu is on nobody's machine; without this the canvas would fall back
+    to a system face and show the wrong shapes with every confidence.
+
+    Only the names in the table are servable, and only the filename recorded
+    against them — nothing here takes a path from the request.
+    """
+    entry = fonts.CAPTION_FONTS.get(name)
+    if not entry or not entry.get("file"):
+        raise HTTPException(404, "Not a bundled font.")
+    folder = fonts.fonts_dir()
+    path = os.path.join(folder, entry["file"]) if folder else ""
+    if not path or not os.path.isfile(path):
+        raise HTTPException(404, "That font is not in this build.")
+    return FileResponse(path, media_type="font/ttf")
+
 # ── brand kit ─────────────────────────────────────────────────────────────────
 # The customer's own logo, stamped on every clip. Per-user, kept under the
 # folder that belongs to one account: this is somebody's branding, and two

@@ -454,6 +454,23 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 
 .modal.wide { width: min(760px, calc(100vw - 40px)); max-height: 92vh; overflow-y: auto; }
 
+/* The live preview — the clip drawn the way it will export. The canvas carries
+   its own aspect ratio through width/height attributes, so this only has to
+   stop it growing past the panel. */
+.live-preview { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.live-canvas {
+  max-width: 100%;
+  max-height: 58vh;
+  border-radius: var(--radius);
+  background: #000;
+  cursor: pointer;
+  /* Nothing here is scaled by an integer factor, and a video drawn into a
+     canvas then shrunk by CSS is where preview text goes crunchy. */
+  image-rendering: auto;
+}
+.live-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; }
+.live-bar .hint-sm { max-width: 46ch; text-align: center; }
+
 /* The brand kit. A 9:16 frame with the logo on it at the size and opacity it
    will really have, because every control beside it is a number whose meaning
    is "how it looks". Built from the variables at the top of this file. */
