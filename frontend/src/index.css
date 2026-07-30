@@ -320,6 +320,32 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
   width: min(460px, calc(100vw - 40px)); background: #12121d;
   border: 1px solid var(--border); border-radius: 18px; padding: 26px;
 }
+/*
+ * A modal with more in it than fits on screen.
+ *
+ * Settings had no height limit and no scrollbar of its own, so on a laptop the
+ * Save button sat below the bottom of the window and the only way to reach it
+ * was to zoom the whole browser out. The body scrolls now and the buttons stay.
+ *
+ * Padding moves onto the two children so the footer can sit flush and its
+ * background can cover content sliding under it.
+ */
+.modal.sheet {
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: min(86vh, 880px);
+  overflow: hidden;
+}
+.modal .sheet-body { overflow-y: auto; padding: 26px; }
+.modal .sheet-foot {
+  display: flex; gap: 10px; justify-content: flex-end;
+  padding: 14px 26px;
+  border-top: 1px solid var(--border);
+  background: #12121d;
+  flex-shrink: 0;
+}
+
 .modal h3 { font-size: 16px; margin-bottom: 6px; }
 .modal p { font-size: 13px; color: var(--muted); margin-bottom: 16px; line-height: 1.5; }
 .modal a { color: var(--accent-2); }

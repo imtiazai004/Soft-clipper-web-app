@@ -1432,8 +1432,17 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
   useEffect(() => inputRef.current?.focus(), [])
 
   async function save() {
-    // key can be left blank to keep the existing one; must exist one way or another
-    if (!key.trim() && !hasKey) return onError('Set your Gemini API key first')
+    /*
+     * Saving does not demand a Gemini key.
+     *
+     * It used to, and that trapped exactly the people who most needed this
+     * screen: someone whose download was failing came here to set a proxy or
+     * cookies, and could not save either until they had gone and signed up
+     * with Google for a key that had nothing to do with their problem.
+     *
+     * What genuinely needs a key is running detection, and that check lives at
+     * the point of use, where it belongs.
+     */
     try {
       const body = {
         proxy: proxy.trim(),
@@ -1453,7 +1462,8 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
 
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sheet-body">
         <h2 style={{ marginBottom: 4 }}>⚙️ Settings</h2>
 
         <h3 style={{ marginTop: 14 }}>🔑 Google Gemini API Key</h3>
@@ -1515,8 +1525,15 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
           value={cookiesFile} onChange={(e) => setCookiesFile(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && save()} />
         </>)}
+        </div>
 
-        <div className="row" style={{ justifyContent: 'flex-end' }}>
+        {/* Outside the scrolling body, so Save is reachable without hunting. */}
+        <div className="sheet-foot">
+          {!hasKey && !key.trim() && (
+            <span className="muted" style={{ marginRight: 'auto', fontSize: 12, maxWidth: '26ch' }}>
+              No AI key yet — detection will ask for one.
+            </span>
+          )}
           <button className="btn" onClick={onClose}>Cancel</button>
           <button className="btn primary" onClick={save}>Save</button>
         </div>
