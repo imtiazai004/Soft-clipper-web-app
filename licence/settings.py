@@ -35,27 +35,30 @@ DEFAULTS: dict = {
 	},
 	"downloads": {
 		"enabled": True,
+		# Two files, and only two. A ZIP of the same Windows build used to sit
+		# beside the installer for anyone who would rather not run a setup
+		# wizard. It is a different thing to hand over — the product as a folder
+		# to open, read and pass on — so it is gone from here, from the site and
+		# from the licence email. The terminal command on the download page is
+		# the escape hatch for people who dislike installers now.
 		"installerUrl": "https://dl.softclipper.pro/Soft-Clipper-Setup.exe",
-		"installerSize": "120 MB",
-		"zipUrl": "https://dl.softclipper.pro/Soft-Clipper.zip",
-		"zipSize": "164 MB",
+		"installerSize": "161 MB",
 		# Shown in place of the buttons when downloads are off. There is always a
 		# reason, and a page that just hides the button looks broken.
 		"offMessage": "Downloads are paused while we ship an update. Back shortly.",
-		# The Mac build, off until someone has run it on a real Mac.
+		# The Mac build. One switch publishes the download, the install guide and
+		# the platform line together, so they cannot disagree.
 		#
-		# CI proves a great deal about it — the suite passes on macOS, a vertical
-		# clip really renders, and the bundled ffmpeg is self-contained and can
-		# burn in subtitles. It cannot prove the app is usable: nobody has yet
-		# clicked through it on a Mac, and nobody has seen what Gatekeeper does
-		# to an unsigned download. Advertising it before that is selling
-		# something we have not opened.
-		#
-		# Flipping this on publishes the download, the Mac install guide and the
-		# platform line together. One switch, so they cannot disagree.
-		"macEnabled": False,
-		"macUrl": "https://dl.softclipper.pro/Soft-Clipper-macOS.zip",
-		"macSize": "95 MB",
+		# What CI has proved: the suite passes on macOS, a vertical clip really
+		# renders, the bundled ffmpeg is self-contained and can burn in
+		# subtitles, and the .dmg mounts with the app and an Applications
+		# shortcut inside it. What it cannot prove is how the app feels to use,
+		# or what Gatekeeper does to an unsigned download on a real machine —
+		# the install guide is written for exactly that, and it is worth having
+		# someone with a Mac walk it before this is pushed at people.
+		"macEnabled": True,
+		"macUrl": "https://dl.softclipper.pro/Soft-Clipper.dmg",
+		"macSize": "202 MB",
 	},
 	"affiliates": {
 		"enabled": True,
@@ -151,7 +154,7 @@ def validate(s: dict):
 		raise Invalid("The checkout link must be a Stripe Payment Link (https://buy.stripe.com/…).")
 
 	downloads = s.get("downloads", {})
-	for field in ("installerUrl", "zipUrl", "macUrl"):
+	for field in ("installerUrl", "macUrl"):
 		link = downloads.get(field, "")
 		if link and not link.startswith("https://"):
 			raise Invalid(f"{field} must be an https:// link.")
@@ -201,8 +204,9 @@ def public() -> dict:
 			"enabled": bool(downloads["enabled"]),
 			"installerUrl": downloads["installerUrl"],
 			"installerSize": downloads["installerSize"],
-			"zipUrl": downloads["zipUrl"],
-			"zipSize": downloads["zipSize"],
+			# No zipUrl. A settings row saved before this still has one — _merge
+			# keeps unknown keys — and it is simply not published, which is the
+			# point of building this dict by hand rather than dumping the row.
 			"offMessage": downloads["offMessage"],
 			"macEnabled": bool(downloads["macEnabled"]),
 			"macUrl": downloads["macUrl"],

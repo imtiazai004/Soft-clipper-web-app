@@ -40,16 +40,19 @@ Download:
     {DOWNLOAD_URL or "(download link not configured — reply to this email and we will send it)"}
 
 Getting started — Windows
-  1. Extract the ZIP somewhere you will keep it (Documents works well).
-  2. Run "Soft Clipper.exe". If Windows shows a blue SmartScreen panel,
-     choose "More info" and then "Run anyway" — that appears for any new
-     release and goes away as more people download it.
+  1. Run the installer you downloaded. If Windows shows a blue SmartScreen
+     panel, choose "More info" and then "Run anyway" — that appears for any
+     new release and goes away as more people download it.
+  2. It installs for you only, so Windows never asks for an administrator
+     password, and Soft Clipper opens by itself when it finishes.
   3. Paste the licence key above when it asks.
 
 Getting started — Mac
-  1. Unzip and drag Soft Clipper into your Applications folder.
-  2. Open it. macOS will say it "cannot verify" the app — this is normal for
-     software not sold through the App Store, and it appears once.
+  1. Open the .dmg you downloaded and drag Soft Clipper onto the Applications
+     shortcut in the same window. Then eject the disk image.
+  2. Open it from Applications. macOS will say it "cannot verify" the app —
+     this is normal for software not sold through the App Store, and it
+     appears once.
   3. Open System Settings > Privacy & Security, scroll to Security, and click
      "Open Anyway" next to the message about Soft Clipper.
   4. Open the app again and paste your licence key.

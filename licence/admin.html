@@ -277,14 +277,6 @@
 				<span>Size</span>
 				<input id="setInstallerSize">
 			</label>
-			<label class="field grow">
-				<span>ZIP URL</span>
-				<input id="setZip">
-			</label>
-			<label class="field" style="max-width:130px">
-				<span>Size</span>
-				<input id="setZipSize">
-			</label>
 		</div>
 		<label class="field" style="margin-top:12px">
 			<span>Shown instead of the buttons when downloads are off</span>
@@ -867,8 +859,6 @@ function fillSettings(s) {
 	$("setDlEnabled").checked = !!s.downloads.enabled;
 	$("setInstaller").value = s.downloads.installerUrl;
 	$("setInstallerSize").value = s.downloads.installerSize;
-	$("setZip").value = s.downloads.zipUrl;
-	$("setZipSize").value = s.downloads.zipSize;
 	$("setDlOff").value = s.downloads.offMessage;
 	$("setMacEnabled").checked = !!s.downloads.macEnabled;
 	$("setMacUrl").value = s.downloads.macUrl;
@@ -909,8 +899,6 @@ function collectSettings() {
 			enabled: $("setDlEnabled").checked,
 			installerUrl: $("setInstaller").value.trim(),
 			installerSize: $("setInstallerSize").value.trim(),
-			zipUrl: $("setZip").value.trim(),
-			zipSize: $("setZipSize").value.trim(),
 			offMessage: $("setDlOff").value.trim(),
 			macEnabled: $("setMacEnabled").checked,
 			macUrl: $("setMacUrl").value.trim(),
