@@ -64,6 +64,7 @@ CAPTION_FONTS: dict[str, dict] = {
 		"label": "Urdu — Nastaliq",
 		"note": "The script Urdu is actually written in. Use this for Urdu clips.",
 		"rtl": True,
+		"script": "nastaliq",
 		# Measured, not guessed — see size_scale() and glyph_width() below for
 		# how, and for what the first guessed pair got wrong.
 		"size_scale": 2.0,
@@ -75,10 +76,88 @@ CAPTION_FONTS: dict[str, dict] = {
 		"label": "Arabic / Pashto — Naskh",
 		"note": "For Arabic, Pashto, Persian and Sindhi.",
 		"rtl": True,
+		"script": "arabic",
 		# Naskh sits flat rather than sloping, so it needs less of both than
 		# Nastaliq does. Same method.
 		"size_scale": 1.5,
 		"glyph_width": 0.19,
+	},
+
+	# ── the rest of the scripts ───────────────────────────────────────────────
+	# Bundling Urdu and stopping there was a market talking, not a decision: the
+	# app transcribes in any language and the site names Hindi by name. Every one
+	# of these is a script Arial cannot draw, which is the same bug that made an
+	# Urdu clip a row of empty boxes.
+	#
+	# On Windows most of these already worked, quietly, because Windows ships
+	# Nirmala UI and libass falls back to it per glyph. Two places they did not:
+	# a machine without it, and the web app's container, which has Liberation and
+	# nothing else — so every Hindi caption that server has ever burnt in was
+	# blank. Bundling them makes the answer the same everywhere.
+	#
+	# Metrics measured the same way as the two above.
+	"Noto Sans Devanagari": {
+		"family": "Noto Sans Devanagari",
+		"file": "NotoSansDevanagari-Variable.ttf",
+		"label": "Hindi / Marathi / Nepali",
+		"note": "Devanagari.",
+		"script": "devanagari",
+		"size_scale": 1.15,
+		"glyph_width": 0.22,
+	},
+	"Noto Sans Bengali": {
+		"family": "Noto Sans Bengali",
+		"file": "NotoSansBengali-Variable.ttf",
+		"label": "Bengali / Assamese",
+		"note": "Bangla.",
+		"script": "bengali",
+		"size_scale": 1.15,
+		"glyph_width": 0.32,
+	},
+	"Noto Sans Gurmukhi": {
+		"family": "Noto Sans Gurmukhi",
+		"file": "NotoSansGurmukhi-Variable.ttf",
+		"label": "Punjabi (Gurmukhi)",
+		"note": "For Punjabi written in India. Punjabi in Pakistan uses Nastaliq.",
+		"script": "gurmukhi",
+		"size_scale": 1.15,
+		"glyph_width": 0.34,
+	},
+	"Noto Sans Gujarati": {
+		"family": "Noto Sans Gujarati",
+		"file": "NotoSansGujarati-Variable.ttf",
+		"label": "Gujarati",
+		"note": "",
+		"script": "gujarati",
+		"size_scale": 1.1,
+		"glyph_width": 0.33,
+	},
+	"Noto Sans Tamil": {
+		"family": "Noto Sans Tamil",
+		"file": "NotoSansTamil-Variable.ttf",
+		"label": "Tamil",
+		"note": "",
+		"script": "tamil",
+		"size_scale": 1.1,
+		"glyph_width": 0.46,
+	},
+	"Noto Sans Telugu": {
+		"family": "Noto Sans Telugu",
+		"file": "NotoSansTelugu-Variable.ttf",
+		"label": "Telugu",
+		"note": "",
+		"script": "telugu",
+		"size_scale": 1.2,
+		"glyph_width": 0.30,
+	},
+	"Noto Sans Thai": {
+		"family": "Noto Sans Thai",
+		"file": "NotoSansThai-Variable.ttf",
+		"label": "Thai",
+		"note": "",
+		"script": "thai",
+		"size_scale": 1.15,
+		"glyph_width": 0.27,
 	},
 }
 
@@ -90,6 +169,79 @@ DEFAULT_FONT = "System"
 DEFAULT_SIZE_SCALE = 1.0
 DEFAULT_GLYPH_WIDTH = 0.62
 
+
+
+# ── choosing one without being asked ──────────────────────────────────────────
+# Unicode blocks, by the script they belong to. Enough to tell one writing system
+# from another, which is all that is being asked — not a language detector.
+SCRIPT_RANGES = (
+	("devanagari", 0x0900, 0x097F),
+	("bengali", 0x0980, 0x09FF),
+	("gurmukhi", 0x0A00, 0x0A7F),
+	("gujarati", 0x0A80, 0x0AFF),
+	("tamil", 0x0B80, 0x0BFF),
+	("telugu", 0x0C00, 0x0C7F),
+	("thai", 0x0E00, 0x0E7F),
+	("arabic", 0x0600, 0x06FF),
+	("arabic", 0x0750, 0x077F),
+	("arabic", 0xFB50, 0xFDFF),
+	("arabic", 0xFE70, 0xFEFF),
+)
+
+AUTO_FONT = "Auto"
+
+# Which font wins for a script. Arabic-script text is the one genuinely
+# ambiguous case: Urdu is written in Nastaliq and Arabic, Pashto and Persian in
+# Naskh, and the letters are the same. Nastaliq is the choice because Urdu is
+# who this app is used by, and because a Naskh reader can read Nastaliq — the
+# picker is there for anyone who wants the other.
+SCRIPT_FONTS = {
+	"devanagari": "Noto Sans Devanagari",
+	"bengali": "Noto Sans Bengali",
+	"gurmukhi": "Noto Sans Gurmukhi",
+	"gujarati": "Noto Sans Gujarati",
+	"tamil": "Noto Sans Tamil",
+	"telugu": "Noto Sans Telugu",
+	"thai": "Noto Sans Thai",
+	"arabic": "Noto Nastaliq Urdu",
+}
+
+
+def script_of(text: str) -> str:
+	"""The writing system most of this text is in, or "" for Latin and the rest.
+
+	Counted rather than decided on the first non-Latin character, because one
+	borrowed word or a stray character should not change the typeface of a whole
+	clip. Latin is not a candidate: a caption that is mostly Hindi with an
+	English brand name in it is a Hindi caption.
+	"""
+	counts: dict[str, int] = {}
+	for ch in str(text or ""):
+		code = ord(ch)
+		for name, low, high in SCRIPT_RANGES:
+			if low <= code <= high:
+				counts[name] = counts.get(name, 0) + 1
+				break
+	if not counts:
+		return ""
+	return max(counts, key=counts.get)
+
+
+def for_text(text: str) -> str:
+	"""The font this text should be drawn in. DEFAULT_FONT for Latin.
+
+	The point of it: nobody should have to know the word "Nastaliq" to caption a
+	video in Urdu. The picker still exists, and a chosen font always wins — this
+	is only what happens when nobody has chosen.
+	"""
+	return SCRIPT_FONTS.get(script_of(text), DEFAULT_FONT)
+
+
+def choose(name: str | None, text: str = "") -> str:
+	"""Resolve a font setting, following Auto to whatever the text needs."""
+	if str(name or "") == AUTO_FONT:
+		return for_text(text)
+	return str(name or DEFAULT_FONT)
 
 def _bundle_root() -> str:
 	"""The folder the app's own files were unpacked into.
@@ -180,7 +332,15 @@ def available() -> list[dict]:
 	still listed, and still selectable, but the app knows it will be substituted.
 	"""
 	folder = fonts_dir()
-	out = []
+	out = [{
+		"name": AUTO_FONT,
+		"label": "Auto — match the language",
+		"note": "Picks the right script from the words themselves. Leave this on "
+		        "unless you want a particular look.",
+		"rtl": False,
+		"bundled": False,
+		"present": True,
+	}]
 	for name, entry in CAPTION_FONTS.items():
 		bundled = bool(entry["file"])
 		out.append({

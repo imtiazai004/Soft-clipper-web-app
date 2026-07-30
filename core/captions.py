@@ -119,6 +119,19 @@ def play_size(ratio: str | None) -> tuple[int, int]:
 	return PLAY_X.get(ratio or "9:16", DEFAULT_PLAY_X), PLAY_Y
 
 
+def resolve_font(font: str | None, segments: list[dict] | None) -> str:
+	"""Follow an "Auto" font setting to whatever these captions are written in.
+
+	Done once for the whole clip rather than per line. ASS carries one Fontname
+	per style, and a clip that changed typeface halfway through would look like a
+	fault even if every line were individually right.
+	"""
+	if str(font or "") != fonts.AUTO_FONT:
+		return font
+	sample = " ".join(str(seg.get("text", "")) for seg in (segments or []))[:2000]
+	return fonts.for_text(sample)
+
+
 def caption_metrics(style: str = None, ratio: str | None = "9:16",
                     font: str | None = None) -> dict:
 	"""Everything needed to draw a caption, in the coordinate space above.
@@ -160,6 +173,7 @@ def caption_timeline(segments: list[dict], style: str = None, words_per_line: in
 	a preview that disagrees with the render is worse than no preview, because it
 	makes a promise the export then breaks.
 	"""
+	font = resolve_font(font, segments)
 	metrics = caption_metrics(style, ratio, font)
 	budget = line_budget(metrics["fontsize"], metrics["play_x"], fonts.glyph_width(font))
 
@@ -565,6 +579,9 @@ def build_ass(
     Returns the path, or None when there is nothing to burn in.
     """
     st = caption_style(style)
+    # An Auto setting becomes a real font here, from the words themselves, before
+    # anything is sized or measured against it.
+    font = resolve_font(font, segments)
     family = fonts.resolve(font)
 
     # A caption size chosen for Latin capitals is too large for Nastaliq, which

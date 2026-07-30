@@ -943,6 +943,9 @@ def preview_captions(body: PreviewBody, user: str = Depends(auth.current_user)):
     # Captions sit on the sped-up output timeline, exactly as they do in a render.
     segments = effects.scale_captions(segments, eff)
 
+    # Auto resolves from the words, so the preview draws the same typeface the
+    # render will pick rather than the literal string "Auto".
+    chosen = captions.resolve_font(cap.get("font"), segments)
     return {
         "lines": captions.caption_timeline(
             segments,
@@ -950,9 +953,9 @@ def preview_captions(body: PreviewBody, user: str = Depends(auth.current_user)):
             words_per_line=cap.get("words_per_line", 4),
             ratio=body.ratio,
             overrides=cap.get("overrides") or None,
-            font=cap.get("font"),
+            font=chosen,
         ),
-        "metrics": captions.caption_metrics(cap.get("style"), body.ratio, cap.get("font")),
+        "metrics": captions.caption_metrics(cap.get("style"), body.ratio, chosen),
         "duration": effects.scale_time(max(0.0, body.end_sec - body.start_sec), eff),
     }
 

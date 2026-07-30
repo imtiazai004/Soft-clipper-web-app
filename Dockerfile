@@ -14,9 +14,17 @@ FROM python:3.12-slim
 # ffmpeg does the cutting/encoding; fonts-liberation is what makes burned-in
 # captions readable — captions.py asks for Arial, which no Linux box has, and
 # fontconfig maps it to Liberation Sans. Without this, text renders as blanks.
+#
+# fonts-noto-cjk covers Chinese, Japanese and Korean. Those are the one family
+# not shipped in assets/fonts: the three Noto CJK files come to about 38 MB,
+# which is a fifth again on the desktop installer for languages this is not
+# for. Windows and macOS ship their own and libass falls back to them; this
+# container ships none, so it takes them from the package manager, where they
+# cost the image and nothing else.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-liberation \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
