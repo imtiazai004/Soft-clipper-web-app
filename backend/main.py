@@ -34,8 +34,8 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
 from core import (
-    ai, broll, captions, cleanup, downloader, effects, llm, proc, projects, silence, transcript,
-    updates, utils, video,
+    ai, broll, captions, cleanup, downloader, effects, fonts, llm, proc, projects, silence,
+    transcript, updates, utils, video,
 )
 from core.version import __version__ as APP_VERSION
 
@@ -563,6 +563,7 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
             ratio=r.get("ratio"),
             position=cap_pos,
             overrides=cap.get("overrides") or None,
+            font=cap.get("font"),
         )
     try:
         if len(segs) == 1:
@@ -657,6 +658,9 @@ class ConfigBody(BaseModel):
     pixabay_api_key: str | None = None
     # what a new clip starts as, so the same choices are not remade every time
     default_caption_style: str | None = None
+    # Which typeface new clips start with. Worth saving rather than picking
+    # each time: someone whose channel is in Urdu wants it every clip.
+    default_caption_font: str | None = None
     default_reframe: str | None = None
     default_ratio: str | None = None
     default_export_quality: str | None = None
@@ -703,6 +707,10 @@ class CaptionOpts(BaseModel):
     y: float | None = None
     # {"wrong": "right"} word fixes, for names and jargon the transcriber missed.
     overrides: dict[str, str] = Field(default_factory=dict)
+    # Which typeface to burn in — see core/fonts.py. None is the system Arial
+    # every clip used before there was a choice, so a saved clip record from
+    # before this existed re-renders exactly as it did.
+    font: str | None = None
 
 
 class HeadlineOpts(BaseModel):
@@ -827,6 +835,12 @@ def get_config(user: str = Depends(auth.current_user)):
         "default_ratio": cfg.get("default_ratio", "9:16"),
         "default_export_quality": cfg.get("default_export_quality", "1080p"),
         "caption_styles": list(captions.CAPTION_STYLES.keys()),
+        # What each style looks like, so the picker can show a swatch instead
+        # of twenty names that mean nothing until you have rendered each one.
+        "caption_style_details": captions.style_list(),
+        # The typefaces captions can be burnt in — see core/fonts.py.
+        "caption_fonts": fonts.available(),
+        "default_caption_font": cfg.get("default_caption_font", fonts.DEFAULT_FONT),
     }
 
 
@@ -848,6 +862,8 @@ def set_config(body: ConfigBody, user: str = Depends(auth.current_user)):
         cfg["pixabay_api_key"] = body.pixabay_api_key.strip()
     if body.default_caption_style is not None:
         cfg["default_caption_style"] = body.default_caption_style.strip()
+    if body.default_caption_font is not None:
+        cfg["default_caption_font"] = body.default_caption_font.strip()
     if body.default_reframe is not None:
         cfg["default_reframe"] = body.default_reframe.strip()
     if body.default_ratio is not None:

@@ -16,6 +16,7 @@ import os
 import subprocess
 
 from . import effects as fx
+from . import fonts
 from . import proc
 from . import reframe as face_reframe
 
@@ -86,6 +87,27 @@ def _ass_escape(ass_file: str) -> str:
     return ass_file.replace("\\", "/").replace(":", "\\:")
 
 
+def _ass_filter(ass_file: str) -> str:
+    """The `ass` filter for this subtitle file, pointed at our own fonts.
+
+    Without `fontsdir` libass only sees fonts installed on the machine, and the
+    ones that ship with this app are not installed anywhere — they sit beside
+    the code. A caption asking for Noto Nastaliq Urdu would then get silently
+    substituted, which is how you end up with a clip full of empty boxes from an
+    ffmpeg run that exited 0 and looked fine. The container has almost no fonts
+    of its own, so here that substitution is a near certainty rather than a risk.
+
+    Left off entirely when the folder is absent, so a checkout without the fonts
+    still renders — in whatever the system provides, which is what happened
+    before any of this existed.
+    """
+    parts = [f"f='{_ass_escape(ass_file)}'"]
+    folder = fonts.fonts_dir()
+    if folder:
+        parts.append(f"fontsdir='{_ass_escape(folder)}'")
+    return "ass=" + ":".join(parts)
+
+
 def _smart_crop_filter(iw: int, ih: int, ratio: str, faces: list[dict]) -> str | None:
     """Static face-centered crop filter. None -> caller falls back to center.
 
@@ -144,7 +166,7 @@ def _tail(chain: str, vfx: list[str], ass_file: str | None) -> str:
     """
     steps = list(vfx)
     if ass_file:
-        steps.append(f"ass='{_ass_escape(ass_file)}'")
+        steps.append(_ass_filter(ass_file))
     if not steps:
         return chain
     return chain.replace("[out]", "[fx]") + ";[fx]" + ",".join(steps) + "[out]"
@@ -370,7 +392,7 @@ def render_clip(
         # crop filter (if any) -> effects -> captions, all on the plain -vf chain
         vf_filters.extend(vfx)
         if ass_file:
-            vf_filters.append(f"ass='{_ass_escape(ass_file)}'")
+            vf_filters.append(_ass_filter(ass_file))
         cmd = base + (["-vf", ",".join(vf_filters)] if vf_filters else [])
         cmd += (["-af", afx] if afx else []) + ENCODE + [output_file]
 
@@ -419,7 +441,7 @@ def _render_dynamic_smart(
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list]
         if ass_file and os.path.exists(ass_file):
             cmd += [
-                "-vf", f"ass='{_ass_escape(ass_file)}'",
+                "-vf", _ass_filter(ass_file),
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-c:a", "aac", "-b:a", "128k",
             ]
@@ -481,7 +503,7 @@ def render_stitched_clip(
         cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list]
         if ass_file and os.path.exists(ass_file):
             cmd += [
-                "-vf", f"ass='{_ass_escape(ass_file)}'",
+                "-vf", _ass_filter(ass_file),
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                 "-c:a", "aac", "-b:a", "128k",
             ]

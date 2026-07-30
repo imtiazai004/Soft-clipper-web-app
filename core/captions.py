@@ -11,6 +11,8 @@ Both live in a single .ass file with two styles, so ffmpeg burns them in one pas
 """
 import re
 
+from . import fonts
+
 # `highlight` is the colour the currently-spoken word turns when word-by-word
 # highlighting is on. It is ignored otherwise, so adding it changed nothing for
 # the four styles that already shipped.
@@ -23,6 +25,36 @@ CAPTION_STYLES = {
     # Boxed is the karaoke look that reads on a busy background.
     "Bounce": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 18, "highlight": "&H0000D7FF", "pop": True},
     "Boxed": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 16, "highlight": "&H0000FFFF", "box": True},
+
+    # ── the second batch ──────────────────────────────────────────────────────
+    # Six presets is a short list next to what a clipper expects to scroll, and
+    # the six were close relatives: white text, black outline, one accent. These
+    # spread out across the looks people actually ask for by name.
+    #
+    # Nothing above this line moved. A style is only its colours, its size and
+    # three flags, so these are entries in a table rather than new machinery —
+    # which is the reason there can be twenty of them and not six.
+    #
+    # Colours are ASS &HBBGGRR: blue, green, red — the reverse of hex you are
+    # used to, and the reason a "red" written the familiar way comes out blue.
+    "Hormozi": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 19, "highlight": "&H0000E5FF", "pop": True},
+    "Gold Pop": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 18, "highlight": "&H0000C0FF"},
+    "Mint": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 17, "highlight": "&H00B9E6A0"},
+    "Hot Pink": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 17, "highlight": "&H00B469FF"},
+    "Red Alert": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 18, "highlight": "&H000000FF", "pop": True},
+    "Sky": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 17, "highlight": "&H00FFC060"},
+    # Dark text needs a light outline or it disappears into the video.
+    "Ink": {"colour": "&H00000000", "outline": "&H00FFFFFF", "fontsize": 17, "highlight": "&H000000FF"},
+    "Cream": {"colour": "&H00D5EFFF", "outline": "&H00000000", "fontsize": 16, "highlight": "&H0000A5FF"},
+    # Boxed variants: the block behind the words is what makes captions readable
+    # over a bright, busy frame, and it is the look news and podcast clips use.
+    "News Bar": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 15, "highlight": "&H0000D7FF", "box": True},
+    "Podcast": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 14, "highlight": "&H00E6D8AD", "box": True},
+    "Highlighter": {"colour": "&H00000000", "outline": "&H0000FFFF", "fontsize": 16, "highlight": "&H000000FF", "box": True},
+    # Loud ones. Big sizes on purpose — these are for a single punchy word.
+    "Impact": {"colour": "&H00FFFFFF", "outline": "&H00000000", "fontsize": 21, "highlight": "&H0000FFFF", "pop": True},
+    "Shout": {"colour": "&H0000FFFF", "outline": "&H00000000", "fontsize": 21, "highlight": "&H00FFFFFF", "pop": True},
+    "Electric": {"colour": "&H00FFFF00", "outline": "&H00FF0000", "fontsize": 18, "highlight": "&H0000FFFF", "pop": True},
 }
 
 # earlier builds shipped these names; keep saved clip records rendering the same
@@ -65,9 +97,9 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,{fontsize},{colour},&H000000FF,{outline},&H80000000,-1,0,0,0,100,100,0,0,{c_border},{c_outline},1,2,10,10,{margin_v},1
-Style: Headline,Arial,{h_fontsize},{h_colour},&H000000FF,{h_box},&H80000000,-1,0,0,0,100,100,0,0,{h_border},{h_outline},{h_shadow},{h_align},14,14,{h_margin},1
-Style: Overlay,Arial,24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,1,5,10,10,10,1
+Style: Default,{font},{fontsize},{colour},&H000000FF,{outline},&H80000000,-1,0,0,0,100,100,0,0,{c_border},{c_outline},1,2,10,10,{margin_v},1
+Style: Headline,{font},{h_fontsize},{h_colour},&H000000FF,{h_box},&H80000000,-1,0,0,0,100,100,0,0,{h_border},{h_outline},{h_shadow},{h_align},14,14,{h_margin},1
+Style: Overlay,{font},24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,1,5,10,10,10,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -91,7 +123,7 @@ _GLYPH_WIDTH = 0.62
 _SIDE_MARGINS = 20
 
 
-def line_budget(fontsize: int, play_x: int) -> int:
+def line_budget(fontsize: int, play_x: int, width_ratio: float = _GLYPH_WIDTH) -> int:
     """How many characters actually fit on one line.
 
     Guessing a fixed number was the first attempt and it was wrong: at
@@ -99,9 +131,15 @@ def line_budget(fontsize: int, play_x: int) -> int:
     twenty-character chunk still wrapped and still ended up two lines tall in
     the middle of the picture. The budget has to come from the font size and
     the canvas width, and then it adjusts itself for every style and ratio.
+
+    `width_ratio` defaults to the bold-Latin-capitals figure this was measured
+    with, so every existing caller gets exactly the number it got before. It is
+    a parameter because the answer is per-script: Arabic script is cursive and
+    joins, and is about six times narrower per character, so the Latin figure
+    chopped an Urdu line off after three words.
     """
     usable = max(40, play_x - _SIDE_MARGINS)
-    return max(8, int(usable / (_GLYPH_WIDTH * max(8, fontsize))))
+    return max(8, int(usable / (max(0.02, width_ratio) * max(8, fontsize))))
 
 
 def _chunk_words(words: list[str], max_words: int = 3, max_chars: int = 15) -> list[list[str]]:
@@ -240,6 +278,49 @@ def _wrap_headline(text: str, max_chars: int = 26) -> str:
 def caption_style(name: str) -> dict:
     name = CAPTION_ALIASES.get(name, name)
     return CAPTION_STYLES.get(name, CAPTION_STYLES[DEFAULT_CAPTION_STYLE])
+
+
+def style_list() -> list[dict]:
+    """Every caption style, with enough for the UI to draw a swatch.
+
+    The picker used to be a hard-coded array in App.jsx that happened to agree
+    with this table. It only had to agree with six names; the way you find out
+    it no longer agrees with twenty is a customer choosing a style and getting
+    the default. So the list is served from the one place that defines it.
+
+    `colour` and `highlight` come back as "#rrggbb" because that is what a
+    browser can paint. They are stored the other way round — ASS wants BGR — and
+    converting here rather than in the UI keeps that oddity in one file.
+    """
+    out = []
+    for name, st in CAPTION_STYLES.items():
+        out.append({
+            "name": name,
+            "colour": _ass_to_hex(st["colour"]),
+            "highlight": _ass_to_hex(st.get("highlight", st["colour"])),
+            "outline": _ass_to_hex(st["outline"]),
+            "size": st["fontsize"],
+            "boxed": bool(st.get("box")),
+            "pop": bool(st.get("pop")),
+        })
+    return out
+
+
+def _ass_to_hex(value: str) -> str:
+    """"&H00BBGGRR" -> "#rrggbb". Anything unexpected comes back white.
+
+    ASS stores colours backwards from every other format, with an alpha byte in
+    front. Getting this wrong does not fail, it just swaps red and blue, which
+    is exactly the kind of thing that ships.
+    """
+    digits = str(value or "").lstrip("&Hh").rstrip("&")
+    # Length alone is not enough of a check: "nonsense" is eight characters and
+    # sliced happily into "#seenns", a colour the browser then ignores. The
+    # characters have to actually be hex.
+    if len(digits) < 6 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+        return "#ffffff"
+    bb, gg, rr = digits[-6:-4], digits[-4:-2], digits[-2:]
+    return f"#{rr}{gg}{bb}".lower()
 
 
 def _overlay_color(color: str) -> str:
@@ -387,6 +468,7 @@ def build_ass(
     ratio: str | None = "9:16",
     position: dict | None = None,
     overrides: dict | None = None,
+    font: str | None = None,
 ) -> str | None:
     """Write an ASS file from clip-relative caption segments, a headline, overlays.
 
@@ -396,9 +478,18 @@ def build_ass(
     position: {"x", "y"} as 0..1 of the frame — where the captions sit. None keeps
       the bottom-centre placement every earlier clip was rendered with.
     overrides: {"wrong": "right"} word fixes applied to the caption text.
+    font: which bundled typeface to draw in — see core/fonts.py. None means the
+      system Arial every clip was rendered with before there was a choice.
     Returns the path, or None when there is nothing to burn in.
     """
     st = caption_style(style)
+    family = fonts.resolve(font)
+
+    # A caption size chosen for Latin capitals is too large for Nastaliq, which
+    # slopes as it runs and needs the vertical room. Scaled here rather than in
+    # the style table so every style stays usable in every script — and it is
+    # 1.0 for everything else, so nothing that rendered before moves a pixel.
+    fontsize = max(6, int(round(st["fontsize"] * fonts.size_scale(font))))
     lines = []
 
     # The caption canvas has to be the same shape as the video. A 4:3 PlayRes
@@ -411,7 +502,7 @@ def build_ass(
     segments = tidy_segments(segments)
 
     # How much text fits on one line at this style's size, on this canvas.
-    budget = line_budget(st["fontsize"], play_x)
+    budget = line_budget(fontsize, play_x, fonts.glyph_width(font))
 
     # Worked out once, not per chunk: it is the same tag for every line.
     anchor = caption_anchor(position, play_x)
@@ -462,14 +553,17 @@ def build_ass(
     top = (headline or {}).get("position", "top") != "bottom"
     header = ASS_HEADER.format(
         play_x=play_x,
-        fontsize=st["fontsize"], colour=st["colour"], outline=st["outline"],
+        font=family,
+        fontsize=fontsize, colour=st["colour"], outline=st["outline"],
         # BorderStyle 3 draws an opaque box behind the words instead of an
         # outline around them — the only way captions stay readable over a
         # bright, busy frame.
         c_border=3 if st.get("box") else 1,
         c_outline=6 if st.get("box") else 2,
         margin_v=margin_v,
-        h_fontsize=max(8, min(40, int((headline or {}).get("size", 20)))),
+        h_fontsize=max(8, min(40, int(
+            int((headline or {}).get("size", 20)) * fonts.size_scale(font)
+        ))),
         h_colour="&H00FFFFFF",
         h_box=hs["box"],
         h_border=hs["border_style"],

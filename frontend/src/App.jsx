@@ -8,7 +8,15 @@ const RATIOS = [
   { id: null, label: 'Original' },
 ]
 
+// Only a fallback for the moment before /api/config answers — the real list is
+// served from core/captions.py, which is why growing it there needs no edit
+// here. It used to be the actual list, duplicated, which was survivable at six
+// names and is not at twenty.
 const CAPTION_STYLES = ['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon', 'Bounce', 'Boxed']
+
+// Same again for the typefaces. 'System' is Arial — what every clip was burnt
+// in before there was a choice, and still the default.
+const CAPTION_FONTS = [{ name: 'System', label: 'System default', note: '', rtl: false, present: true }]
 
 // Mirrors core/silence.py LENGTHS
 const SPLIT_LENGTHS = [30, 45, 60, 90, 120]
@@ -125,6 +133,9 @@ export default function App() {
   const [reframeMode, setReframeMode] = useState('smart')
   const [captionsOn, setCaptionsOn] = useState(true)
   const [capStyle, setCapStyle] = useState('TikTok Bold')
+  // The typeface captions are burnt in. 'System' is Arial — what every clip
+  // rendered before this existed, so leaving it alone changes nothing.
+  const [capFont, setCapFont] = useState('System')
   const [capHighlight, setCapHighlight] = useState(false)
   const [wordsPerLine, setWordsPerLine] = useState(4)
   // null = wherever captions have always gone. Set only once someone drags the
@@ -177,7 +188,7 @@ export default function App() {
   const [activeProject, setActiveProject] = useState(null)
   const [hasTranscript, setHasTranscript] = useState(false)
   const [stockKeys, setStockKeys] = useState({ pexels: false, pixabay: false })
-  const [shell, setShell] = useState({ version: '', captionStyles: CAPTION_STYLES })
+  const [shell, setShell] = useState({ version: '', captionStyles: CAPTION_STYLES, captionFonts: CAPTION_FONTS })
 
   const busy = !!job
   // one-line summary of the active global look, shown on the collapsed panel
@@ -190,6 +201,7 @@ export default function App() {
   ].filter(Boolean).join(' · ')
   const captionOpts = {
     enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine, highlight: capHighlight,
+    font: capFont,
     // x/y stay null unless the chip was dragged — the backend reads null as
     // "leave the captions where they were".
     x: capPos ? capPos.x : null, y: capPos ? capPos.y : null,
@@ -217,14 +229,18 @@ export default function App() {
       setShell({
         version: c.version || '',
         captionStyles: c.caption_styles || CAPTION_STYLES,
+        captionStyleDetails: c.caption_style_details || [],
+        captionFonts: c.caption_fonts || CAPTION_FONTS,
         defaults: {
           caption_style: c.default_caption_style,
+          caption_font: c.default_caption_font,
           reframe: c.default_reframe,
           ratio: c.default_ratio,
           quality: c.default_export_quality,
         },
       })
       if (c.default_caption_style) setCapStyle(c.default_caption_style)
+      if (c.default_caption_font) setCapFont(c.default_caption_font)
       if (c.default_reframe) setReframeMode(c.default_reframe)
       if (c.default_ratio !== undefined) setRatio(c.default_ratio || null)
       // Used before the Qualities button has been pressed, so a download started
@@ -542,8 +558,9 @@ export default function App() {
           {captionsOn && (
             <>
               <select className="select" value={capStyle} onChange={(e) => setCapStyle(e.target.value)}>
-                {CAPTION_STYLES.map((s) => <option key={s}>{s}</option>)}
+                {(shell?.captionStyles || CAPTION_STYLES).map((s) => <option key={s}>{s}</option>)}
               </select>
+              <FontPicker fonts={shell?.captionFonts} value={capFont} onChange={setCapFont} />
               <div className="side-row">
                 <span className="lbl-inline">Words per line</span>
                 <span className="side-val">{wordsPerLine}</span>
@@ -1023,6 +1040,7 @@ export default function App() {
           index={editing}
           busy={busy}
           duration={video?.duration || 0}
+          shell={shell}
           onClose={() => setEditing(null)}
           onManual={(payload) => {
             setEditing(null)
@@ -1274,7 +1292,7 @@ function ZoomSlider({ crop, setCrop }) {
   )
 }
 
-function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
+function EditModal({ clip, index, busy, duration, shell, onClose, onManual, onAi }) {
   const r = clip.render
   const [tab, setTab] = useState('ai')
   const [instruction, setInstruction] = useState('')
@@ -1288,6 +1306,9 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   const [reframe, setReframe] = useState(r.reframe || 'smart')
   const [capOn, setCapOn] = useState(!!r.captions?.enabled)
   const [capStyle, setCapStyle] = useState(r.captions?.style || 'TikTok Bold')
+  // Falls back to 'System' for a clip saved before fonts were a choice, which
+  // is the font it was rendered with — so re-rendering it changes nothing.
+  const [capFont, setCapFont] = useState(r.captions?.font || 'System')
   const [capHi, setCapHi] = useState(!!r.captions?.highlight)
   const [words, setWords] = useState(r.captions?.words_per_line || 4)
   const [head, setHead] = useState({
@@ -1364,7 +1385,7 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
     if (!segs.length) return
     onManual({
       index, name, segments: segs, ratio, reframe,
-      captions: { enabled: capOn, style: capStyle, words_per_line: words, highlight: capHi },
+      captions: { enabled: capOn, style: capStyle, words_per_line: words, highlight: capHi, font: capFont },
       headline: head,
       crop,
       effects,
@@ -1584,7 +1605,12 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
               {capOn && (
                 <>
                   <select className="select" style={{ width: 140 }} value={capStyle} onChange={(e) => setCapStyle(e.target.value)}>
-                    {CAPTION_STYLES.map((s) => <option key={s}>{s}</option>)}
+                    {(shell?.captionStyles || CAPTION_STYLES).map((s) => <option key={s}>{s}</option>)}
+                  </select>
+                  <select className="select" style={{ width: 150 }} value={capFont} onChange={(e) => setCapFont(e.target.value)}>
+                    {(shell?.captionFonts || CAPTION_FONTS).map((f) => (
+                      <option key={f.name} value={f.name}>{f.label || f.name}</option>
+                    ))}
                   </select>
                   <input type="range" min={2} max={8} value={words} style={{ width: 80 }} onChange={(e) => setWords(+e.target.value)} />
                   <span className="muted">{words} w/line</span>
@@ -1614,6 +1640,43 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
  *  bottom-centre lands on a chin, a logo, or a platform's own UI often enough
  *  that "move the captions" is the first request every clipper makes.
  */
+/** Which typeface the captions are burnt in.
+ *
+ *  It exists for one reason above all the others: Arial cannot draw Nastaliq,
+ *  so every Urdu clip this app has ever rendered came out in the wrong shapes or
+ *  in empty boxes, while the website said it captioned Urdu. The right-to-left
+ *  entries are called out rather than left to blend in with the display faces,
+ *  because picking Anton for an Urdu clip silently falls back to Arial and the
+ *  customer would have no way of knowing why.
+ */
+function FontPicker({ fonts, value, onChange }) {
+  const list = fonts?.length ? fonts : CAPTION_FONTS
+  const current = list.find((f) => f.name === value)
+  const scripts = list.filter((f) => f.rtl)
+  const latin = list.filter((f) => !f.rtl)
+  return (
+    <>
+      <select className="select" value={value} onChange={(e) => onChange(e.target.value)}>
+        <optgroup label="Latin">
+          {latin.map((f) => <option key={f.name} value={f.name}>{f.label || f.name}</option>)}
+        </optgroup>
+        {scripts.length > 0 && (
+          <optgroup label="Urdu, Arabic & Pashto">
+            {scripts.map((f) => <option key={f.name} value={f.name}>{f.label || f.name}</option>)}
+          </optgroup>
+        )}
+      </select>
+      {current?.note && <div className="hint-sm">{current.note}</div>}
+      {current && current.present === false && (
+        <div className="hint-sm warn">
+          This font is not in the build — captions will fall back to the system one.
+        </div>
+      )}
+    </>
+  )
+}
+
+
 function CaptionChip({ pos, onMove, style }) {
   const dragging = useRef(false)
   function move(e) {
@@ -1991,6 +2054,7 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
   const [pexelsKey, setPexelsKey] = useState('')
   const [pixabayKey, setPixabayKey] = useState('')
   const [defStyle, setDefStyle] = useState(shell?.defaults?.caption_style || 'TikTok Bold')
+  const [defFont, setDefFont] = useState(shell?.defaults?.caption_font || 'System')
   const [defReframe, setDefReframe] = useState(shell?.defaults?.reframe || 'smart')
   const [defRatio, setDefRatio] = useState(shell?.defaults?.ratio ?? '9:16')
   const [defQuality, setDefQuality] = useState(shell?.defaults?.quality || '1080p')
@@ -2022,6 +2086,7 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
       if (pexelsKey.trim()) body.pexels_api_key = pexelsKey.trim()
       if (pixabayKey.trim()) body.pixabay_api_key = pixabayKey.trim()
       body.default_caption_style = defStyle
+      body.default_caption_font = defFont
       body.default_reframe = defReframe
       body.default_ratio = defRatio ?? ''
       body.default_export_quality = defQuality
@@ -2120,6 +2185,10 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
             <select className="select" value={defStyle} onChange={(e) => setDefStyle(e.target.value)}>
               {(shell?.captionStyles || CAPTION_STYLES).map((v) => <option key={v}>{v}</option>)}
             </select>
+          </div>
+          <div>
+            <label className="lbl">CAPTION FONT</label>
+            <FontPicker fonts={shell?.captionFonts} value={defFont} onChange={setDefFont} />
           </div>
           <div>
             <label className="lbl">REFRAME</label>

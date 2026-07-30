@@ -26,6 +26,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/ ./backend/
 COPY core/ ./core/
+# The caption typefaces we ship ourselves. fonts-liberation above covers Arial,
+# and nothing on this image covers Nastaliq — so an Urdu caption came out as a
+# row of empty boxes, from a render that exits 0 and produces a video nobody can
+# post. core/fonts.py looks for exactly this path.
+COPY assets/ ./assets/
 COPY --from=frontend /build/dist ./frontend/dist
 
 # main.py chdir's here and resolves downloads/ and clips/ relative to it
