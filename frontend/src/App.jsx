@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { mergeDecisions, tally } from './review'
 import { api, cancelJob, del, runJob, secToMMSS, secToClock, mmssToSec } from './api'
 
 const RATIOS = [
@@ -168,6 +169,8 @@ export default function App() {
   const [query, setQuery] = useState('')
   const [moments, setMoments] = useState([])
   const [selected, setSelected] = useState(new Set())
+  // The review panel — see ReviewPanel. Opt-in: the list below it is unchanged.
+  const [reviewing, setReviewing] = useState(false)
 
   // reel
   const [reelMode, setReelMode] = useState('teaser')
@@ -361,7 +364,7 @@ export default function App() {
       const v = await api.get('/api/video')
       setVideo(v.loaded ? { ...v, stream_url: `/api/video/stream?t=${Date.now()}` } : null)
       setClips(r.clips || [])
-      setMoments([]); setSelected(new Set())
+      setMoments([]); setSelected(new Set()); setReviewing(false)
       setHasTranscript(!!r.has_transcript)
       setActiveProject(id)
       setShowProjects(false)
@@ -823,6 +826,14 @@ export default function App() {
                             </div>
                           </div>
                         ))}
+                        {/* Watching beats reading a score. Offered rather than
+                            forced: the list still works exactly as it did, and
+                            for someone who wants all of them the Cut button
+                            below is still one click. */}
+                        <button className="btn mt" style={{ width: '100%' }}
+                          onClick={() => setReviewing(true)} disabled={busy}>
+                          👀 Review them one by one
+                        </button>
                         <button className="btn primary mt" style={{ width: '100%' }} onClick={cutSelected} disabled={busy}>
                           ✂️ Cut {selected.size} Selected Clips
                         </button>
@@ -1030,6 +1041,17 @@ export default function App() {
             ok('Settings saved!')
           }}
           onError={err}
+        />
+      )}
+
+      {/* watch each suggestion and decide on it */}
+      {reviewing && moments.length > 0 && (
+        <ReviewPanel
+          moments={moments}
+          src={video?.stream_url || '/api/video/stream'}
+          selected={selected}
+          onApply={(next) => { setSelected(next); setReviewing(false) }}
+          onClose={() => setReviewing(false)}
         />
       )}
 
@@ -1640,6 +1662,140 @@ function EditModal({ clip, index, busy, duration, shell, onClose, onManual, onAi
  *  bottom-centre lands on a chin, a logo, or a platform's own UI often enough
  *  that "move the captions" is the first request every clipper makes.
  */
+/** Watch each suggestion and decide on it, one at a time.
+ *
+ *  The moments list arrives with every box already ticked, which means the app
+ *  decides and the person un-decides. That is the wrong way round for the one
+ *  judgement only they can make — whether a moment is actually any good — and
+ *  the list gives them nothing to make it with: a title, a score and a sentence
+ *  of AI reasoning about a video they have not watched.
+ *
+ *  So this plays the moment. The source is already downloaded and already being
+ *  streamed for the frame editor, so showing the real seconds costs nothing and
+ *  replaces a guess with the thing itself. Rendering is what is expensive —
+ *  minutes per clip — and finding out after the render is the expensive mistake.
+ *
+ *  It drives the same `selected` set the list always used, so the Cut button
+ *  below is unchanged and the list is still there for anyone who would rather
+ *  tick boxes. This is another way to do it, not a replacement.
+ */
+function ReviewPanel({ moments, src, selected, onApply, onClose }) {
+  const [at, setAt] = useState(0)
+  // index -> 'approved' | 'rejected'. Anything absent has not been judged, and
+  // stays exactly as selected as it already was — closing halfway through must
+  // not quietly discard the suggestions nobody looked at.
+  const [calls, setCalls] = useState({})
+  const videoRef = useRef(null)
+  const m = moments[at]
+
+  // Seek to the moment whenever it changes. `loadedmetadata` matters: seeking a
+  // video that has not reported its duration yet is silently ignored, which
+  // showed the previous moment again with the new title above it.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v || !m) return
+    const go = () => { v.currentTime = m.start_sec; v.play().catch(() => {}) }
+    if (v.readyState >= 1) go()
+    else v.addEventListener('loadedmetadata', go, { once: true })
+  }, [at, m])
+
+  // Loop inside the moment rather than running on into the rest of the video.
+  function onTime() {
+    const v = videoRef.current
+    if (v && m && v.currentTime >= m.end_sec) v.currentTime = m.start_sec
+  }
+
+  function decide(verdict) {
+    setCalls((prev) => ({ ...prev, [at]: verdict }))
+    if (at < moments.length - 1) setAt(at + 1)
+  }
+
+  function apply() {
+    onApply(mergeDecisions(selected, calls))
+  }
+
+  // A and R because the hands are already off the mouse, and because going
+  // through fifteen suggestions with a pointer is the reason people skip this.
+  useEffect(() => {
+    function onKey(e) {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return
+      const k = e.key.toLowerCase()
+      if (k === 'a') decide('approved')
+      else if (k === 'r' || k === 'd') decide('rejected')
+      else if (e.key === 'ArrowLeft') setAt((i) => Math.max(0, i - 1))
+      else if (e.key === 'ArrowRight') setAt((i) => Math.min(moments.length - 1, i + 1))
+      else if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  })
+
+  const { approved, rejected, left, done } = tally(calls, moments.length)
+  const judged = moments.length - left
+  const verdict = calls[at]
+
+  if (!m) return null
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal wide review" onClick={(e) => e.stopPropagation()}>
+        <div className="review-head">
+          <div>
+            <h3>Suggestion {at + 1} of {moments.length}</h3>
+            <p style={{ marginBottom: 0 }}>
+              {approved} approved · {rejected} rejected · {left} left
+            </p>
+          </div>
+          <button className="btn ghost" onClick={onClose}>Close</button>
+        </div>
+
+        <video
+          ref={videoRef}
+          src={src}
+          className="review-video"
+          controls
+          onTimeUpdate={onTime}
+        />
+
+        <div className="review-info">
+          <div className="score-ring" style={{ '--pct': m.virality_score }}>
+            <span>{m.virality_score}</span>
+          </div>
+          <div className="info">
+            <div className="hook">{m.hook_title}</div>
+            <div className="times">
+              {secToMMSS(m.start_sec)} → {secToMMSS(m.end_sec)} ({Math.round(m.end_sec - m.start_sec)}s)
+            </div>
+            <div className="reason">{m.reason}</div>
+          </div>
+        </div>
+
+        <div className="review-actions">
+          <button className="btn" disabled={at === 0} onClick={() => setAt(at - 1)}>← Back</button>
+          <button
+            className={`btn ${verdict === 'rejected' ? 'primary' : ''}`}
+            onClick={() => decide('rejected')}
+          >✕ Reject <kbd>R</kbd></button>
+          <button
+            className={`btn ${verdict === 'approved' ? 'primary' : ''}`}
+            onClick={() => decide('approved')}
+          >✓ Approve <kbd>A</kbd></button>
+        </div>
+
+        <button className="btn primary mt" style={{ width: '100%' }} onClick={apply}>
+          {done
+            ? `All reviewed — keep ${approved} clip${approved === 1 ? '' : 's'}`
+            : `Use these ${judged} decision${judged === 1 ? '' : 's'}`}
+        </button>
+        {!done && judged > 0 && (
+          <div className="hint-sm">
+            The {left} you have not judged keep the ticks they have now.
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 /** Which typeface the captions are burnt in.
  *
  *  It exists for one reason above all the others: Arial cannot draw Nastaliq,

@@ -454,6 +454,39 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 
 .modal.wide { width: min(760px, calc(100vw - 40px)); max-height: 92vh; overflow-y: auto; }
 
+/* Reviewing suggestions one at a time. Everything here is built from the
+   variables already defined at the top of this file — the panel is a new place
+   to stand, not a new look. */
+.review-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.review-video {
+  width: 100%;
+  margin-top: 14px;
+  border-radius: var(--radius);
+  background: #000;
+  /* Capped so a landscape source cannot push the decision buttons off the
+     bottom of the panel — the buttons are the point of the screen. */
+  max-height: 46vh;
+}
+.review-info { display: flex; gap: 14px; align-items: flex-start; margin-top: 16px; }
+.review-info .info { flex: 1; min-width: 0; }
+.review-info .hook { font-weight: 700; font-size: 15px; margin-bottom: 3px; }
+.review-info .times { font-size: 12.5px; color: var(--accent-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+.review-info .reason { font-size: 13px; color: var(--muted); margin-top: 5px; line-height: 1.45; }
+.review-actions { display: flex; gap: 10px; margin-top: 18px; }
+/* Back stays narrow; the two that matter share the rest of the row equally, so
+   neither reads as the one you are supposed to press. */
+.review-actions .btn { flex: 1; justify-content: center; }
+.review-actions .btn:first-child { flex: 0 0 auto; }
+.review-actions kbd {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--muted);
+}
+
 .btn.danger {
   border-color: rgba(248, 113, 113, 0.45);
   background: rgba(248, 113, 113, 0.12);
