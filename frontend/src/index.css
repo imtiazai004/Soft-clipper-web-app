@@ -454,6 +454,49 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 
 .modal.wide { width: min(760px, calc(100vw - 40px)); max-height: 92vh; overflow-y: auto; }
 
+/* The brand kit. A 9:16 frame with the logo on it at the size and opacity it
+   will really have, because every control beside it is a number whose meaning
+   is "how it looks". Built from the variables at the top of this file. */
+.brand-body { display: flex; gap: 18px; margin-top: 16px; align-items: flex-start; }
+.brand-frame {
+  position: relative;
+  flex: 0 0 132px;
+  aspect-ratio: 9 / 16;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  /* A mid-grey rather than the panel colour: a white logo on a dark preview
+     looks like it will read over anything, and it will not. */
+  background: repeating-conic-gradient(#2a2a3a 0% 25%, #23232f 0% 50%) 0 / 20px 20px;
+  overflow: hidden;
+}
+.brand-frame img { position: absolute; display: block; max-width: none; }
+.brand-controls { flex: 1; min-width: 0; }
+.brand-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px;
+  width: 96px;
+  margin-top: 4px;
+}
+.brand-cell {
+  aspect-ratio: 1;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  padding: 0;
+  transition: all 0.15s;
+}
+.brand-cell:hover { background: rgba(255, 255, 255, 0.08); }
+.brand-cell.active {
+  border-color: var(--accent-1);
+  background: rgba(139, 92, 246, 0.35);
+}
+@media (max-width: 560px) {
+  .brand-body { flex-direction: column; }
+  .brand-frame { flex: 0 0 auto; width: 120px; }
+}
+
 /* Reviewing suggestions one at a time. Everything here is built from the
    variables already defined at the top of this file — the panel is a new place
    to stand, not a new look. */

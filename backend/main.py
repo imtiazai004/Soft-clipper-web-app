@@ -34,8 +34,8 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
 from core import (
-    ai, broll, captions, cleanup, downloader, effects, fonts, llm, proc, projects, silence,
-    transcript, updates, utils, video,
+    ai, brand, broll, captions, cleanup, downloader, effects, fonts, llm, proc, projects,
+    silence, transcript, updates, utils, video,
 )
 from core.version import __version__ as APP_VERSION
 
@@ -585,11 +585,54 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
         raise RuntimeError(f"{rec['name']}: {err}")
 
     apply_broll(job, rec)
+    # After B-roll, so the logo sits on top of the cutaways rather than being
+    # covered by them — a mark the footage can hide is not a mark.
+    apply_logo(job, rec, user)
 
     # A still for the clip list. After B-roll, so the thumbnail matches what the
     # clip actually looks like. One second in, because frame zero of a cut is
     # often a fade or a blur.
     projects.make_thumbnail(rec["path"], thumb_path_for(rec["path"]), at=1.0, width=360)
+
+
+
+def apply_logo(job: dict, rec: dict, user: str) -> None:
+    """Stamp this user's own logo on the finished clip.
+
+    Non-fatal, like B-roll and for the same reason: the file on disk is already
+    the clip that was asked for, and losing it over a decoration would be the
+    wrong trade. It differs in one way that matters — the setting being on means
+    the customer believes every clip carries their mark, so a failure is written
+    into the clip's notes rather than passed over.
+
+    A clip can turn it off for itself. Some clips are not for the channel.
+    """
+    render = rec.get("render") or {}
+    if render.get("brand") is False:
+        return
+    logo = brand.settings(load_user_config(user))
+    if not logo["enabled"]:
+        return
+
+    path = rec["path"]
+    info = video.get_video_info(path)
+    width = info.get("width") or 1080
+    tmp = f"{os.path.splitext(path)[0]}_logo.mp4"
+    job["message"] = f"Adding your logo: {rec['name']}"
+
+    ok, err = brand.apply_logo(path, tmp, logo, width)
+    if not ok:
+        rec.setdefault("notes", []).append(f"Your logo could not be added: {err}")
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return
+    try:
+        os.replace(tmp, path)
+    except OSError as e:
+        rec.setdefault("notes", []).append(f"The logo rendered but could not replace the clip: {e}")
 
 
 def apply_broll(job: dict, rec: dict) -> None:
@@ -661,6 +704,14 @@ class ConfigBody(BaseModel):
     # Which typeface new clips start with. Worth saving rather than picking
     # each time: someone whose channel is in Urdu wants it every clip.
     default_caption_font: str | None = None
+    # The brand kit — the customer's own logo on every clip. See core/brand.py.
+    # brand_logo is set by the upload endpoint, not by this body.
+    brand_enabled: bool | None = None
+    brand_position: str | None = None
+    brand_scale_pct: int | None = None
+    brand_opacity: float | None = None
+    brand_x: float | None = None
+    brand_y: float | None = None
     default_reframe: str | None = None
     default_ratio: str | None = None
     default_export_quality: str | None = None
@@ -764,6 +815,10 @@ class CutBody(BaseModel):
     effects: EffectsOpts = EffectsOpts()
     overlays: list[OverlayOpts] = Field(default_factory=list)
     broll: list[BrollOpts] = Field(default_factory=list)
+    # Whether this clip carries the logo from Settings. True is the setting's
+    # own answer; False is this one clip opting out, because some clips are
+    # not for the channel.
+    brand: bool = True
 
 
 class ReelBody(BaseModel):
@@ -780,6 +835,10 @@ class ReelBody(BaseModel):
     effects: EffectsOpts = EffectsOpts()
     overlays: list[OverlayOpts] = Field(default_factory=list)
     broll: list[BrollOpts] = Field(default_factory=list)
+    # Whether this clip carries the logo from Settings. True is the setting's
+    # own answer; False is this one clip opting out, because some clips are
+    # not for the channel.
+    brand: bool = True
 
 
 # ── auth endpoints ────────────────────────────────────────────────────────────
@@ -841,8 +900,89 @@ def get_config(user: str = Depends(auth.current_user)):
         # The typefaces captions can be burnt in — see core/fonts.py.
         "caption_fonts": fonts.available(),
         "default_caption_font": cfg.get("default_caption_font", fonts.DEFAULT_FONT),
+        # The brand kit, clamped and defaulted by core/brand.py rather than by
+        # the UI, so the preview and the renderer agree on where it goes.
+        "brand": brand.settings(cfg),
+        "brand_positions": list(brand.POSITIONS.keys()),
     }
 
+
+
+# ── brand kit ─────────────────────────────────────────────────────────────────
+# The customer's own logo, stamped on every clip. Per-user, kept under the
+# folder that belongs to one account: this is somebody's branding, and two
+# people on the same server must never end up wearing each other's.
+#
+# One way in rather than the desktop's two — there is no native file dialog on a
+# web page, so the browser's own picker is the only picker there is.
+@app.post("/api/brand/logo")
+async def upload_logo(file: UploadFile = File(...), user: str = Depends(auth.current_user)):
+    """Take a logo the customer picked or dropped."""
+    name = os.path.basename(file.filename or "logo.png")
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in brand.ALLOWED:
+        raise HTTPException(400, f"{ext or 'That'} is not an image we can use. Choose a PNG.")
+
+    root = user_root(user)
+    folder = brand.logo_dir(root)
+    os.makedirs(folder, exist_ok=True)
+    staged = os.path.join(folder, f"_upload{ext}")
+    path = ""
+    try:
+        with open(staged, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                out.write(chunk)
+        path = brand.store_logo(root, staged)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"Couldn't save the logo: {e}")
+    finally:
+        await file.close()
+        # store_logo copies rather than moves, and clears its folder of anything
+        # else named logo* — the staging file is neither, so it is ours to remove.
+        if os.path.exists(staged) and os.path.abspath(staged) != os.path.abspath(path or ""):
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
+
+    cfg = load_user_config(user)
+    cfg["brand_logo"] = path
+    # Choosing a logo is the act of wanting it used. A separate switch afterwards
+    # has one outcome: wondering why the logo is not showing up.
+    cfg["brand_enabled"] = True
+    save_user_config(user, cfg)
+    return {"ok": True, "brand": brand.settings(cfg)}
+
+
+@app.delete("/api/brand/logo")
+def clear_logo(user: str = Depends(auth.current_user)):
+    """Forget the logo. The file goes too — it is ours and nothing else uses it."""
+    cfg = load_user_config(user)
+    path = cfg.get("brand_logo", "")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    cfg["brand_logo"] = ""
+    cfg["brand_enabled"] = False
+    save_user_config(user, cfg)
+    return {"ok": True, "brand": brand.settings(cfg)}
+
+
+@app.get("/api/brand/logo")
+def get_logo(user: str = Depends(auth.current_user)):
+    """The logo itself, so the preview can show the real thing.
+
+    Read out of this user's own config, so the path can only ever be one this
+    account stored — a request cannot name somebody else's file.
+    """
+    logo = brand.settings(load_user_config(user))
+    if not logo["path"] or not os.path.isfile(logo["path"]):
+        raise HTTPException(404, "No logo is set.")
+    return FileResponse(logo["path"])
 
 @app.post("/api/config")
 def set_config(body: ConfigBody, user: str = Depends(auth.current_user)):
@@ -864,6 +1004,11 @@ def set_config(body: ConfigBody, user: str = Depends(auth.current_user)):
         cfg["default_caption_style"] = body.default_caption_style.strip()
     if body.default_caption_font is not None:
         cfg["default_caption_font"] = body.default_caption_font.strip()
+    for field in ("brand_enabled", "brand_position", "brand_scale_pct",
+                  "brand_opacity", "brand_x", "brand_y"):
+        value = getattr(body, field)
+        if value is not None:
+            cfg[field] = value.strip() if isinstance(value, str) else value
     if body.default_reframe is not None:
         cfg["default_reframe"] = body.default_reframe.strip()
     if body.default_ratio is not None:
@@ -1501,6 +1646,10 @@ class EditBody(BaseModel):
     effects: EffectsOpts = EffectsOpts()
     overlays: list[OverlayOpts] = Field(default_factory=list)
     broll: list[BrollOpts] = Field(default_factory=list)
+    # Whether this clip carries the logo from Settings. True is the setting's
+    # own answer; False is this one clip opting out, because some clips are
+    # not for the channel.
+    brand: bool = True
 
 
 class AiEditBody(BaseModel):

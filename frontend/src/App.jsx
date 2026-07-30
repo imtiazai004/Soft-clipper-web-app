@@ -19,6 +19,15 @@ const CAPTION_STYLES = ['TikTok Bold', 'Clean White', 'Yellow Pop', 'Neon', 'Bou
 // in before there was a choice, and still the default.
 const CAPTION_FONTS = [{ name: 'System', label: 'System default', note: '', rtl: false, present: true }]
 
+// Mirrors core/brand.py POSITIONS — the preview has to put the logo exactly
+// where the renderer will, and a round trip to ask would make the nine corner
+// buttons feel laggy for values that never change.
+const POSITION_FRACTIONS = {
+  'top-left': [0.04, 0.04], top: [0.5, 0.04], 'top-right': [0.96, 0.04],
+  left: [0.04, 0.5], centre: [0.5, 0.5], right: [0.96, 0.5],
+  'bottom-left': [0.04, 0.96], bottom: [0.5, 0.96], 'bottom-right': [0.96, 0.96],
+}
+
 // Mirrors core/silence.py LENGTHS
 const SPLIT_LENGTHS = [30, 45, 60, 90, 120]
 
@@ -137,6 +146,11 @@ export default function App() {
   // The typeface captions are burnt in. 'System' is Arial — what every clip
   // rendered before this existed, so leaving it alone changes nothing.
   const [capFont, setCapFont] = useState('System')
+  // The brand kit as the server reports it — see core/brand.py. `brandOn` is
+  // this session's switch over it, so a clip that is not for the channel can
+  // skip the logo without unsetting it for everything else.
+  const [brand, setBrand] = useState(null)
+  const [brandOn, setBrandOn] = useState(true)
   const [capHighlight, setCapHighlight] = useState(false)
   const [wordsPerLine, setWordsPerLine] = useState(4)
   // null = wherever captions have always gone. Set only once someone drags the
@@ -221,6 +235,10 @@ export default function App() {
     facecam: { corner: facecamCorner },
     effects,
     overlays: overlays.map(({ text, x, y, size, color }) => ({ text, x, y, size, color })),
+    // Whether the logo from Settings goes on these clips. The switch is only
+    // shown once a logo exists, so for everyone else this is a constant true
+    // that the backend ignores because no logo is set.
+    brand: brandOn,
   }
 
   useEffect(() => {
@@ -234,6 +252,7 @@ export default function App() {
         captionStyles: c.caption_styles || CAPTION_STYLES,
         captionStyleDetails: c.caption_style_details || [],
         captionFonts: c.caption_fonts || CAPTION_FONTS,
+        brandPositions: c.brand_positions || Object.keys(POSITION_FRACTIONS),
         defaults: {
           caption_style: c.default_caption_style,
           caption_font: c.default_caption_font,
@@ -244,6 +263,7 @@ export default function App() {
       })
       if (c.default_caption_style) setCapStyle(c.default_caption_style)
       if (c.default_caption_font) setCapFont(c.default_caption_font)
+      if (c.brand) setBrand(c.brand)
       if (c.default_reframe) setReframeMode(c.default_reframe)
       if (c.default_ratio !== undefined) setRatio(c.default_ratio || null)
       // Used before the Qualities button has been pressed, so a download started
@@ -548,6 +568,21 @@ export default function App() {
             ))}
           </div>
         </div>
+
+        {/* Only once a logo exists. A switch for a thing nobody has set up is
+            a question with no answer. */}
+        {brand?.enabled && (
+          <div className="sidebar-section">
+            <span className="sec-title">🏷️ Your logo</span>
+            <div className="side-row">
+              <span className="lbl-inline">Stamp on these clips</span>
+              <label className="switch">
+                <input type="checkbox" checked={brandOn} onChange={(e) => setBrandOn(e.target.checked)} />
+                <span className="track" />
+              </label>
+            </div>
+          </div>
+        )}
 
         <div className="sidebar-section">
           <span className="sec-title">💬 Captions</span>
@@ -1026,6 +1061,8 @@ export default function App() {
           multiUser={multiUser}
           initialProxy={proxy}
           initialCookiesBrowser={cookiesBrowser}
+          initialBrand={brand}
+          onBrandChange={setBrand}
           initialCookiesFile={cookiesFile}
           shell={shell}
           initialStockKeys={stockKeys}
@@ -2204,13 +2241,170 @@ function UpdatesPanel({ version, onError }) {
   )
 }
 
+/** The customer's own logo, on every clip they export.
+ *
+ *  Not ours — nothing this app produces carries Soft Clipper branding. What this
+ *  replaces is opening thirty finished clips again in Canva to drop the same
+ *  logo in the same corner.
+ *
+ *  It shows the real image at the real size against a 9:16 frame, because every
+ *  control here is a number whose meaning is "how it looks", and a slider marked
+ *  12% tells you nothing about that.
+ */
+function BrandKit({ brand, positions, onChange, onError }) {
+  const [busy, setBusy] = useState(false)
+  const [bust, setBust] = useState(Date.now())
+  const fileRef = useRef(null)
+  const b = brand || {}
+
+  async function send(path, init) {
+    setBusy(true)
+    try {
+      const r = await fetch(path, init)
+      const body = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(body.error || body.detail || 'That did not work')
+      setBust(Date.now())
+      onChange(body.brand)
+    } catch (e) {
+      onError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function choose() {
+    // The browser's own picker, and only that: a web page has no native file
+    // dialog to reach for, which is the one place this differs from the desktop
+    // app's copy of this component.
+    fileRef.current?.click()
+  }
+
+  async function upload(file) {
+    if (!file) return
+    const form = new FormData()
+    form.append('file', file)
+    await send('/api/brand/logo', { method: 'POST', body: form })
+  }
+
+  function set(patch) {
+    const next = { ...b, ...patch }
+    onChange(next)
+    // Saved as it is dragged rather than behind a separate button, because these
+    // are judged by looking and nobody wants to press Save between nudges.
+    api.post('/api/config', {
+      brand_enabled: next.enabled,
+      brand_position: next.position,
+      brand_scale_pct: next.scale_pct,
+      brand_opacity: next.opacity,
+      brand_x: next.x,
+      brand_y: next.y,
+    }).catch((e) => onError(e.message))
+  }
+
+  return (
+    <div className="brand-kit">
+      <input ref={fileRef} type="file" accept="image/*" style={{ display: 'none' }}
+        onChange={(e) => upload(e.target.files?.[0])} />
+
+      {!b.path ? (
+        <div className="row">
+          <button className="btn" onClick={choose} disabled={busy}>
+            {busy ? 'Saving…' : '🖼️ Choose a logo'}
+          </button>
+          <span className="hint-sm" style={{ margin: 0 }}>
+            A PNG with a transparent background looks best.
+          </span>
+        </div>
+      ) : (
+        <>
+          <div className="row">
+            <div className="side-row grow">
+              <span className="lbl-inline">Put it on every clip</span>
+              <label className="switch">
+                <input type="checkbox" checked={!!b.enabled}
+                  onChange={(e) => set({ enabled: e.target.checked })} />
+                <span className="track" />
+              </label>
+            </div>
+            <button className="btn sm" onClick={choose} disabled={busy}>Change</button>
+            <button className="btn sm danger" disabled={busy}
+              onClick={() => send('/api/brand/logo', { method: 'DELETE' })}>Remove</button>
+          </div>
+
+          <div className="brand-body">
+            <div className="brand-frame">
+              <img
+                src={`/api/brand/logo?t=${bust}`}
+                alt="Your logo"
+                style={{
+                  width: `${b.scale_pct}%`,
+                  opacity: b.opacity,
+                  left: `${(b.x ?? 0.96) * 100}%`,
+                  top: `${(b.y ?? 0.04) * 100}%`,
+                  // The same maths the renderer uses: the fraction is of the free
+                  // space, so 1 is flush right rather than hanging off the edge.
+                  transform: `translate(${-(b.x ?? 0.96) * 100}%, ${-(b.y ?? 0.04) * 100}%)`,
+                }}
+              />
+            </div>
+
+            <div className="brand-controls">
+              <label className="lbl">POSITION</label>
+              <div className="brand-grid">
+                {(positions || Object.keys(POSITION_FRACTIONS)).map((name) => (
+                  <button
+                    key={name}
+                    className={`brand-cell ${b.position === name ? 'active' : ''}`}
+                    title={name.replace('-', ' ')}
+                    onClick={() => {
+                      const at = POSITION_FRACTIONS[name] || [0.96, 0.04]
+                      set({ position: name, x: at[0], y: at[1] })
+                    }}
+                  />
+                ))}
+              </div>
+
+              <div className="side-row mt">
+                <span className="lbl-inline">Size</span>
+                <span className="side-val">{b.scale_pct}%</span>
+              </div>
+              <input type="range" min={2} max={60} value={b.scale_pct ?? 12}
+                onChange={(e) => set({ scale_pct: +e.target.value })} />
+
+              <div className="side-row">
+                <span className="lbl-inline">Opacity</span>
+                <span className="side-val">{Math.round((b.opacity ?? 0.85) * 100)}%</span>
+              </div>
+              <input type="range" min={5} max={100} value={Math.round((b.opacity ?? 0.85) * 100)}
+                onChange={(e) => set({ opacity: +e.target.value / 100 })} />
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCookiesBrowser, initialCookiesFile,
-                        shell, initialStockKeys, onClose, onSaved, onError }) {
+                        shell, initialStockKeys, initialBrand, onBrandChange,
+                        onClose, onSaved, onError }) {
   const [key, setKey] = useState('')
   const [pexelsKey, setPexelsKey] = useState('')
   const [pixabayKey, setPixabayKey] = useState('')
   const [defStyle, setDefStyle] = useState(shell?.defaults?.caption_style || 'TikTok Bold')
   const [defFont, setDefFont] = useState(shell?.defaults?.caption_font || 'System')
+  // Saved as it is changed rather than on Save, so it is handed back up on
+  // every edit instead of riding along with the rest of the form.
+  //
+  // Told directly rather than through an effect on brandCfg. The effect
+  // version had to either list onBrandChange as a dependency — and fire again
+  // every time the parent re-rendered and handed down a new function — or lie
+  // about its dependencies.
+  const [brandCfg, setBrandCfgState] = useState(initialBrand)
+  function setBrandCfg(next) {
+    setBrandCfgState(next)
+    onBrandChange?.(next)
+  }
   const [defReframe, setDefReframe] = useState(shell?.defaults?.reframe || 'smart')
   const [defRatio, setDefRatio] = useState(shell?.defaults?.ratio ?? '9:16')
   const [defQuality, setDefQuality] = useState(shell?.defaults?.quality || '1080p')
@@ -2328,6 +2522,19 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
           value={cookiesFile} onChange={(e) => setCookiesFile(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && save()} />
         </>)}
+
+        <h3 style={{ marginTop: 18 }}>🏷️ Brand kit</h3>
+        <p>
+          Your own logo on every clip you export, so you are not opening each one
+          again somewhere else to add it. Nothing Soft Clipper makes carries our
+          branding — this is yours.
+        </p>
+        <BrandKit
+          brand={brandCfg}
+          positions={shell?.brandPositions}
+          onChange={setBrandCfg}
+          onError={onError}
+        />
 
         <h3 style={{ marginTop: 18 }}>⭐ Defaults for new clips</h3>
         <p>
