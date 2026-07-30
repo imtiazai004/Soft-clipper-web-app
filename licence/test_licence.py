@@ -596,3 +596,20 @@ def test_the_admin_view_warns_when_the_checkout_is_a_test_link():
 	_save({"price": {"checkoutUrl": ""}})
 	warnings = " ".join(client.get("/api/admin/settings", headers=ADMIN).json()["warnings"])
 	assert "nobody can buy" in warnings
+
+
+def test_the_mac_download_cannot_be_published_without_a_link():
+	"""Turning Mac on publishes the download button, the install guide and the
+	sitemap entry together. Doing that with no URL ships a page advertising a
+	platform whose download 404s."""
+	r = _save({"downloads": {"macEnabled": True, "macUrl": ""}})
+	assert r.status_code == 400 and "Mac" in r.json()["error"]
+
+	assert _save({
+		"downloads": {"macEnabled": True, "macUrl": "https://dl.softclipper.pro/Soft-Clipper-macOS.zip"}
+	}).status_code == 200
+	assert client.get("/api/site-config").json()["downloads"]["macEnabled"] is True
+
+
+def test_mac_is_off_until_someone_turns_it_on():
+	assert client.get("/api/site-config").json()["downloads"]["macEnabled"] is False

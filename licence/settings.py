@@ -42,6 +42,20 @@ DEFAULTS: dict = {
 		# Shown in place of the buttons when downloads are off. There is always a
 		# reason, and a page that just hides the button looks broken.
 		"offMessage": "Downloads are paused while we ship an update. Back shortly.",
+		# The Mac build, off until someone has run it on a real Mac.
+		#
+		# CI proves a great deal about it — the suite passes on macOS, a vertical
+		# clip really renders, and the bundled ffmpeg is self-contained and can
+		# burn in subtitles. It cannot prove the app is usable: nobody has yet
+		# clicked through it on a Mac, and nobody has seen what Gatekeeper does
+		# to an unsigned download. Advertising it before that is selling
+		# something we have not opened.
+		#
+		# Flipping this on publishes the download, the Mac install guide and the
+		# platform line together. One switch, so they cannot disagree.
+		"macEnabled": False,
+		"macUrl": "https://dl.softclipper.pro/Soft-Clipper-macOS.zip",
+		"macSize": "95 MB",
 	},
 	"affiliates": {
 		"enabled": True,
@@ -137,10 +151,12 @@ def validate(s: dict):
 		raise Invalid("The checkout link must be a Stripe Payment Link (https://buy.stripe.com/…).")
 
 	downloads = s.get("downloads", {})
-	for field in ("installerUrl", "zipUrl"):
+	for field in ("installerUrl", "zipUrl", "macUrl"):
 		link = downloads.get(field, "")
 		if link and not link.startswith("https://"):
 			raise Invalid(f"{field} must be an https:// link.")
+	if downloads.get("macEnabled") and not downloads.get("macUrl"):
+		raise Invalid("Turning on the Mac download needs a link to the Mac build.")
 
 	aff = s.get("affiliates", {})
 	rate = aff.get("ratePct")
@@ -188,6 +204,9 @@ def public() -> dict:
 			"zipUrl": downloads["zipUrl"],
 			"zipSize": downloads["zipSize"],
 			"offMessage": downloads["offMessage"],
+			"macEnabled": bool(downloads["macEnabled"]),
+			"macUrl": downloads["macUrl"],
+			"macSize": downloads["macSize"],
 		},
 		"affiliates": {"enabled": bool(aff["enabled"]), "ratePct": aff["ratePct"], "holdDays": aff["holdDays"]},
 		"notice": notice if notice.get("enabled") else {"enabled": False, "text": "", "tone": "info"},

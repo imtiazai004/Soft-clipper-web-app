@@ -290,6 +290,28 @@
 			<span>Shown instead of the buttons when downloads are off</span>
 			<input id="setDlOff" class="grow">
 		</label>
+
+		<hr style="border:0;border-top:1px solid var(--line);margin:18px 0">
+		<label class="check">
+			<input id="setMacEnabled" type="checkbox">
+			<span>Sell for macOS — publishes the download, the Mac install guide and every mention of it</span>
+		</label>
+		<div class="row" style="margin-top:12px">
+			<label class="field grow">
+				<span>macOS build URL</span>
+				<input id="setMacUrl">
+			</label>
+			<label class="field" style="max-width:130px">
+				<span>Size</span>
+				<input id="setMacSize">
+			</label>
+		</div>
+		<p class="hint">
+			The Mac build is Apple Silicon only and is not signed by Apple, so the first launch
+			shows a security warning the customer has to click past. CI proves the app runs and
+			renders on macOS; it cannot prove the app is pleasant to use. Open it on a real Mac
+			once before turning this on.
+		</p>
 		<p class="hint">
 			Switching downloads off also hides the buy link on that page. Selling a licence
 			for software nobody can install is how a refund starts.
@@ -848,6 +870,9 @@ function fillSettings(s) {
 	$("setZip").value = s.downloads.zipUrl;
 	$("setZipSize").value = s.downloads.zipSize;
 	$("setDlOff").value = s.downloads.offMessage;
+	$("setMacEnabled").checked = !!s.downloads.macEnabled;
+	$("setMacUrl").value = s.downloads.macUrl;
+	$("setMacSize").value = s.downloads.macSize;
 	$("setAffEnabled").checked = !!s.affiliates.enabled;
 	$("setAffRate").value = s.affiliates.ratePct;
 	$("setAffHold").value = s.affiliates.holdDays;
@@ -887,6 +912,9 @@ function collectSettings() {
 			zipUrl: $("setZip").value.trim(),
 			zipSize: $("setZipSize").value.trim(),
 			offMessage: $("setDlOff").value.trim(),
+			macEnabled: $("setMacEnabled").checked,
+			macUrl: $("setMacUrl").value.trim(),
+			macSize: $("setMacSize").value.trim(),
 		},
 		affiliates: {
 			enabled: $("setAffEnabled").checked,
