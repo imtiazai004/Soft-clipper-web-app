@@ -493,3 +493,55 @@ input[type='range'] { accent-color: var(--accent-1); width: 100%; }
 /* editor Source | Result toggle */
 .seg-toggle { display: inline-flex; gap: 4px; }
 .seg-toggle .tab { font-size: 12.5px; padding: 4px 10px; }
+
+/* caption placement handle — reads as a control, not as burnt-in text, because
+   it is showing *where* the captions land, not what they will look like */
+.cap-chip {
+  font-size: 12px; font-weight: 700; color: #fff;
+  background: rgba(139, 92, 246, 0.82); border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 8px; padding: 3px 8px; text-shadow: none;
+}
+
+/* connection tests */
+.test-ok { color: #34d399; font-size: 12.5px; }
+.test-bad { color: #f87171; font-size: 12.5px; }
+
+/* projects library */
+.proj-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; margin-top: 12px; }
+.proj-card {
+  background: rgba(0, 0, 0, 0.3); border: 1px solid var(--border);
+  border-radius: 14px; overflow: hidden;
+}
+.proj-card.active { border-color: var(--a1); }
+.proj-card img { width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; display: block; }
+.proj-card .body { padding: 10px 12px 12px; }
+.proj-card .name { font-weight: 700; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.proj-card .size { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.proj-noimg { aspect-ratio: 16/9; display: grid; place-items: center; font-size: 30px; background: #000; }
+
+/* B-roll picker */
+.broll-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 10px; }
+.broll-item {
+  position: relative; padding: 0; border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; background: #000; cursor: pointer; color: #fff;
+}
+.broll-item:hover { border-color: var(--a1); }
+.broll-item img { width: 100%; aspect-ratio: 16/9; object-fit: cover; display: block; }
+.broll-item span {
+  position: absolute; right: 5px; bottom: 5px; font-size: 11px; font-weight: 700;
+  background: rgba(0, 0, 0, 0.65); border-radius: 6px; padding: 1px 6px;
+}
+.broll-row {
+  display: flex; gap: 10px; align-items: flex-start;
+  border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; margin-top: 10px;
+}
+.broll-row .name { font-size: 12.5px; font-weight: 700; margin-bottom: 6px; }
+
+/* first-run wizard */
+.wiz-steps { display: flex; gap: 8px; flex-wrap: wrap; }
+.wiz-step {
+  font-size: 12px; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.wiz-step.active { border-color: var(--a1); color: var(--text); }
+.wiz-step.done { opacity: 0.6; }

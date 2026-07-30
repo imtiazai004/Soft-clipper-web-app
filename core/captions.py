@@ -289,7 +289,53 @@ def _clamp01(v) -> float:
         return 0.5
 
 
-def _karaoke_lines(chunk: list[str], start: float, duration: float, st: dict) -> list[str]:
+def caption_anchor(position: dict | None, play_x: int, play_y: int = 288) -> str:
+	"""The ASS tag that places a caption chunk.
+
+	Without a position this returns exactly what it always returned — `\\an2`,
+	bottom-centre, sitting on the Default style's own MarginV. That matters: every
+	clip already rendered, and every saved clip record, has no position, and all
+	of them must keep looking the way the customer approved.
+
+	With one, the chunk is anchored on its centre (`\\an5`) at an explicit point,
+	which is what lets someone drag the captions off the speaker's chin.
+	"""
+	if not position:
+		return "\\an2"
+	x = position.get("x")
+	y = position.get("y")
+	if x is None and y is None:
+		return "\\an2"
+	px = int(_clamp01(0.5 if x is None else x) * play_x)
+	py = int(_clamp01(0.82 if y is None else y) * play_y)
+	return f"\\an5\\pos({px},{py})"
+
+
+def apply_overrides(text: str, overrides: dict | None) -> str:
+	"""Fix words the transcriber got wrong, everywhere they appear.
+
+	Names, brands and jargon are what speech models miss, and they are exactly
+	the words a clip is about — "Klap" for "clip", a person's surname, a product
+	name. Re-transcribing to fix one word is absurd; this is a find-and-replace
+	the customer controls, applied at burn-in time so nothing is destroyed.
+
+	Whole words only, and case-insensitive: replacing inside words would turn
+	"application" into "apclipation" the moment someone corrected "app".
+	"""
+	if not overrides:
+		return text
+	for wrong, right in overrides.items():
+		wrong = str(wrong or "").strip()
+		if not wrong:
+			continue
+		text = re.sub(rf"\b{re.escape(wrong)}\b", str(right or ""), text, flags=re.IGNORECASE)
+	# A replacement with an empty right-hand side is how you delete a filler
+	# word, which leaves a double space behind.
+	return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _karaoke_lines(chunk: list[str], start: float, duration: float, st: dict,
+                   anchor: str = "\\an2") -> list[str]:
     """One line per word, with the spoken word coloured.
 
     ASS has a \\k karaoke tag, but how it renders depends on the player and
@@ -322,7 +368,7 @@ def _karaoke_lines(chunk: list[str], start: float, duration: float, st: dict) ->
                 parts.append(text)
         lines.append(
             f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + word_dur)},Default,,0,0,0,,"
-            f"{{\\an2}}{' '.join(parts)}"
+            f"{{{anchor}}}{' '.join(parts)}"
         )
         t += word_dur
     return lines
@@ -339,12 +385,17 @@ def build_ass(
     overlays: list[dict] | None = None,
     highlight: bool = False,
     ratio: str | None = "9:16",
+    position: dict | None = None,
+    overrides: dict | None = None,
 ) -> str | None:
     """Write an ASS file from clip-relative caption segments, a headline, overlays.
 
     headline: {"text", "style": plain|box, "position": top|bottom, "size": int}
     overlays: [{"text", "x", "y", "size", "color"}] — placed text, x/y are 0..1.
     clip_duration: how long the headline / overlays stay on screen (whole clip).
+    position: {"x", "y"} as 0..1 of the frame — where the captions sit. None keeps
+      the bottom-centre placement every earlier clip was rendered with.
+    overrides: {"wrong": "right"} word fixes applied to the caption text.
     Returns the path, or None when there is nothing to burn in.
     """
     st = caption_style(style)
@@ -362,8 +413,11 @@ def build_ass(
     # How much text fits on one line at this style's size, on this canvas.
     budget = line_budget(st["fontsize"], play_x)
 
+    # Worked out once, not per chunk: it is the same tag for every line.
+    anchor = caption_anchor(position, play_x)
+
     for seg in segments or []:
-        text = seg["text"].strip()
+        text = apply_overrides(seg["text"].strip(), overrides)
         if not text:
             continue
         words = text.split()
@@ -380,13 +434,13 @@ def build_ass(
             chunk_dur = seg_dur * (chunk_chars / total_chars)
 
             if highlight:
-                lines.extend(_karaoke_lines(chunk, t, chunk_dur, st))
+                lines.extend(_karaoke_lines(chunk, t, chunk_dur, st, anchor))
             else:
-                # \an2 = bottom-center anchor
+                # \an2 = bottom-center anchor, unless a position was placed
                 chunk_text = _ass_text(" ".join(chunk).upper())
                 lines.append(
                     f"Dialogue: 0,{_ass_time(t)},{_ass_time(t + chunk_dur)},Default,,0,0,0,,"
-                    f"{{\\an2}}{chunk_text}"
+                    f"{{{anchor}}}{chunk_text}"
                 )
             t += chunk_dur
 

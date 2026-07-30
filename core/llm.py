@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from . import utils
@@ -90,6 +91,105 @@ def settings() -> dict:
 
 def is_gemini() -> bool:
 	return settings()["provider"] == "gemini"
+
+
+# Google's own endpoint, used only to check a key and list what it can reach.
+GEMINI_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Short on purpose: this runs while someone watches a spinner in Settings, and
+# "cannot reach it" after eight seconds is a more useful answer than a hang.
+TEST_TIMEOUT = 8
+
+
+def _proxy_opener():
+	"""Honour the configured proxy, the same way the downloader does.
+
+	Without this, the customer whose ISP blocks the AI provider gets "key
+	rejected" from a test that never left the building — the worst possible
+	message, because it sends them to change a key that was fine.
+	"""
+	proxy = str(utils.load_config().get("proxy", "")).strip()
+	if proxy:
+		return urllib.request.build_opener(
+			urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+		)
+	return urllib.request.build_opener()
+
+
+def test(provider: str = "", key: str = "", base_url: str = "", model: str = "") -> dict:
+	"""Check a provider answers, before a 40-minute job finds out it does not.
+
+	Everything is optional and falls back to what is saved, so Settings can test
+	either the values in the form or the ones already stored. Returns
+	{"ok", "message", "models": [...]} and never raises: a failed test is an
+	answer, not an exception.
+
+	The model list is the quiet win here. Ollama and LM Studio users guess model
+	names — "llama3.1" versus "llama3.1:8b" — and a 404 from a job an hour later
+	is a terrible way to learn which one they pulled.
+	"""
+	saved = settings()
+	provider = (provider or saved["provider"]).strip()
+	preset = PROVIDERS.get(provider)
+	if not preset:
+		return {"ok": False, "message": f"Unknown provider: {provider}", "models": []}
+
+	# An empty key means "use the saved one" — the front end never receives the
+	# stored key, so it cannot send it back.
+	key = key.strip() or (saved["key"] if provider == saved["provider"] else "")
+	base_url = (base_url.strip() or preset["base_url"]).rstrip("/")
+	model = model.strip() or preset["model"]
+	label = preset["label"]
+
+	if preset["needs_key"] and not key:
+		return {"ok": False, "message": f"{label} needs an API key.", "models": []}
+
+	if provider == "gemini":
+		url = f"{GEMINI_MODELS_URL}?key={urllib.parse.quote(key)}&pageSize=200"
+		req = urllib.request.Request(url)
+	else:
+		req = urllib.request.Request(
+			f"{base_url}/models",
+			headers={"Authorization": f"Bearer {key or 'not-needed'}"},
+		)
+
+	try:
+		with _proxy_opener().open(req, timeout=TEST_TIMEOUT) as resp:
+			payload = json.loads(resp.read())
+	except urllib.error.HTTPError as exc:
+		if exc.code in (400, 401, 403):
+			return {"ok": False, "message": f"{label} rejected that key.", "models": []}
+		return {"ok": False, "message": f"{label} returned an error ({exc.code}).", "models": []}
+	except (urllib.error.URLError, TimeoutError, OSError) as exc:
+		if preset["local"]:
+			return {
+				"ok": False,
+				"models": [],
+				"message": f"Could not reach {label} at {base_url}. Is it running?",
+			}
+		return {"ok": False, "message": f"Could not reach {label}: {exc}", "models": []}
+	except Exception as exc:
+		return {"ok": False, "message": f"{label} sent a reply we could not read: {exc}", "models": []}
+
+	models = _model_names(provider, payload)
+	message = f"Connected to {label}."
+	# Only a warning: providers alias and version model names constantly, and
+	# refusing to save over a name we simply did not recognise would be worse
+	# than letting the customer proceed.
+	if models and model and not any(model in m for m in models):
+		message += f" Note: '{model}' is not in its model list."
+	return {"ok": True, "message": message, "models": models[:200]}
+
+
+def _model_names(provider: str, payload: dict) -> list[str]:
+	if provider == "gemini":
+		# "models/gemini-2.5-flash" -> "gemini-2.5-flash"
+		return sorted(
+			str(m.get("name", "")).split("/")[-1]
+			for m in payload.get("models", [])
+			if m.get("name")
+		)
+	return sorted(str(m.get("id", "")) for m in payload.get("data", []) if m.get("id"))
 
 
 def _extract_json(text: str):

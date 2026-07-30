@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, cancelJob, runJob, secToMMSS, secToClock, mmssToSec } from './api'
+import { api, cancelJob, del, runJob, secToMMSS, secToClock, mmssToSec } from './api'
 
 const RATIOS = [
   { id: '9:16', label: '9:16 TikTok' },
@@ -36,6 +36,24 @@ const RATIO_AR = { '9:16': 9 / 16, '1:1': 1, '16:9': 16 / 9 }
 const FRAME = 1 / 30   // one frame step at 30fps — fine for trimming by eye
 
 const clamp01 = (v) => Math.max(0, Math.min(1, v))
+
+// Where the captions sit when nobody has moved them: bottom-centre, matching
+// core/captions.py's own default. Kept as a constant so "Reset" and the preview
+// chip agree on what "default" means.
+const DEFAULT_CAPTION_POS = { x: 0.5, y: 0.84 }
+
+// B-roll insert modes — mirrors core/broll.py MODES.
+const BROLL_MODES = [
+  { id: 'cutaway', label: '🎬 Cutaway', hint: 'Fills the frame, your audio keeps playing' },
+  { id: 'pip', label: '🖼️ Corner', hint: 'Small box in the top corner' },
+]
+
+// [{from, to}] rows from the UI -> the {"wrong": "right"} map the API takes.
+// Blank `from` rows are dropped: a half-typed row must not replace every word.
+const fixesToMap = (rows) =>
+  Object.fromEntries((rows || [])
+    .filter((r) => (r.from || '').trim())
+    .map((r) => [r.from.trim(), (r.to || '').trim()]))
 
 // Look presets — labels for the editor, plus a CSS approximation of what ffmpeg
 // bakes on export. The keys must match core/effects.py LOOKS; the CSS is only a
@@ -109,6 +127,11 @@ export default function App() {
   const [capStyle, setCapStyle] = useState('TikTok Bold')
   const [capHighlight, setCapHighlight] = useState(false)
   const [wordsPerLine, setWordsPerLine] = useState(4)
+  // null = wherever captions have always gone. Set only once someone drags the
+  // preview chip, so nothing renders differently until they ask for it.
+  const [capPos, setCapPos] = useState(null)
+  // [{from, to}] word fixes for names and jargon the transcriber mangled.
+  const [capFixes, setCapFixes] = useState([])
   const [headlineOn, setHeadlineOn] = useState(false)
   const [headlineText, setHeadlineText] = useState('')
   const [headlineStyle, setHeadlineStyle] = useState('box')
@@ -147,6 +170,14 @@ export default function App() {
   // results
   const [clips, setClips] = useState([])
   const [editing, setEditing] = useState(null)   // clip index being edited
+  const [brolling, setBrolling] = useState(null) // clip index getting B-roll
+
+  // projects, transcript, stock footage
+  const [showProjects, setShowProjects] = useState(false)
+  const [activeProject, setActiveProject] = useState(null)
+  const [hasTranscript, setHasTranscript] = useState(false)
+  const [stockKeys, setStockKeys] = useState({ pexels: false, pixabay: false })
+  const [shell, setShell] = useState({ version: '', captionStyles: CAPTION_STYLES })
 
   const busy = !!job
   // one-line summary of the active global look, shown on the collapsed panel
@@ -157,7 +188,13 @@ export default function App() {
     (effects.brightness !== 0 || effects.contrast !== 1 || effects.saturation !== 1) && 'Adjusted',
     overlays.length > 0 && `${overlays.length} text`,
   ].filter(Boolean).join(' · ')
-  const captionOpts = { enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine, highlight: capHighlight }
+  const captionOpts = {
+    enabled: captionsOn, style: capStyle, words_per_line: wordsPerLine, highlight: capHighlight,
+    // x/y stay null unless the chip was dragged — the backend reads null as
+    // "leave the captions where they were".
+    x: capPos ? capPos.x : null, y: capPos ? capPos.y : null,
+    overrides: fixesToMap(capFixes),
+  }
   const headlineOpts = {
     enabled: headlineOn, text: headlineText, style: headlineStyle,
     position: headlinePos, size: headlineSize,
@@ -176,9 +213,28 @@ export default function App() {
       setHasKey(c.has_key); setKeyPreview(c.key_preview); setPackaged(!!c.packaged)
       setMultiUser(!!c.multi_user)
       setProxy(c.proxy || ''); setCookiesBrowser(c.cookies_browser || ''); setCookiesFile(c.cookies_file || '')
+      setStockKeys({ pexels: !!c.has_pexels_key, pixabay: !!c.has_pixabay_key })
+      setShell({
+        version: c.version || '',
+        captionStyles: c.caption_styles || CAPTION_STYLES,
+        defaults: {
+          caption_style: c.default_caption_style,
+          reframe: c.default_reframe,
+          ratio: c.default_ratio,
+          quality: c.default_export_quality,
+        },
+      })
+      if (c.default_caption_style) setCapStyle(c.default_caption_style)
+      if (c.default_reframe) setReframeMode(c.default_reframe)
+      if (c.default_ratio !== undefined) setRatio(c.default_ratio || null)
+      // Used before the Qualities button has been pressed, so a download started
+      // straight from a pasted link honours the setting too.
+      if (c.default_export_quality) setQuality(c.default_export_quality)
     }).catch(() => {})
     api.get('/api/video').then((v) => { if (v.loaded) setVideo(v) }).catch(() => {})
     api.get('/api/clips').then((r) => setClips(r.clips || [])).catch(() => {})
+    api.get('/api/transcript').then((t) => setHasTranscript(!!t.count)).catch(() => {})
+    api.get('/api/projects').then((r) => setActiveProject(r.active || null)).catch(() => {})
   }, [])
 
   function err(text) { setToast({ text, ok: false }); setTimeout(() => setToast(null), 6000) }
@@ -276,6 +332,54 @@ export default function App() {
     })
   }
 
+  /** Whether the transcript export links should be offered. */
+  function refreshTranscript() {
+    api.get('/api/transcript').then((t) => setHasTranscript(!!t.count)).catch(() => {})
+  }
+
+  /** Load a saved project back in: source, transcript, clips and their settings. */
+  async function openProject(id) {
+    try {
+      setJob({ message: 'Opening project...', progress: 0.4 })
+      const r = await api.post(`/api/projects/${id}/open`, {})
+      const v = await api.get('/api/video')
+      setVideo(v.loaded ? { ...v, stream_url: `/api/video/stream?t=${Date.now()}` } : null)
+      setClips(r.clips || [])
+      setMoments([]); setSelected(new Set())
+      setHasTranscript(!!r.has_transcript)
+      setActiveProject(id)
+      setShowProjects(false)
+      if (r.source_missing) {
+        // The clips and the transcript are still usable; only re-cutting is not.
+        err('The original video file is gone, so new clips cannot be cut. Your finished clips are still here.')
+      } else ok('Project opened')
+    } catch (e) { err(e.message) } finally { setJob(null) }
+  }
+
+  /** Re-render one clip with its B-roll list, through the normal edit path. */
+  function applyBroll(index, inserts) {
+    const c = clips[index]
+    if (!c?.render) return err('This clip cannot be edited')
+    setBrolling(null)
+    const r = c.render
+    exec(api.post('/api/jobs/edit', {
+      index,
+      name: c.name,
+      segments: r.segments,
+      ratio: r.ratio,
+      reframe: r.reframe,
+      captions: r.captions,
+      headline: r.headline,
+      crop: r.crop,
+      effects: r.effects,
+      overlays: r.overlays || [],
+      broll: inserts,
+    }), (res) => {
+      setClips(res.clips)
+      ok(inserts.length ? 'B-roll added!' : 'B-roll removed')
+    })
+  }
+
   function detect() {
     if (!hasKey) { setShowSettings(true); return err('Set your Gemini API key first') }
     exec(api.post('/api/jobs/detect', {
@@ -283,6 +387,7 @@ export default function App() {
     }), (r) => {
       setMoments(r.moments || [])
       setSelected(new Set((r.moments || []).map((_, i) => i)))
+      refreshTranscript()
       if (!r.moments?.length) err('No moments found — try a different prompt or mode')
     })
   }
@@ -349,6 +454,12 @@ export default function App() {
         <button className="btn sm" onClick={() => setShowSettings(true)}
                 title="API key, download proxy and YouTube cookies">
           {hasKey ? '⚙️ Settings' : '⚠️ Set API Key'}
+        </button>
+
+        {/* Everything you have worked on, still here after closing the tab. */}
+        <button className="btn sm" onClick={() => setShowProjects(true)}
+          title="Your saved videos, transcripts and clips">
+          📁 Projects
         </button>
 
         {packaged && (
@@ -443,6 +554,21 @@ export default function App() {
                 <input type="checkbox" checked={capHighlight}
                   onChange={(e) => setCapHighlight(e.target.checked)} />
               </label>
+
+              <div className="side-row">
+                <span className="lbl-inline">Position</span>
+                {capPos ? (
+                  <button className="btn sm ghost" onClick={() => setCapPos(null)}
+                    title="Put the captions back at the bottom">Reset</button>
+                ) : <span className="side-val">Bottom</span>}
+              </div>
+              <span className="muted small">
+                {video
+                  ? 'Drag the 💬 chip on the video above to move the captions off a face or a logo.'
+                  : 'Load a video, then drag the caption chip on it to place them.'}
+              </span>
+
+              <WordFixes rows={capFixes} setRows={setCapFixes} />
             </>
           )}
         </div>
@@ -577,6 +703,9 @@ export default function App() {
                   effects={effects}
                   overlays={overlays}
                   moveOverlay={moveOverlay}
+                  captionPos={capPos}
+                  captionStyle={capStyle}
+                  onCaptionMove={captionsOn ? ((x, y) => setCapPos({ x, y })) : null}
                 />
                 {reframeMode === 'manual' && (
                   <div className="hint mt">
@@ -756,15 +885,35 @@ export default function App() {
                     <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <span className="step-num">3</span> Generated Clips ({clips.length})
                     </span>
-                    <a className="btn sm" href="/api/clips/zip" download>📦 Download All (ZIP)</a>
+                    <span className="row" style={{ gap: 8 }}>
+                      {hasTranscript && (
+                        <>
+                          {/* Platform captions, not burnt-in ones: an .srt uploaded
+                              next to the video is indexed for search and reads with
+                              the sound off. */}
+                          <a className="btn sm" href="/api/transcript/export?fmt=srt" download>📄 SRT</a>
+                          <a className="btn sm" href="/api/transcript/export?fmt=txt" download>📝 TXT</a>
+                        </>
+                      )}
+                      <a className="btn sm" href="/api/clips/zip" download>📦 Download All (ZIP)</a>
+                    </span>
                   </h2>
                   <div className="clips-grid">
                     {clips.map((c, i) => (
                       <div key={i} className="clip-card">
-                        <video src={c.url} controls preload="metadata" />
+                        {/* poster: the still rendered next to the clip, so the grid
+                            shows the actual frame instead of a black rectangle
+                            until someone presses play */}
+                        <video src={c.url} poster={c.thumb || undefined} controls preload="metadata" />
                         <div className="body">
                           <div className="name">{c.name}</div>
-                          <div className="size">{c.size_mb} MB</div>
+                          <div className="size">
+                            {c.size_mb} MB
+                            {c.render?.broll?.length > 0 && ` · ${c.render.broll.length} B-roll`}
+                          </div>
+                          {c.notes?.length > 0 && (
+                            <div className="muted small">{c.notes[c.notes.length - 1]}</div>
+                          )}
                           {c.meta?.caption && <div className="caption-text">{c.meta.caption}</div>}
                           {c.meta?.hashtags?.length > 0 && (
                             <div className="chips">{c.meta.hashtags.slice(0, 4).map((h, j) => <span key={j} className="chip">{h}</span>)}</div>
@@ -773,6 +922,10 @@ export default function App() {
                             <a className="btn sm grow" style={{ textAlign: 'center', textDecoration: 'none' }} href={c.url} download>⬇ Download</a>
                             {c.render && (
                               <button className="btn sm" title="Fix / edit this clip" onClick={() => setEditing(i)}>✏️</button>
+                            )}
+                            {c.render && (
+                              <button className="btn sm" title="Cut stock footage over this clip"
+                                onClick={() => setBrolling(i)}>🎬</button>
                             )}
                             {(c.meta?.caption || c.meta?.hashtags?.length > 0) && (
                               <button className="btn sm" title="Copy caption + hashtags"
@@ -814,6 +967,29 @@ export default function App() {
         </div>
       )}
 
+      {/* projects library */}
+      {showProjects && (
+        <ProjectsModal
+          activeId={activeProject}
+          onOpen={openProject}
+          onClose={() => setShowProjects(false)}
+          onError={err}
+        />
+      )}
+
+      {/* B-roll for one clip */}
+      {brolling !== null && clips[brolling] && (
+        <BrollModal
+          clip={clips[brolling]}
+          index={brolling}
+          stockKeys={stockKeys}
+          onClose={() => setBrolling(null)}
+          onApply={applyBroll}
+          onError={err}
+          onOpenSettings={() => { setBrolling(null); setShowSettings(true) }}
+        />
+      )}
+
       {/* settings modal */}
       {showSettings && (
         <SettingsModal
@@ -823,8 +999,11 @@ export default function App() {
           initialProxy={proxy}
           initialCookiesBrowser={cookiesBrowser}
           initialCookiesFile={cookiesFile}
+          shell={shell}
+          initialStockKeys={stockKeys}
           onClose={() => setShowSettings(false)}
-          onSaved={({ preview, proxy: savedProxy, cookiesBrowser: savedCB, cookiesFile: savedCF }) => {
+          onSaved={({ preview, proxy: savedProxy, cookiesBrowser: savedCB, cookiesFile: savedCF, stock }) => {
+            if (stock) setStockKeys((v) => ({ ...v, ...stock }))
             if (preview) setKeyPreview(preview)
             setHasKey(true)
             setProxy(savedProxy)
@@ -898,7 +1077,8 @@ function OverlayChip({ ov, onMove }) {
 }
 
 function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFallback,
-                      manual, effects, overlays, moveOverlay, onTimeUpdate, onReady }) {
+                      manual, effects, overlays, moveOverlay, onTimeUpdate, onReady,
+                      captionPos, onCaptionMove, captionStyle }) {
   const [dims, setDims] = useState({ w: 0, h: 0 })
   const stageRef = useRef(null)
   const dragging = useRef(false)
@@ -936,6 +1116,10 @@ function FrameStage({ videoRef, src, ratio, crop, setCrop, headline, headlineFal
   const burnEls = (
     <>
       {headlineEl}
+      {onCaptionMove && (
+        <CaptionChip pos={captionPos || DEFAULT_CAPTION_POS} onMove={onCaptionMove}
+          style={captionStyle} />
+      )}
       {(overlays || []).map((ov) => (
         <OverlayChip key={ov.id} ov={ov} onMove={moveOverlay} />
       ))}
@@ -1422,9 +1606,394 @@ function EditModal({ clip, index, busy, duration, onClose, onManual, onAi }) {
   )
 }
 
+/** The caption placement handle.
+ *
+ *  Captions are burnt in by ffmpeg from real timings, so they cannot be shown on
+ *  the source video as they will appear. What can be shown truthfully is *where*
+ *  they will sit, and that is the thing people need to change — the default
+ *  bottom-centre lands on a chin, a logo, or a platform's own UI often enough
+ *  that "move the captions" is the first request every clipper makes.
+ */
+function CaptionChip({ pos, onMove, style }) {
+  const dragging = useRef(false)
+  function move(e) {
+    const rect = e.currentTarget.offsetParent?.getBoundingClientRect()
+    if (!rect) return
+    onMove(clamp01((e.clientX - rect.left) / rect.width),
+      clamp01((e.clientY - rect.top) / rect.height))
+  }
+  return (
+    <div className="ov-chip cap-chip" title="Drag to place the captions"
+      style={{ left: `${pos.x * 100}%`, top: `${pos.y * 100}%` }}
+      onPointerDown={(e) => {
+        e.stopPropagation()
+        e.currentTarget.setPointerCapture(e.pointerId)
+        dragging.current = true
+        move(e)
+      }}
+      onPointerMove={(e) => { if (dragging.current) { e.stopPropagation(); move(e) } }}
+      onPointerUp={() => { dragging.current = false }}
+      onPointerCancel={() => { dragging.current = false }}
+    >💬 {style || 'Captions'}</div>
+  )
+}
+
+/** Word fixes for the burnt-in captions.
+ *
+ *  Every speech model gets names, brands and jargon wrong, and those are exactly
+ *  the words a clip is *about*. Re-transcribing to fix one of them is absurd, so
+ *  this is a find-and-replace applied at burn-in — the transcript itself is left
+ *  alone, and clearing a row puts the original word straight back.
+ */
+function WordFixes({ rows, setRows }) {
+  const [open, setOpen] = useState(false)
+  const set = (i, patch) => setRows(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)))
+
+  return (
+    <details className="mt" open={open} onToggle={(e) => setOpen(e.target.open)}>
+      <summary className="lbl-inline" style={{ cursor: 'pointer' }}>
+        ✏️ Fix words {rows.length > 0 && <span className="muted">({rows.length})</span>}
+      </summary>
+      <span className="muted small">
+        Got a name or a brand wrong? Replace it everywhere in the captions.
+      </span>
+      {rows.map((r, i) => (
+        <div className="row mt" key={i}>
+          <input className="input" style={{ minWidth: 0 }} placeholder="heard"
+            value={r.from} onChange={(e) => set(i, { from: e.target.value })} />
+          <span className="muted">→</span>
+          <input className="input" style={{ minWidth: 0 }} placeholder="correct"
+            value={r.to} onChange={(e) => set(i, { to: e.target.value })} />
+          <button className="btn sm ghost" title="Remove"
+            onClick={() => setRows(rows.filter((_, j) => j !== i))}>✕</button>
+        </div>
+      ))}
+      <button className="btn sm mt" onClick={() => setRows([...rows, { from: '', to: '' }])}>
+        + Word fix
+      </button>
+    </details>
+  )
+}
+
+/** A Test button that reports in place.
+ *
+ *  The value is entirely in the timing: a wrong key or an unreachable local model
+ *  used to surface as a failed job twenty minutes into a video. Two seconds here
+ *  turns that into a red line next to the field that caused it.
+ */
+function TestRow({ label, onTest }) {
+  const [state, setState] = useState(null)   // {ok, message} | 'busy'
+
+  async function run() {
+    setState('busy')
+    try {
+      const r = await onTest()
+      setState({ ok: !!r.ok, message: r.message || (r.ok ? 'Connected.' : 'Failed.') })
+    } catch (e) {
+      setState({ ok: false, message: e.message })
+    }
+  }
+
+  return (
+    <div className="row mb">
+      <button className="btn sm" onClick={run} disabled={state === 'busy'}>
+        {state === 'busy' ? 'Testing…' : `🔌 ${label}`}
+      </button>
+      {state && state !== 'busy' && (
+        <span className={state.ok ? 'test-ok' : 'test-bad'}>
+          {state.ok ? '✓' : '✕'} {state.message}
+        </span>
+      )}
+    </div>
+  )
+}
+
+/** Everything you have worked on, still here after closing the app. */
+function ProjectsModal({ activeId, onOpen, onClose, onError }) {
+  const [items, setItems] = useState(null)
+  const [confirming, setConfirming] = useState(null)
+
+  const load = () => api.get('/api/projects')
+    .then((r) => setItems(r.projects || []))
+    .catch((e) => { setItems([]); onError(e.message) })
+
+  // Once, when the modal opens. `load` is recreated every render, so listing it
+  // as a dependency would refetch the library on each keystroke elsewhere.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { load() }, [])
+
+  async function remove(id, keepClips) {
+    try {
+      const r = await del(`/api/projects/${id}?keep_clips=${keepClips ? 'true' : 'false'}`)
+      setConfirming(null)
+      load()
+      if (keepClips && r.clips_kept) onError(`Project deleted — ${r.clips_kept} clip(s) moved to the clips folder.`)
+    } catch (e) { onError(e.message) }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sheet-body">
+          <h3>📁 Projects</h3>
+          <p>
+            Every video you have worked on. Opening one brings back its transcript,
+            its clips and their settings — nothing is fetched or detected again.
+          </p>
+
+          {items === null && <div className="muted">Loading…</div>}
+          {items?.length === 0 && (
+            <div className="muted">
+              Nothing here yet. Download or drop in a video and a project is started for you.
+            </div>
+          )}
+
+          <div className="proj-grid">
+            {(items || []).map((p) => (
+              <div key={p.id} className={`proj-card ${p.id === activeId ? 'active' : ''}`}>
+                {p.has_thumb
+                  ? <img src={`/api/projects/${p.id}/thumb`} alt="" />
+                  : <div className="proj-noimg">🎬</div>}
+                <div className="body">
+                  <div className="name" title={p.title}>{p.title}</div>
+                  <div className="size">
+                    {secToMMSS(p.duration || 0)} · {p.clip_count} clip{p.clip_count === 1 ? '' : 's'}
+                    {p.has_transcript && ' · transcript'}
+                  </div>
+                  {p.source_missing && (
+                    <div className="muted small">Original video file is gone — clips still open.</div>
+                  )}
+                  {confirming === p.id ? (
+                    <div className="row mt">
+                      <button className="btn sm danger" onClick={() => remove(p.id, true)}>
+                        Delete, keep clips
+                      </button>
+                      <button className="btn sm" onClick={() => setConfirming(null)}>Cancel</button>
+                    </div>
+                  ) : (
+                    <div className="row mt">
+                      <button className="btn sm primary grow" onClick={() => onOpen(p.id)}>Open</button>
+                      <button className="btn sm ghost" title="Delete project"
+                        onClick={() => setConfirming(p.id)}>🗑</button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="sheet-foot">
+          <button className="btn" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/** Stock footage cut over one clip.
+ *
+ *  Retention is the whole reason: a single talking head for a minute loses
+ *  people, and the same audio with two short cutaways does not. Your audio never
+ *  changes — only the picture does, for as long as you say.
+ */
+function BrollModal({ clip, index, stockKeys, onClose, onApply, onError, onOpenSettings }) {
+  const existing = (clip.render?.broll || []).map((b) => ({ ...b }))
+  const [inserts, setInserts] = useState(existing)
+  const [source, setSource] = useState(stockKeys.pexels ? 'pexels' : 'pixabay')
+  const [q, setQ] = useState('')
+  const [results, setResults] = useState([])
+  const [searching, setSearching] = useState(false)
+  const [picking, setPicking] = useState(null)
+
+  const clipLen = (clip.render?.segments || []).reduce((t, s) => t + (s.end_sec - s.start_sec), 0)
+  const anyKey = stockKeys.pexels || stockKeys.pixabay
+
+  async function search() {
+    if (!q.trim()) return onError('Type what footage you want first')
+    setSearching(true)
+    try {
+      const r = await api.get(`/api/broll/search?q=${encodeURIComponent(q.trim())}&source=${source}`)
+      setResults(r.results || [])
+      if (!r.results?.length) onError('Nothing found — try a simpler word')
+    } catch (e) { onError(e.message) } finally { setSearching(false) }
+  }
+
+  async function add(item) {
+    setPicking(item.id)
+    try {
+      // Downloaded now, not during the render: a cutaway that starts fetching
+      // mid-encode turns a cancellable job into one stuck on a socket.
+      const r = await api.post('/api/broll/pick', { url: item.url, id: item.id })
+      const at = inserts.length
+        ? Math.min(clipLen - 1, inserts[inserts.length - 1].at + inserts[inserts.length - 1].duration + 1)
+        : Math.min(3, Math.max(0, clipLen / 4))
+      setInserts([...inserts, {
+        path: r.path,
+        at: Math.max(0, Math.round(at * 10) / 10),
+        duration: Math.min(4, Math.max(1, item.duration || 3)),
+        mode: 'cutaway',
+        credit: item.credit || '',
+      }])
+    } catch (e) { onError(e.message) } finally { setPicking(null) }
+  }
+
+  const set = (i, patch) => setInserts(inserts.map((b, j) => (j === i ? { ...b, ...patch } : b)))
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal sheet" onClick={(e) => e.stopPropagation()}>
+        <div className="sheet-body">
+          <h3>🎬 B-roll for “{clip.name}”</h3>
+          <p>
+            Cut stock footage over the clip while your audio keeps playing.
+            Two short cutaways is usually all a minute-long clip needs.
+          </p>
+
+          {!anyKey ? (
+            <div className="hint">
+              Add a free <b>Pexels</b> or <b>Pixabay</b> key in Settings first — the footage
+              comes from your own account, so nothing here is shared or rate-limited with
+              anyone else.
+              <div className="row mt">
+                <button className="btn sm" onClick={onOpenSettings}>Open Settings</button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="row mb">
+                <select className="select" style={{ width: 130 }} value={source}
+                  onChange={(e) => setSource(e.target.value)}>
+                  {stockKeys.pexels && <option value="pexels">Pexels</option>}
+                  {stockKeys.pixabay && <option value="pixabay">Pixabay</option>}
+                </select>
+                <div className="grow">
+                  <input className="input" placeholder='What should it cut to? e.g. "city at night"'
+                    value={q} onChange={(e) => setQ(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && search()} />
+                </div>
+                <button className="btn" onClick={search} disabled={searching}>
+                  {searching ? 'Searching…' : '🔍 Search'}
+                </button>
+              </div>
+
+              {results.length > 0 && (
+                <div className="broll-grid mb">
+                  {results.map((r) => (
+                    <button key={r.id} className="broll-item" onClick={() => add(r)}
+                      disabled={picking === r.id} title={r.credit}>
+                      {r.thumb ? <img src={r.thumb} alt="" /> : <div className="proj-noimg">🎞️</div>}
+                      <span>{picking === r.id ? 'Adding…' : `${Math.round(r.duration)}s`}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+
+          <h3 style={{ marginTop: 18 }}>On this clip ({inserts.length})</h3>
+          {inserts.length === 0 && <div className="muted">No cutaways yet.</div>}
+          {inserts.map((b, i) => (
+            <div className="broll-row" key={i}>
+              <div className="grow">
+                <div className="name">{b.credit || b.path.split(/[\\/]/).pop()}</div>
+                <div className="row">
+                  <label className="lbl-inline">Starts at</label>
+                  <input className="input" style={{ width: 84 }} type="number" min={0}
+                    max={Math.max(0, clipLen - 0.5)} step={0.5} value={b.at}
+                    onChange={(e) => set(i, { at: Math.max(0, +e.target.value) })} />
+                  <label className="lbl-inline">for</label>
+                  <input className="input" style={{ width: 74 }} type="number" min={0.5} max={20} step={0.5}
+                    value={b.duration}
+                    onChange={(e) => set(i, { duration: Math.max(0.5, +e.target.value) })} />
+                  <span className="muted small">s of {Math.round(clipLen)}s</span>
+                </div>
+                <div className="pills mt">
+                  {BROLL_MODES.map((m) => (
+                    <button key={m.id} className={`pill ${b.mode === m.id ? 'active' : ''}`}
+                      title={m.hint} onClick={() => set(i, { mode: m.id })}>{m.label}</button>
+                  ))}
+                </div>
+              </div>
+              <button className="btn sm ghost" title="Remove"
+                onClick={() => setInserts(inserts.filter((_, j) => j !== i))}>✕</button>
+            </div>
+          ))}
+        </div>
+        <div className="sheet-foot">
+          <span className="muted" style={{ marginRight: 'auto', fontSize: 12 }}>
+            Re-renders this clip. Your audio is untouched.
+          </span>
+          <button className="btn" onClick={onClose}>Cancel</button>
+          <button className="btn primary" onClick={() => onApply(index, inserts)}>
+            {inserts.length ? 'Apply B-roll' : 'Remove B-roll'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+
+/** The yt-dlp version check.
+ *
+ *  This is the part that rots. YouTube changes something and every download on
+ *  this deploy starts failing at once, with nobody in front of a screen — and
+ *  without this the only available conclusion is "the app is broken". There is no
+ *  update button: the container is immutable, so the fix is a redeploy with a
+ *  newer pin, and a button that appeared to work would be undone by it.
+ */
+function UpdatesPanel({ version, onError }) {
+  const [state, setState] = useState(null)
+  const [busy, setBusy] = useState(false)
+
+  async function check(force) {
+    setBusy(true)
+    try { setState(await api.get(`/api/updates?force=${force ? 'true' : 'false'}`)) }
+    catch (e) { onError(e.message) } finally { setBusy(false) }
+  }
+
+  // Once, on open — and not forced, so it uses the day's cached answer rather
+  // than spending a rate-limit slot every time Settings is opened.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { check(false) }, [])
+
+  const yt = state?.ytdlp
+
+  return (
+    <>
+      <h3 style={{ marginTop: 18 }}>⬆️ Versions</h3>
+      <p>
+        Soft Clipper <b>v{version || state?.app?.current || '—'}</b>
+        {yt && (
+          <>
+            <br />Downloader (yt-dlp) <b>{yt.current || 'unknown'}</b>
+            {yt.update ? <> — <b>{yt.latest}</b> is out.</> : yt.latest ? ' — up to date.' : ''}
+          </>
+        )}
+        {yt?.update && (
+          <><br /><span style={{ opacity: 0.7 }}>{yt.how}</span></>
+        )}
+      </p>
+      <p className="muted small">
+        yt-dlp is what breaks when YouTube changes something. If downloads suddenly
+        fail for every link, this is the first thing to check.
+      </p>
+      <button className="btn sm" disabled={busy} onClick={() => check(true)}>
+        {busy ? 'Checking…' : 'Check now'}
+      </button>
+    </>
+  )
+}
+
 function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCookiesBrowser, initialCookiesFile,
-                        onClose, onSaved, onError }) {
+                        shell, initialStockKeys, onClose, onSaved, onError }) {
   const [key, setKey] = useState('')
+  const [pexelsKey, setPexelsKey] = useState('')
+  const [pixabayKey, setPixabayKey] = useState('')
+  const [defStyle, setDefStyle] = useState(shell?.defaults?.caption_style || 'TikTok Bold')
+  const [defReframe, setDefReframe] = useState(shell?.defaults?.reframe || 'smart')
+  const [defRatio, setDefRatio] = useState(shell?.defaults?.ratio ?? '9:16')
+  const [defQuality, setDefQuality] = useState(shell?.defaults?.quality || '1080p')
   const [proxy, setProxy] = useState(initialProxy || '')
   const [cookiesBrowser, setCookiesBrowser] = useState(initialCookiesBrowser || '')
   const [cookiesFile, setCookiesFile] = useState(initialCookiesFile || '')
@@ -1450,12 +2019,22 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
         cookies_file: cookiesFile.trim(),
       }
       if (key.trim()) body.api_key = key.trim()
+      if (pexelsKey.trim()) body.pexels_api_key = pexelsKey.trim()
+      if (pixabayKey.trim()) body.pixabay_api_key = pixabayKey.trim()
+      body.default_caption_style = defStyle
+      body.default_reframe = defReframe
+      body.default_ratio = defRatio ?? ''
+      body.default_export_quality = defQuality
       await api.post('/api/config', body)
       onSaved({
         preview: key.trim() ? `...${key.trim().slice(-4)}` : null,
         proxy: proxy.trim(),
         cookiesBrowser: cookiesBrowser.trim(),
         cookiesFile: cookiesFile.trim(),
+        stock: {
+          pexels: initialStockKeys?.pexels || !!pexelsKey.trim(),
+          pixabay: initialStockKeys?.pixabay || !!pixabayKey.trim(),
+        },
       })
     } catch (e) { onError(e.message) }
   }
@@ -1480,6 +2059,9 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
         </p>
         <input ref={inputRef} className="input mb" type="password" placeholder="AIza..." value={key}
           onChange={(e) => setKey(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && save()} />
+        {/* Before a job finds out the hard way. A blank box tests the saved key. */}
+        <TestRow label="Test key"
+          onTest={() => api.post('/api/providers/test', { provider: 'gemini', key: key.trim() })} />
 
         {/* Proxy and cookies are per-machine fixes: on the desktop the user's own
             ISP is what blocks YouTube. On the server every download leaves from
@@ -1525,6 +2107,66 @@ function SettingsModal({ hasKey, keyPreview, multiUser, initialProxy, initialCoo
           value={cookiesFile} onChange={(e) => setCookiesFile(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && save()} />
         </>)}
+
+        <h3 style={{ marginTop: 18 }}>⭐ Defaults for new clips</h3>
+        <p>
+          What the sidebar starts on every time you open the app. If you always cut
+          9:16 with the same caption style, set it once here instead of changing it
+          on every video.
+        </p>
+        <div className="grid2 mb">
+          <div>
+            <label className="lbl">CAPTION STYLE</label>
+            <select className="select" value={defStyle} onChange={(e) => setDefStyle(e.target.value)}>
+              {(shell?.captionStyles || CAPTION_STYLES).map((v) => <option key={v}>{v}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="lbl">REFRAME</label>
+            <select className="select" value={defReframe} onChange={(e) => setDefReframe(e.target.value)}>
+              {REFRAMES.map((r) => <option key={r.id} value={r.id}>{r.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="lbl">ASPECT RATIO</label>
+            <select className="select" value={defRatio ?? ''}
+              onChange={(e) => setDefRatio(e.target.value || null)}>
+              {RATIOS.map((r) => <option key={r.label} value={r.id ?? ''}>{r.label}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="lbl">DOWNLOAD QUALITY</label>
+            <select className="select" value={defQuality} onChange={(e) => setDefQuality(e.target.value)}>
+              {['2160p', '1440p', '1080p', '720p', '480p'].map((v) => <option key={v}>{v}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <h3 style={{ marginTop: 18 }}>🎬 B-roll (stock footage)</h3>
+        <p>
+          Cut relevant footage over a clip while the speaker keeps talking — the single
+          biggest thing you can do for retention on a long talking clip.
+          Both keys are free and personal to you:{' '}
+          <a href="https://www.pexels.com/api/new/" target="_blank" rel="noreferrer">Pexels</a>
+          {' '}and{' '}
+          <a href="https://pixabay.com/api/docs/" target="_blank" rel="noreferrer">Pixabay</a>.
+          One is enough.
+        </p>
+        <input className="input mb" type="password"
+          placeholder={initialStockKeys?.pexels ? 'Pexels key saved — leave blank to keep it' : 'Pexels API key'}
+          value={pexelsKey} onChange={(e) => setPexelsKey(e.target.value)} />
+        <TestRow label="Test Pexels"
+          onTest={() => api.post('/api/providers/test-stock', { provider: 'pexels' })} />
+        <input className="input mb" type="password"
+          placeholder={initialStockKeys?.pixabay ? 'Pixabay key saved — leave blank to keep it' : 'Pixabay API key'}
+          value={pixabayKey} onChange={(e) => setPixabayKey(e.target.value)} />
+        <TestRow label="Test Pixabay"
+          onTest={() => api.post('/api/providers/test-stock', { provider: 'pixabay' })} />
+        <p className="muted small">
+          Save first, then test — the test uses the key that is stored.
+        </p>
+
+        <UpdatesPanel version={shell?.version} onError={onError} />
         </div>
 
         {/* Outside the scrolling body, so Save is reachable without hunting. */}

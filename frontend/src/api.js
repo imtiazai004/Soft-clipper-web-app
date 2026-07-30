@@ -23,6 +23,11 @@ export const api = {
     }).then(json),
 }
 
+// Same credentials rule as the rest: deleting a project is an authenticated call,
+// and without the cookie the server cannot tell whose project it is.
+export const del = (path) =>
+  fetch(path, { method: 'DELETE', credentials: 'include' }).then(json)
+
 // Poll a job until done/error/cancelled. onUpdate({progress, message, id}) fires each tick.
 export async function runJob(startPromise, onUpdate) {
   const { job_id } = await startPromise

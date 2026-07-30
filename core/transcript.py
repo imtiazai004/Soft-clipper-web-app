@@ -91,6 +91,55 @@ def segments_for_stitched(segments: list[dict], windows: list[dict]) -> list[dic
     return out
 
 
+def _srt_time(seconds: float) -> str:
+    """SRT wants HH:MM:SS,mmm — comma, not a full stop, and always three digits."""
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000))
+    if ms == 1000:            # rounding up a value like 4.9996
+        s, ms = s + 1, 0
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def to_srt(segments: list[dict]) -> str:
+    """A subtitle file for the transcript.
+
+    Worth having for a reason beyond completeness: this is the file people upload
+    alongside the video. YouTube and TikTok both take an .srt for their own
+    captions, which are indexed for search and readable with the sound off —
+    neither of which burnt-in captions can do.
+    """
+    out = []
+    for i, seg in enumerate(segments or [], start=1):
+        start = float(seg.get("start", 0.0))
+        end = start + max(0.2, float(seg.get("duration", 2.0)))
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        out.append(f"{i}\n{_srt_time(start)} --> {_srt_time(end)}\n{text}\n")
+    return "\n".join(out)
+
+
+def to_txt(segments: list[dict], timestamps: bool = True) -> str:
+    """The transcript as prose, optionally with [MM:SS] in front of each line.
+
+    Without timestamps this is what someone pastes into a blog post, a newsletter
+    or a description; with them it is how they find the moment they remember
+    hearing.
+    """
+    lines = []
+    for seg in segments or []:
+        text = str(seg.get("text", "")).strip()
+        if not text:
+            continue
+        lines.append(
+            f"[{seconds_to_mmss(float(seg.get('start', 0.0)))}] {text}" if timestamps else text
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def segments_between(segments: list[dict], start: float, end: float) -> list[dict]:
     """Segments overlapping the [start, end] window, times re-based to clip start."""
     out = []

@@ -33,7 +33,11 @@ from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
 
 from backend import auth
-from core import ai, captions, cleanup, downloader, effects, proc, silence, transcript, utils, video
+from core import (
+    ai, broll, captions, cleanup, downloader, effects, llm, proc, projects, silence, transcript,
+    updates, utils, video,
+)
+from core.version import __version__ as APP_VERSION
 
 # ── path setup (works both as source and as a bundled PyInstaller exe) ────────
 if getattr(sys, "frozen", False):
@@ -110,6 +114,9 @@ def new_session() -> dict:
         "transcript_source": None,
         "proxy_path": None,
         "clips": [],  # [{name, path, meta}]
+        # The project this session is mirrored into, so a closed tab does not lose
+        # the transcript and the clip list. None = nothing to mirror into yet.
+        "project_id": None,
     }
 
 
@@ -483,12 +490,23 @@ def clip_output_dir(user: str) -> str:
     return out
 
 
+def thumb_path_for(clip_path: str) -> str:
+    """The still that sits next to a clip. Same folder, .jpg instead of .mp4."""
+    return f"{os.path.splitext(clip_path)[0]}.jpg"
+
+
 def clip_to_api(user: str, c: dict) -> dict:
     rel = os.path.relpath(c["path"], user_clips(user)).replace("\\", "/")
     size = os.path.getsize(c["path"]) if os.path.exists(c["path"]) else 0
+    thumb = thumb_path_for(c["path"])
     return {
         "name": c["name"], "url": f"/api/clips/file/{rel}", "size_mb": round(size / 1e6, 1),
+        # Served by the same ownership-checked route as the clip itself, so a
+        # thumbnail cannot become the way one account reads another's folder.
+        "thumb": f"/api/clips/file/{os.path.relpath(thumb, user_clips(user)).replace(chr(92), '/')}"
+        if os.path.isfile(thumb) else None,
         "meta": c.get("meta", {}), "render": c.get("render"),
+        "notes": c.get("notes", []),
     }
 
 
@@ -529,6 +547,10 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
     caption_segs = effects.scale_captions(caption_segs, eff)
     overlays = [o for o in (r.get("overlays") or []) if (o.get("text") or "").strip()]
 
+    # Only a real placement counts. `{"x": None, "y": None}` is what every clip
+    # record written before this feature carries, and it has to mean "unchanged".
+    cap_pos = {k: cap[k] for k in ("x", "y") if cap.get(k) is not None} or None
+
     ass_file = None
     # one .ass carries captions, headline and overlays — any of them is reason to build it
     if caption_segs or head["text"] or overlays:
@@ -539,6 +561,8 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
             highlight=bool(cap.get("highlight", False)),
             headline=head, clip_duration=clip_duration, overlays=overlays,
             ratio=r.get("ratio"),
+            position=cap_pos,
+            overrides=cap.get("overrides") or None,
         )
     try:
         if len(segs) == 1:
@@ -558,6 +582,46 @@ def render_record(job: dict, user: str, rec: dict, out_dir: str) -> None:
             os.remove(ass_file)
     if not ok:
         raise RuntimeError(f"{rec['name']}: {err}")
+
+    apply_broll(job, rec)
+
+    # A still for the clip list. After B-roll, so the thumbnail matches what the
+    # clip actually looks like. One second in, because frame zero of a cut is
+    # often a fade or a blur.
+    projects.make_thumbnail(rec["path"], thumb_path_for(rec["path"]), at=1.0, width=360)
+
+
+def apply_broll(job: dict, rec: dict) -> None:
+    """Burn any chosen stock footage over the finished clip.
+
+    A second pass on purpose — see core/broll.py. Deliberately non-fatal: the clip
+    on disk at this point is already the clip the customer asked for, and losing
+    it because a cutaway failed would be the wrong trade. The reason is kept on
+    the record so it can be seen later.
+    """
+    inserts = [i for i in (rec["render"].get("broll") or []) if i.get("path")]
+    if not inserts:
+        return
+
+    path = rec["path"]
+    info = video.get_video_info(path)
+    w, h = info.get("width") or 1080, info.get("height") or 1920
+    tmp = f"{os.path.splitext(path)[0]}_broll.mp4"
+    job["message"] = f"Adding B-roll: {rec['name']}"
+
+    ok, err = broll.apply_inserts(path, tmp, inserts, w, h)
+    if not ok:
+        rec.setdefault("notes", []).append(f"B-roll could not be added: {err}")
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return
+    try:
+        os.replace(tmp, path)
+    except OSError as e:
+        rec.setdefault("notes", []).append(f"B-roll rendered but could not replace the clip: {e}")
 
 
 def rerender_clip(job: dict, user: str, rec: dict) -> None:
@@ -588,6 +652,14 @@ class ConfigBody(BaseModel):
     proxy: str | None = None
     cookies_browser: str | None = None
     cookies_file: str | None = None
+    # stock-footage keys for B-roll (core/broll.py) — per user, like the AI key
+    pexels_api_key: str | None = None
+    pixabay_api_key: str | None = None
+    # what a new clip starts as, so the same choices are not remade every time
+    default_caption_style: str | None = None
+    default_reframe: str | None = None
+    default_ratio: str | None = None
+    default_export_quality: str | None = None
 
 
 class DownloadBody(BaseModel):
@@ -608,6 +680,15 @@ class SplitBody(BaseModel):
     length: int = 60               # seconds per clip
 
 
+class BrollOpts(BaseModel):
+    """One piece of stock footage cut over the clip. Times are in clip seconds."""
+    path: str = ""                 # already downloaded by /api/broll/pick
+    at: float = 0.0
+    duration: float = 3.0
+    mode: str = "cutaway"          # cutaway (full frame) | pip (corner)
+    credit: str = ""
+
+
 class CaptionOpts(BaseModel):
     enabled: bool = True
     style: str = "TikTok Bold"
@@ -615,6 +696,13 @@ class CaptionOpts(BaseModel):
     # Word-by-word highlighting. Off by default so existing clips re-render
     # exactly as they did before.
     highlight: bool = False
+    # Where the captions sit, as 0..1 of the frame. None means "leave them where
+    # they have always been" — bottom-centre on the style's own margin — so a
+    # clip saved before this existed re-renders identically.
+    x: float | None = None
+    y: float | None = None
+    # {"wrong": "right"} word fixes, for names and jargon the transcriber missed.
+    overrides: dict[str, str] = Field(default_factory=dict)
 
 
 class HeadlineOpts(BaseModel):
@@ -667,6 +755,7 @@ class CutBody(BaseModel):
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
     overlays: list[OverlayOpts] = Field(default_factory=list)
+    broll: list[BrollOpts] = Field(default_factory=list)
 
 
 class ReelBody(BaseModel):
@@ -682,6 +771,7 @@ class ReelBody(BaseModel):
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
     overlays: list[OverlayOpts] = Field(default_factory=list)
+    broll: list[BrollOpts] = Field(default_factory=list)
 
 
 # ── auth endpoints ────────────────────────────────────────────────────────────
@@ -727,6 +817,16 @@ def get_config(user: str = Depends(auth.current_user)):
         "packaged": bool(getattr(sys, "frozen", False)),
         # so Settings can tell the truth about where a saved key ends up
         "multi_user": auth.MULTI_USER,
+        "version": APP_VERSION,
+        # stock footage: whether this user has a key, never the key itself
+        "has_pexels_key": bool(cfg.get("pexels_api_key", "")),
+        "has_pixabay_key": bool(cfg.get("pixabay_api_key", "")),
+        # what a new clip starts as
+        "default_caption_style": cfg.get("default_caption_style", captions.DEFAULT_CAPTION_STYLE),
+        "default_reframe": cfg.get("default_reframe", "smart"),
+        "default_ratio": cfg.get("default_ratio", "9:16"),
+        "default_export_quality": cfg.get("default_export_quality", "1080p"),
+        "caption_styles": list(captions.CAPTION_STYLES.keys()),
     }
 
 
@@ -742,8 +842,312 @@ def set_config(body: ConfigBody, user: str = Depends(auth.current_user)):
         cfg["cookies_browser"] = body.cookies_browser.strip()
     if body.cookies_file is not None:
         cfg["cookies_file"] = body.cookies_file.strip()
+    if body.pexels_api_key is not None:
+        cfg["pexels_api_key"] = body.pexels_api_key.strip()
+    if body.pixabay_api_key is not None:
+        cfg["pixabay_api_key"] = body.pixabay_api_key.strip()
+    if body.default_caption_style is not None:
+        cfg["default_caption_style"] = body.default_caption_style.strip()
+    if body.default_reframe is not None:
+        cfg["default_reframe"] = body.default_reframe.strip()
+    if body.default_ratio is not None:
+        cfg["default_ratio"] = body.default_ratio.strip()
+    if body.default_export_quality is not None:
+        cfg["default_export_quality"] = body.default_export_quality.strip()
     save_user_config(user, cfg)
     return {"ok": True}
+
+
+# ── provider connection tests ─────────────────────────────────────────────────
+class ProviderTestBody(BaseModel):
+    provider: str = ""
+    key: str = ""
+    base_url: str = ""
+    model: str = ""
+
+
+@app.post("/api/providers/test")
+def providers_test(body: ProviderTestBody, user: str = Depends(auth.current_user)):
+    """Does this AI provider answer, and which models can it reach?
+
+    The point is *when* you find out. Before this, a wrong key or a model name
+    the provider has never heard of surfaced as a failed job — after the
+    download, after the transcript, twenty minutes in. Always 200: `ok: false`
+    with a sentence to show is the answer here, not an error condition.
+    """
+    return llm.test(body.provider, body.key, body.base_url, body.model)
+
+
+@app.post("/api/providers/test-stock")
+def providers_test_stock(body: ProviderTestBody, user: str = Depends(auth.current_user)):
+    """The same check for this user's stock-footage keys."""
+    source = body.provider.strip() or "pexels"
+    if source not in broll.SOURCES:
+        return {"ok": False, "message": f"Unknown source: {source}", "count": 0}
+    cfg = load_user_config(user)
+    try:
+        # A search *is* the test: it exercises the key the same way the feature
+        # will, so a key that passes here cannot fail later for a reason we
+        # could have caught.
+        results = broll.search("city", cfg, source=source, per_page=1)
+    except broll.BrollError as e:
+        return {"ok": False, "message": str(e), "count": 0}
+    except Exception as e:
+        return {"ok": False,
+                "message": f"Could not reach {broll.SOURCES[source]['label']}: {e}", "count": 0}
+    return {"ok": True, "message": f"Connected to {broll.SOURCES[source]['label']}.",
+            "count": len(results)}
+
+
+# ── B-roll (stock footage) ────────────────────────────────────────────────────
+@app.get("/api/broll/sources")
+def broll_sources(user: str = Depends(auth.current_user)):
+    cfg = load_user_config(user)
+    return {
+        "sources": [
+            {"id": sid, "label": meta["label"], "signup": meta["signup"],
+             "configured": bool(broll.key_for(sid, cfg))}
+            for sid, meta in broll.SOURCES.items()
+        ],
+        "modes": list(broll.MODES),
+    }
+
+
+@app.get("/api/broll/search")
+def broll_search(q: str, source: str = "pexels", orientation: str = "portrait",
+                 user: str = Depends(auth.current_user)):
+    try:
+        return {"results": broll.search(q, load_user_config(user), source=source,
+                                        orientation=orientation)}
+    except broll.BrollError as e:
+        raise HTTPException(400, str(e))
+
+
+class BrollPickBody(BaseModel):
+    url: str
+    id: str = "broll"
+
+
+@app.post("/api/broll/pick")
+def broll_pick(body: BrollPickBody, user: str = Depends(auth.current_user)):
+    """Download the chosen footage now, so rendering never waits on the network.
+
+    A cutaway that starts downloading in the middle of a render turns a job that
+    could be cancelled into one that hangs on a socket. Into this user's own
+    folder, so nothing is shared between accounts.
+    """
+    if not body.url.strip():
+        raise HTTPException(400, "No footage URL")
+    dest = os.path.join(user_downloads(user), "broll")
+    try:
+        path = broll.fetch(body.url.strip(), dest_dir=dest, name_hint=body.id,
+                           cfg=load_user_config(user))
+    except broll.BrollError as e:
+        raise HTTPException(400, str(e))
+    return {"path": path, "size_mb": round(os.path.getsize(path) / 1e6, 1)}
+
+
+# ── transcript export ─────────────────────────────────────────────────────────
+@app.get("/api/transcript")
+def get_transcript(user: str = Depends(auth.current_user)):
+    sess = get_session(user)
+    segs = sess["transcript_segments"]
+    return {"segments": segs or [], "source": sess["transcript_source"],
+            "count": len(segs or [])}
+
+
+@app.get("/api/transcript/export")
+def export_transcript(fmt: str = "srt", user: str = Depends(auth.current_user)):
+    """srt | txt | txt-plain — downloaded as a file, not shown in the browser.
+
+    An .srt is what gets uploaded next to the video for platform captions, which
+    are indexed for search and read with the sound off. Burnt-in captions cannot
+    do either.
+    """
+    sess = get_session(user)
+    segs = sess["transcript_segments"]
+    if not segs:
+        raise HTTPException(400, "No transcript yet — detect moments or transcribe first")
+
+    fmt = (fmt or "srt").lower()
+    if fmt == "srt":
+        text, ext = transcript.to_srt(segs), "srt"
+    elif fmt in ("txt", "txt-plain"):
+        text, ext = transcript.to_txt(segs, timestamps=fmt == "txt"), "txt"
+    else:
+        raise HTTPException(400, "Format must be srt, txt or txt-plain")
+
+    base = utils.sanitize(sess["video_title"] or "transcript")[:60] or "transcript"
+    path = os.path.join(user_clips(user), f"{base}.{ext}")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=f"{base}.{ext}")
+
+
+# ── projects ──────────────────────────────────────────────────────────────────
+def project_snapshot(user: str) -> dict | None:
+    """Write this user's live session into their active project. Never fatal.
+
+    Called after each step that produces something worth keeping. If it fails —
+    a full disk, a folder deleted underneath us — the session in memory is
+    untouched and the job that called it still succeeds. Losing the autosave is
+    recoverable; losing the render is not.
+    """
+    sess = get_session(user)
+    pid = sess.get("project_id")
+    root = user_root(user)
+    if not pid or not projects.exists(root, pid):
+        return None
+    try:
+        rec = projects.load(root, pid)
+        rec.update(
+            title=sess["video_title"] or rec.get("title", "Untitled"),
+            source_path=sess["video_path"] or rec.get("source_path", ""),
+            source_url=sess["video_url"] or rec.get("source_url", ""),
+            duration=sess["video_duration"] or rec.get("duration", 0),
+            transcript=sess["transcript_segments"],
+            transcript_source=sess["transcript_source"],
+            clips=[
+                {"name": c["name"], "path": c["path"], "meta": c.get("meta", {}),
+                 "render": c.get("render"), "version": c.get("version", 1)}
+                for c in sess["clips"]
+            ],
+        )
+        return projects.save(root, rec)
+    except Exception:
+        return None
+
+
+def project_begin(user: str, title: str, source_path: str, source_url: str = "",
+                  duration: float = 0.0) -> None:
+    """Start a project for a freshly loaded video, and make it the active one.
+
+    Automatic rather than a button: the customer cannot know at this point that
+    they will want it later, and "I closed the tab and lost everything" is not a
+    lesson worth teaching. Failure is silent — a project is a convenience on top
+    of a session that already works.
+    """
+    sess = get_session(user)
+    try:
+        rec = projects.create(user_root(user), title, source_path=source_path,
+                              source_url=source_url, duration=duration)
+        sess["project_id"] = rec["id"]
+    except Exception:
+        sess["project_id"] = None
+
+
+@app.get("/api/projects")
+def projects_list(user: str = Depends(auth.current_user)):
+    return {"projects": projects.listing(user_root(user)),
+            "active": get_session(user).get("project_id")}
+
+
+@app.get("/api/projects/{project_id}")
+def project_get(project_id: str, user: str = Depends(auth.current_user)):
+    try:
+        return projects.load(user_root(user), project_id)
+    except (OSError, ValueError):
+        raise HTTPException(404, "Project not found")
+
+
+@app.get("/api/projects/{project_id}/thumb")
+def project_thumb(project_id: str, user: str = Depends(auth.current_user)):
+    try:
+        path = projects.path_for(user_root(user), project_id, projects.THUMB)
+    except ValueError:
+        raise HTTPException(404, "Project not found")
+    if not os.path.isfile(path):
+        raise HTTPException(404, "No thumbnail")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.post("/api/projects/{project_id}/open")
+def project_open(project_id: str, user: str = Depends(auth.current_user)):
+    """Load a saved project back into the session the whole app already uses.
+
+    This is the feature: the transcript is not fetched again, the moments are not
+    re-detected, and the clips reappear with their render settings intact, so
+    Edit and Re-render work on them as if they had just been made.
+    """
+    root = user_root(user)
+    try:
+        rec = projects.load(root, project_id)
+    except (OSError, ValueError):
+        raise HTTPException(404, "Project not found")
+
+    source = rec.get("source_path") or ""
+    if source and not os.path.isfile(source):
+        # Everything else is still usable, so this is a warning, not a failure:
+        # the transcript and the finished clips are on disk regardless.
+        source = ""
+
+    sess = get_session(user)
+    sess.update(
+        project_id=rec["id"],
+        video_path=source or None,
+        video_title=rec.get("title"),
+        video_duration=rec.get("duration", 0.0),
+        video_url=rec.get("source_url"),
+        transcript_segments=rec.get("transcript"),
+        transcript_source=rec.get("transcript_source"),
+        proxy_path=None,
+        clips=[c for c in rec.get("clips", []) if c.get("path") and os.path.exists(c["path"])],
+    )
+    return {
+        "ok": True,
+        "project": rec["id"],
+        "source_missing": bool(rec.get("source_path")) and not source,
+        "clips": [clip_to_api(user, c) for c in sess["clips"]],
+        "has_transcript": bool(sess["transcript_segments"]),
+    }
+
+
+@app.post("/api/projects/save")
+def project_save(user: str = Depends(auth.current_user)):
+    """Snapshot now, whether or not one was started automatically.
+
+    A transcript counts as something worth saving even with no clips yet. It is
+    the expensive part — a paid API call, or minutes of Whisper — and someone who
+    has detected moments but not cut them has plenty to lose.
+    """
+    sess = get_session(user)
+    if not sess["video_path"] and not sess["clips"] and not sess["transcript_segments"]:
+        raise HTTPException(400, "Nothing to save yet")
+    if not sess.get("project_id"):
+        project_begin(user, sess["video_title"] or "Untitled", sess["video_path"] or "",
+                      sess["video_url"] or "", sess["video_duration"] or 0.0)
+    rec = project_snapshot(user)
+    if not rec:
+        raise HTTPException(400, "Could not save the project")
+    return {"ok": True, "project": rec["id"]}
+
+
+@app.delete("/api/projects/{project_id}")
+def project_delete(project_id: str, keep_clips: bool = True,
+                   user: str = Depends(auth.current_user)):
+    root = user_root(user)
+    if not projects.exists(root, project_id):
+        raise HTTPException(404, "Project not found")
+    result = projects.delete(root, project_id, keep_clips=keep_clips)
+    sess = get_session(user)
+    if sess.get("project_id") == project_id:
+        sess["project_id"] = None
+    return result
+
+
+# ── update check ──────────────────────────────────────────────────────────────
+@app.get("/api/updates")
+def check_updates(force: bool = False, user: str = Depends(auth.current_user)):
+    """Only yt-dlp, and only as information.
+
+    It is the part that rots: YouTube changes something and every download on
+    this deploy starts failing at once, with nobody in front of a screen. The fix
+    is a redeploy with a newer pin, so there is no button here that pretends
+    otherwise — see core/updates.py.
+    """
+    return {"app": {"current": APP_VERSION, "update": False},
+            "ytdlp": updates.ytdlp_check(force)}
 
 
 @app.post("/api/create-shortcut")
@@ -822,7 +1226,9 @@ def job_download(body: DownloadBody, user: str = Depends(auth.current_user)):
             video_url=body.url.strip(), transcript_segments=None,
             transcript_source=None, proxy_path=None, clips=[],
         )
-        return {"title": title, "duration": duration, "video_url": "/api/video/stream"}
+        project_begin(user, title, path, body.url.strip(), duration)
+        return {"title": title, "duration": duration, "video_url": "/api/video/stream",
+                "project": get_session(user).get("project_id")}
 
     return {"job_id": start_job(user, work)}
 
@@ -847,7 +1253,9 @@ def load_local_video(user: str, path: str) -> dict:
         proxy_path=None,
         clips=[],
     )
-    return {"title": sess["video_title"], "duration": duration, "video_url": "/api/video/stream"}
+    project_begin(user, sess["video_title"], path, "", duration)
+    return {"title": sess["video_title"], "duration": duration, "video_url": "/api/video/stream",
+            "project": sess.get("project_id")}
 
 
 @app.post("/api/video/upload")
@@ -923,6 +1331,9 @@ def job_split(body: SplitBody, user: str = Depends(auth.current_user)):
         job["progress"] = 0.3
         moments = silence.split_video(sess["video_path"], sess["video_duration"], body.length)
         job["progress"] = 0.9
+        # No transcript on this path, but the project should still record which
+        # video this was and that it has been split.
+        project_snapshot(user)
         return {"moments": moments, "transcript_source": None}
 
     return {"job_id": start_job(user, work)}
@@ -956,6 +1367,8 @@ def job_detect(body: DetectBody, user: str = Depends(auth.current_user)):
                 num_clips=body.num_clips, min_len=body.min_len, max_len=body.max_len,
                 user_query=body.query,
             )
+        # the transcript is the expensive part — get it on disk before anything else can go wrong
+        project_snapshot(user)
         return {"moments": moments, "transcript_source": sess["transcript_source"]}
 
     return {"job_id": start_job(user, work)}
@@ -989,12 +1402,14 @@ def job_cut(body: CutBody, user: str = Depends(auth.current_user)):
                     "crop": body.crop.model_dump(),
                     "effects": body.effects.model_dump(),
                     "overlays": [o.model_dump() for o in body.overlays],
+                    "broll": [b.model_dump() for b in body.broll],
                 },
             }
             render_record(job, user, rec, out_dir)
             produced.append(rec)
 
         sess["clips"] = produced
+        project_snapshot(user)
         return {"clips": [clip_to_api(user, c) for c in produced]}
 
     return {"job_id": start_job(user, work, heavy=True)}
@@ -1044,11 +1459,13 @@ def job_reel(body: ReelBody, user: str = Depends(auth.current_user)):
                 "crop": body.crop.model_dump(),
                 "effects": body.effects.model_dump(),
                 "overlays": [o.model_dump() for o in body.overlays],
+                "broll": [b.model_dump() for b in body.broll],
             },
         }
         render_record(job, user, rec, out_dir)
 
         sess["clips"] = [rec]
+        project_snapshot(user)
         return {"clips": [clip_to_api(user, rec)], "plan": plan}
 
     return {"job_id": start_job(user, work, heavy=True)}
@@ -1067,6 +1484,7 @@ class EditBody(BaseModel):
     crop: CropOpts = CropOpts()
     effects: EffectsOpts = EffectsOpts()
     overlays: list[OverlayOpts] = Field(default_factory=list)
+    broll: list[BrollOpts] = Field(default_factory=list)
 
 
 class AiEditBody(BaseModel):
@@ -1109,8 +1527,10 @@ def job_edit(body: EditBody, user: str = Depends(auth.current_user)):
             "crop": body.crop.model_dump(),
             "effects": body.effects.model_dump(),
             "overlays": [o.model_dump() for o in body.overlays],
+            "broll": [b.model_dump() for b in body.broll],
         }
         rerender_clip(job, user, rec)
+        project_snapshot(user)
         return {"clips": [clip_to_api(user, c) for c in sess["clips"]]}
 
     return {"job_id": start_job(user, work, heavy=True)}
@@ -1154,6 +1574,7 @@ def job_ai_edit(body: AiEditBody, user: str = Depends(auth.current_user)):
 
         job["progress"] = 0.5
         rerender_clip(job, user, rec)
+        project_snapshot(user)
         return {
             "clips": [clip_to_api(user, c) for c in sess["clips"]],
             "explanation": plan.get("explanation", ""),

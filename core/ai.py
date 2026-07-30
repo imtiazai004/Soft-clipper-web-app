@@ -149,6 +149,78 @@ def _delete_quiet(client, uploaded):
         pass
 
 
+# What the model is actually selecting for. This used to be one line — "START at
+# a strong hook ... END at a natural stopping point" — and the clips it produced
+# were defensible but samey: every one ran the minimum length, most started a
+# sentence or two before the interesting part, and the scores clustered in the
+# high eighties whatever the material was.
+#
+# Naming the four things that make a short travel, and being explicit about how
+# to spend the length budget and the score range, is the whole difference between
+# "a segment containing something good" and "a clip". It costs nothing per call —
+# it is a fixed prefix on a prompt that already carries an entire transcript.
+VIRAL_CRITERIA = """WHAT MAKES A CLIP TRAVEL (select and rank for these, in priority order):
+1. A HOOK IN THE FIRST LINE. The opening sentence has to stop a scroll: a bold
+   claim, a provocative question, a number nobody expects, a "most people don't
+   know", a cliffhanger, or a raw emotional line. START on that line — not on the
+   throat-clearing or the setup before it. Weak first three seconds, dead clip,
+   no matter how good the middle is.
+2. A COMPLETE ARC. It must stand entirely on its own: hook, build, then payoff —
+   the answer, punchline, twist or lesson. Someone who never saw the source
+   understands all of it. No dangling "as I mentioned earlier", no setup whose
+   payoff is outside the clip.
+3. HIGH EMOTION OR HIGH VALUE. The best clips do one of: spark emotion (funny,
+   inspiring, shocking, infuriating, moving), reveal something counterintuitive,
+   deliver a sharp opinion, tell a vivid story, or hand over something genuinely
+   useful the viewer can act on.
+4. SHAREABILITY. Would someone send this to a friend or argue with it in the
+   comments? Does it open a curiosity gap that the payoff then closes?
+   Contrarian takes, myth-busting and "wait, what?" moments travel furthest.
+
+AVOID: rambling intros, housekeeping ("smash subscribe", "link in bio"), inside
+references that need the rest of the video, and flat mid-thought stretches with
+neither a hook nor a payoff."""
+
+
+def _length_guidance(min_len: int, max_len: int) -> str:
+    """How to spend the length budget, in tiers the model can aim at.
+
+    Given only "15-60 seconds", models return 15-second clips almost every time —
+    the shortest thing that satisfies the constraint. Real short-form does not
+    look like that, so the tiers are described and a mix is asked for explicitly.
+    Tiers outside the customer's own min/max are dropped rather than described,
+    so this never contradicts the limits they set.
+    """
+    tiers = [
+        (10, 30, "a single self-contained hit — one punchline, one striking claim, "
+                 "one sharp exchange — with just enough lead-in to land"),
+        (30, 60, "a complete thought — hook, build and payoff: a short story, an "
+                 "argument, a back-and-forth"),
+        (60, 120, "a multi-beat moment — a longer story or a bigger build-up, where "
+                  "cutting it shorter would lose the payoff or the context"),
+    ]
+    usable = [
+        (max(lo, min_len), min(hi, max_len), text)
+        for lo, hi, text in tiers
+        if hi > min_len and lo < max_len
+    ]
+    if len(usable) < 2:
+        return ""
+    lines = "\n".join(f"  - ~{lo}-{hi}s: {text}." for lo, hi, text in usable)
+    return f"""
+  Pick the length the moment actually needs:
+{lines}
+  Aim for a mix across these, not a pile of clips at the same length. Do not
+  default to the shortest length allowed."""
+
+
+SCORE_GUIDANCE = """- virality_score (0-100): score honestly and spread the range out — do not rate
+  everything 85+. 85-100: exceptional — first-line hook, complete arc, real
+  emotion or value, very shareable. 70-84: strong, clear hook and payoff.
+  50-69: works, but the hook or the payoff is soft. Below 50: weak — include only
+  if the video is thin on material."""
+
+
 def _moment_rules(num_clips: int, min_len: int, max_len: int, duration: float, user_query: str = "") -> str:
     query_part = ""
     if user_query.strip():
@@ -158,13 +230,24 @@ USER REQUEST (highest priority — find moments matching this):
 Only return moments that match the user's request. If fewer than {num_clips} match, return fewer.
 """
     return f"""{query_part}
+{VIRAL_CRITERIA}
+
 Rules:
-- Each clip must be {min_len}-{max_len} seconds long.
-- A clip should START right at a strong hook (shocking line, question, bold claim,
-  emotional peak, punchline setup, striking visual) and END at a natural stopping point.
+- Each clip must be {min_len}-{max_len} seconds long.{_length_guidance(min_len, max_len)}
+- START on the hook line, let it run while it stays engaging, then END right
+  after the payoff, before it drags. Snap the boundaries to transcript line
+  edges so no word is cut mid-sentence.
+- Clips must NOT overlap each other in time.
 - Video is {int(duration)} seconds long; never exceed that.
-- virality_score (0-100): rate hook strength, emotional impact, shareability, completeness.
-- hook_title: short punchy title (max 8 words) usable as on-screen text. Same language as the content.
+- Quality over quantity: {num_clips} strong clips beat {num_clips} where half are
+  filler. Return fewer if the material does not support more, and spread them
+  across the whole video rather than clustering them at the start.
+{SCORE_GUIDANCE}
+- hook_title: short punchy title (max 8 words) usable as on-screen text, written
+  the way a viral Short is titled — curiosity or stakes, not a dry summary
+  ("He lost $2M in one trade", not "Discussion about a trade"). Same language as
+  the content.
+- reason: one sentence naming the specific hook and why it stops the scroll.
 - caption: ready-to-post TikTok caption, same language as the content.
 - hashtags: 4-6 relevant hashtags (with # prefix, no spaces).
 - Return up to {num_clips} moments, best first."""
@@ -181,8 +264,9 @@ def detect_viral_moments(
 ) -> list[dict]:
     """Transcript-based detection. Returns validated, clamped moments sorted by score."""
     client = _client(api_key)
-    prompt = f"""You are a short-form video expert (TikTok / Reels / Shorts). Below is a transcript
-with REAL timestamps in [MM:SS] format. Identify the most viral-worthy moments.
+    prompt = f"""You are a world-class short-form video editor (TikTok / Reels / Shorts). You comb a
+long-form transcript and pull out the handful of moments that would actually stop a
+scroll and get shared. Below is a transcript with REAL timestamps in [MM:SS] format.
 start/end MUST align with the [MM:SS] timestamps actually present in the transcript —
 never invent times that are not near a transcript timestamp.
 {_moment_rules(num_clips, min_len, max_len, video_duration, user_query)}

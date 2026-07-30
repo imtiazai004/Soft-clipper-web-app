@@ -1,6 +1,10 @@
 # user data & secrets
 downloads/
 clips/
+# saved projects: transcripts, clip lists and thumbnails — in desktop mode at the
+# root, in server mode one folder per user under users/
+projects/
+users/
 config.json
 *.mp4
 *.mov
