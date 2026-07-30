@@ -58,6 +58,30 @@
 	.msg.good { background: rgba(52,211,153,.12); border: 1px solid var(--ok); }
 	.msg.bad { background: rgba(248,113,113,.12); border: 1px solid var(--bad); }
 
+	/* The answer to "did that work?".
+	 *
+	 * #msg sat at the top of the page, and the Save and Publish buttons are at
+	 * the bottom of a long settings form. Clicking Save wrote a confirmation to
+	 * a part of the page you were not looking at and could not see without
+	 * scrolling back up — so the only honest read of the screen was that nothing
+	 * had happened. It floats over the viewport now, so the acknowledgement
+	 * lands wherever you are when you press the button.
+	 *
+	 * #gateMsg keeps the old inline behaviour: it belongs next to the sign-in
+	 * box it is complaining about, and the page does not scroll there.
+	 */
+	#msg.show {
+		position: fixed; z-index: 60;
+		left: 50%; transform: translateX(-50%);
+		bottom: 22px; width: max-content;
+		max-width: min(620px, calc(100vw - 28px));
+		margin: 0;
+		/* Opaque, because it now sits over the page rather than in it. */
+		background: var(--panel-2); box-shadow: 0 10px 34px rgba(0,0,0,.5);
+	}
+	#msg.show.good { background: color-mix(in srgb, var(--ok) 14%, var(--panel-2)); }
+	#msg.show.bad { background: color-mix(in srgb, var(--bad) 16%, var(--panel-2)); }
+
 	.gate { max-width: 420px; margin: 12vh auto; }
 	.hint { color: var(--dim); font-size: .82rem; margin-top: 10px; }
 	.events { font-family: var(--mono); font-size: .78rem; color: var(--muted); white-space: pre-wrap; }
@@ -355,7 +379,7 @@
 
 	<div class="card">
 		<div class="row">
-			<button class="primary" onclick="saveSettings()">Save</button>
+			<button id="saveBtn" class="primary" onclick="saveSettings()">Save</button>
 			<button id="publishBtn" onclick="publishSite()">Save &amp; publish</button>
 			<span class="spacer"></span>
 			<span id="publishHint" class="hint" style="margin:0"></span>
@@ -398,11 +422,35 @@ const money = (cents, currency) => {
 	}
 };
 
-function say(text, good) {
+let sayTimer = null;
+
+function say(text, good, seconds = 6) {
 	const m = $("msg");
 	m.textContent = text;
 	m.className = "msg show " + (good ? "good" : "bad");
-	if (good) setTimeout(() => (m.className = "msg"), 4000);
+	// Six seconds, not four: these messages now say what actually happened —
+	// "saved but not published yet", "the build has started" — and four seconds
+	// is not long enough to read a sentence you were not expecting.
+	clearTimeout(sayTimer);
+	if (good) sayTimer = setTimeout(() => (m.className = "msg"), seconds * 1000);
+}
+
+/** Run an action with the button showing that it is running.
+ *
+ * Saving and publishing both make a network call, and until one comes back the
+ * screen looked exactly as it did before the click. On a slow connection that is
+ * several seconds of wondering whether the button registered — long enough to
+ * press it again.
+ */
+async function withBusy(id, label, fn) {
+	const btn = $(id);
+	const was = btn ? btn.textContent : "";
+	if (btn) { btn.disabled = true; btn.textContent = label; }
+	try {
+		return await fn();
+	} finally {
+		if (btn) { btn.disabled = false; btn.textContent = was; }
+	}
 }
 
 async function api(path, options = {}) {
@@ -941,26 +989,47 @@ function checkoutStillMatches(next) {
 async function saveSettings(thenPublish) {
 	const next = collectSettings();
 	if (!checkoutStillMatches(next)) return false;
-	try {
-		const d = await api("/settings", { method: "POST", body: JSON.stringify(next) });
-		savedSettings = d.settings;
-		showWarnings(d.warnings);
-		if (!thenPublish) say("Saved. The site still shows the old values until you publish.", true);
-		return true;
-	} catch (e) {
-		say(e.message, false);
-		return false;
-	}
+	return withBusy(thenPublish ? "publishBtn" : "saveBtn", "Saving…", async () => {
+		try {
+			const d = await api("/settings", { method: "POST", body: JSON.stringify(next) });
+			savedSettings = d.settings;
+			showWarnings(d.warnings);
+			// Saved and published are two different things and the difference has
+			// caught people out: the values are stored, the live pages are not
+			// rebuilt, and the site keeps showing yesterday's price until it is.
+			if (!thenPublish) {
+				say("✓ Saved. The live site still shows the old values — press Save & publish to rebuild it.", true, 8);
+			}
+			return true;
+		} catch (e) {
+			say("Not saved: " + e.message, false);
+			return false;
+		}
+	});
 }
 
 async function publishSite() {
-	if (!(await saveSettings(true))) return;
-	try {
-		const d = await api("/publish", { method: "POST" });
-		say(d.note, true);
-	} catch (e) {
-		say(e.message + " — your settings are saved either way.", false);
-	}
+	const next = collectSettings();
+	if (!checkoutStillMatches(next)) return;
+	await withBusy("publishBtn", "Publishing…", async () => {
+		try {
+			const d = await api("/settings", { method: "POST", body: JSON.stringify(next) });
+			savedSettings = d.settings;
+			showWarnings(d.warnings);
+		} catch (e) {
+			say("Not saved, so nothing was published: " + e.message, false);
+			return;
+		}
+		try {
+			const d = await api("/publish", { method: "POST" });
+			// The hook returns as soon as the build is queued, not when the site
+			// is live — saying "published" here would be a lie for the couple of
+			// minutes the build actually takes.
+			say("✓ Saved, and the site rebuild has started. Give it a minute or two, then reload the page to see it. " + (d.note || ""), true, 10);
+		} catch (e) {
+			say("Saved, but the rebuild could not be started: " + e.message, false);
+		}
+	});
 }
 
 $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") signIn(); });
