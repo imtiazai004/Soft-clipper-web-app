@@ -313,17 +313,84 @@ _UNREACHABLE_SIGNS = (
     "not available in your",
 )
 
+# The proxy itself refused or misbehaved. Kept separate from the two above
+# because the fix is neither a VPN nor cookies — it is the proxy address, and
+# telling someone to try a VPN when their proxy is misconfigured sends them to
+# fix the one thing that was already working.
+_PROXY_SIGNS = (
+    "proxyerror", "proxy error", "invalid response version", "socks",
+    "cannot connect to proxy", "tunnel connection failed",
+)
+
+
+def proxy_error_message(raw: str, low: str, user: str) -> str:
+    """Explain a proxy failure in terms of the thing that has to change.
+
+    The signature worth naming is "Invalid response version from server. Expected
+    05 got 48". Those are hex bytes: 05 is the SOCKS5 version we sent, and 48 is
+    'H' — the first letter of "HTTP/1.1". So the address is written socks5:// but
+    the host and port on the other end is an HTTP proxy. Providers hand out a
+    different port per protocol and it is an easy one to mix up.
+    """
+    proxy = get_proxy(user) or ""
+    scheme = proxy.split("://", 1)[0].lower() if "://" in proxy else ""
+    # Host and port only. These messages get screenshotted into chats, and the
+    # credentials live in the part before the @.
+    where = " (currently " + proxy.split("@")[-1] + ")" if proxy else ""
+    setting = "DOWNLOAD_PROXY on the server" if auth.MULTI_USER else "the proxy address in Settings"
+
+    if not proxy:
+        return (
+            "Something is intercepting the connection — a VPN client, antivirus, or a "
+            "network proxy — and it refused the request. No proxy is set in Soft Clipper "
+            "itself.\n\nDetails: " + raw
+        )
+
+    if "invalid response version" in low:
+        if scheme.startswith("socks"):
+            return (
+                "The proxy answered, but not in the language it was asked in.\n\n"
+                f"{setting.capitalize()} starts with {scheme}:// , but the host and port it "
+                f"points at{where} is an HTTP proxy. Providers give you a different port for "
+                "each protocol, and this is the usual mix-up.\n\n"
+                "Fix it either way round: change the address to http:// and keep the port, or "
+                "keep socks5:// and use the SOCKS5 port your provider lists.\n\n"
+                "Details: " + raw
+            )
+        return (
+            "The proxy replied with something we could not read — the protocol in the address "
+            f"does not match what that server speaks{where}. Check that http:// or socks5:// "
+            f"matches the port your provider gave you. Set in {setting}.\n\nDetails: " + raw
+        )
+
+    if "auth" in low or "authentication" in low:
+        return (
+            f"The proxy refused the username or password. Check {setting} — some providers "
+            "reset credentials when a plan renews.\n\nDetails: " + raw
+        )
+
+    return (
+        f"The proxy is not working{where}. Check {setting}, or clear it.\n\nDetails: " + raw
+    )
+
 
 def download_error_message(e: Exception, user: str) -> str:
     """Turn a raw yt-dlp error into a user-friendly, actionable message.
 
-    The two failure modes need opposite fixes, so keep them apart: a VPN gets you
-    *to* YouTube, but cookies are what stop YouTube refusing you once you're there.
+    Three failure modes with three different fixes, so keep them apart: a VPN
+    gets you *to* YouTube, cookies stop YouTube refusing you once you are there,
+    and neither helps if the proxy address itself is wrong.
     """
     raw = str(e)
     low = raw.lower()
     cookies = get_cookies(user)
     has_cookies = bool(cookies["cookies_browser"] or cookies["cookies_file"])
+
+    # Checked first because it is the most specific: a broken proxy produces a
+    # wall of yt-dlp text ending in "please report this issue on GitHub", which
+    # sends a confused user to file a bug against yt-dlp for a settings error.
+    if any(sign in low for sign in _PROXY_SIGNS):
+        return proxy_error_message(raw, low, user)
 
     if any(sign in low for sign in _BOT_BLOCK_SIGNS):
         if has_cookies:
