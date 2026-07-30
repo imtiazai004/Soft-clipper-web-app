@@ -10,7 +10,7 @@
 	# form listed them individually, and adding an admin endpoint without also
 	# editing this line sends it to the video app, which answers 404 for a route
 	# that exists and works. Every admin endpoint checks its own token.
-	@licence path /api/licence/* /api/admin/* /webhooks/stripe /admin
+	@licence path /api/licence/* /api/admin/* /api/site-config /webhooks/stripe /admin
 	handle @licence {
 		reverse_proxy licence:8600
 	}

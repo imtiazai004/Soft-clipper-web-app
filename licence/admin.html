@@ -79,6 +79,15 @@
 	.pill.void { background: rgba(248,113,113,.15); color: var(--bad); }
 	.reflink { font-family: var(--mono); font-size: .78rem; color: var(--muted); }
 	.warnbar { border: 1px solid var(--warn); background: rgba(251,191,36,.1); border-radius: 10px; padding: 10px 14px; font-size: .86rem; margin-bottom: 14px; }
+
+	/* Every input on the Site tab is labelled. An unlabelled box holding the
+	   price of the product is how the wrong number gets typed into it. */
+	.field { display: flex; flex-direction: column; gap: 5px; min-width: 140px; }
+	.field > span { font-size: .74rem; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); font-weight: 700; }
+	.field.grow { flex: 1; min-width: 220px; }
+	.check { display: flex; align-items: center; gap: 9px; cursor: pointer; }
+	.check input { width: 17px; height: 17px; padding: 0; }
+	.dirty { border-color: var(--warn) !important; }
 </style>
 </head>
 <body>
@@ -109,6 +118,7 @@
 	<div class="tabs">
 		<button id="tabLicences" aria-current="true" onclick="showTab('licences')">Licences</button>
 		<button id="tabAffiliates" aria-current="false" onclick="showTab('affiliates')">Affiliates</button>
+		<button id="tabSite" aria-current="false" onclick="showTab('site')">Site</button>
 	</div>
 
 	<div id="msg" class="msg"></div>
@@ -224,6 +234,120 @@
 		<div id="salesEmpty" class="empty" hidden>No sales through this link yet.</div>
 	</div>
 </div><!-- /viewAffiliates -->
+
+<div id="viewSite" hidden>
+	<!--
+	  Two steps, not one. Save writes the setting down; Publish rebuilds the site
+	  so the public sees it. Separated on purpose — a half-finished edit should
+	  never be live while you are still typing the rest of it.
+	-->
+	<div id="siteWarnings"></div>
+
+	<div class="card">
+		<h2>Price</h2>
+		<div class="row">
+			<label class="field">
+				<span>What you charge</span>
+				<input id="setAmount" type="number" min="1" step="1">
+			</label>
+			<label class="field">
+				<span>"Was" price — 0 for no discount</span>
+				<input id="setList" type="number" min="0" step="1">
+			</label>
+			<label class="field grow">
+				<span>Stripe Payment Link</span>
+				<input id="setCheckout" placeholder="https://buy.stripe.com/…">
+			</label>
+		</div>
+		<p class="hint" id="priceHint"></p>
+	</div>
+
+	<div class="card">
+		<h2>Downloads</h2>
+		<label class="check">
+			<input id="setDlEnabled" type="checkbox">
+			<span>Downloads are available</span>
+		</label>
+		<div class="row" style="margin-top:12px">
+			<label class="field grow">
+				<span>Installer URL</span>
+				<input id="setInstaller">
+			</label>
+			<label class="field" style="max-width:130px">
+				<span>Size</span>
+				<input id="setInstallerSize">
+			</label>
+			<label class="field grow">
+				<span>ZIP URL</span>
+				<input id="setZip">
+			</label>
+			<label class="field" style="max-width:130px">
+				<span>Size</span>
+				<input id="setZipSize">
+			</label>
+		</div>
+		<label class="field" style="margin-top:12px">
+			<span>Shown instead of the buttons when downloads are off</span>
+			<input id="setDlOff" class="grow">
+		</label>
+		<p class="hint">
+			Switching downloads off also hides the buy link on that page. Selling a licence
+			for software nobody can install is how a refund starts.
+		</p>
+	</div>
+
+	<div class="card">
+		<h2>Affiliate programme</h2>
+		<label class="check">
+			<input id="setAffEnabled" type="checkbox">
+			<span>Open — new referrals earn commission</span>
+		</label>
+		<div class="row" style="margin-top:12px">
+			<label class="field" style="max-width:170px">
+				<span>Default commission %</span>
+				<input id="setAffRate" type="number" min="0" max="100" step="1">
+			</label>
+			<label class="field" style="max-width:200px">
+				<span>Hold before paying (days)</span>
+				<input id="setAffHold" type="number" min="14" step="1">
+			</label>
+		</div>
+		<p class="hint">
+			Closing the programme stops new sales earning. It never touches commission already
+			recorded — that is still owed, and the affiliates page says so.
+		</p>
+	</div>
+
+	<div class="card">
+		<h2>Notice bar</h2>
+		<label class="check">
+			<input id="setNoticeOn" type="checkbox">
+			<span>Show a bar across the top of every page</span>
+		</label>
+		<div class="row" style="margin-top:12px">
+			<label class="field grow">
+				<span>Message</span>
+				<input id="setNoticeText" placeholder="Sale ends Friday · We are away until Monday">
+			</label>
+			<label class="field" style="max-width:150px">
+				<span>Style</span>
+				<select id="setNoticeTone">
+					<option value="info">Normal</option>
+					<option value="warn">Warning</option>
+				</select>
+			</label>
+		</div>
+	</div>
+
+	<div class="card">
+		<div class="row">
+			<button class="primary" onclick="saveSettings()">Save</button>
+			<button id="publishBtn" onclick="publishSite()">Save &amp; publish</button>
+			<span class="spacer"></span>
+			<span id="publishHint" class="hint" style="margin:0"></span>
+		</div>
+	</div>
+</div><!-- /viewSite -->
 </div>
 
 <script>
@@ -301,18 +425,21 @@ function signOut() {
 	location.reload();
 }
 
+const TABS = { licences: "Licences", affiliates: "Affiliates", site: "Site" };
+
 function showTab(which) {
 	tab = which;
-	$("viewLicences").hidden = which !== "licences";
-	$("viewAffiliates").hidden = which !== "affiliates";
-	$("tabLicences").setAttribute("aria-current", String(which === "licences"));
-	$("tabAffiliates").setAttribute("aria-current", String(which === "affiliates"));
-	$("title").textContent = which === "licences" ? "Licences" : "Affiliates";
+	for (const name of Object.keys(TABS)) {
+		$("view" + name[0].toUpperCase() + name.slice(1)).hidden = which !== name;
+		$("tab" + name[0].toUpperCase() + name.slice(1)).setAttribute("aria-current", String(which === name));
+	}
+	$("title").textContent = TABS[which];
 	load();
 }
 
 async function load() {
 	if (tab === "affiliates") return loadAffiliates();
+	if (tab === "site") return loadSettings();
 	try {
 		const d = await api("/licences?limit=500");
 		all = d.licences || [];
@@ -682,6 +809,143 @@ async function markPaid() {
 }
 
 function closeSales() { $("sales").hidden = true; }
+
+// ── site settings ────────────────────────────────────────────────────────────
+//
+// The site is static, so nothing here is live the moment it is saved. Save
+// writes it down; Publish rebuilds the site and about a minute later the public
+// HTML — and the JSON-LD a search engine reads — carries the new values. That
+// is why the price is baked in rather than fetched by the browser: a pricing
+// page that changes under the visitor, and shows Google yesterday's number, is
+// a worse trade than waiting sixty seconds.
+
+let savedSettings = null;
+
+async function loadSettings() {
+	try {
+		const d = await api("/settings");
+		savedSettings = d.settings;
+		$("count").textContent = "";
+		fillSettings(d.settings);
+		showWarnings(d.warnings);
+
+		$("publishBtn").disabled = !d.publish_ready;
+		$("publishHint").textContent = d.publish_ready
+			? "Publish rebuilds the site — about a minute before it is public."
+			: "Publishing is not wired up: set PUBLISH_HOOK_URL on the server. Saving still works; push the site repo to rebuild.";
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function fillSettings(s) {
+	$("setAmount").value = s.price.amount;
+	$("setList").value = s.price.listAmount;
+	$("setCheckout").value = s.price.checkoutUrl;
+	$("setDlEnabled").checked = !!s.downloads.enabled;
+	$("setInstaller").value = s.downloads.installerUrl;
+	$("setInstallerSize").value = s.downloads.installerSize;
+	$("setZip").value = s.downloads.zipUrl;
+	$("setZipSize").value = s.downloads.zipSize;
+	$("setDlOff").value = s.downloads.offMessage;
+	$("setAffEnabled").checked = !!s.affiliates.enabled;
+	$("setAffRate").value = s.affiliates.ratePct;
+	$("setAffHold").value = s.affiliates.holdDays;
+	$("setNoticeOn").checked = !!s.notice.enabled;
+	$("setNoticeText").value = s.notice.text || "";
+	$("setNoticeTone").value = s.notice.tone || "info";
+	priceHint();
+}
+
+function priceHint() {
+	const now = Number($("setAmount").value) || 0;
+	const was = Number($("setList").value) || 0;
+	$("priceHint").textContent = was
+		? `Shown as $${was} struck through, then $${now} — a ${Math.round((1 - now / was) * 100)}% saving. ` +
+		  "The 'was' price has to be one this site really charged."
+		: "No discount shown — just the price.";
+}
+["setAmount", "setList"].forEach((id) => $(id).addEventListener("input", priceHint));
+
+function showWarnings(list) {
+	$("siteWarnings").innerHTML = (list || [])
+		.map((w) => `<div class="warnbar">${esc(w)}</div>`)
+		.join("");
+}
+
+function collectSettings() {
+	return {
+		price: {
+			amount: Number($("setAmount").value),
+			listAmount: Number($("setList").value),
+			checkoutUrl: $("setCheckout").value.trim(),
+		},
+		downloads: {
+			enabled: $("setDlEnabled").checked,
+			installerUrl: $("setInstaller").value.trim(),
+			installerSize: $("setInstallerSize").value.trim(),
+			zipUrl: $("setZip").value.trim(),
+			zipSize: $("setZipSize").value.trim(),
+			offMessage: $("setDlOff").value.trim(),
+		},
+		affiliates: {
+			enabled: $("setAffEnabled").checked,
+			ratePct: Number($("setAffRate").value),
+			holdDays: Number($("setAffHold").value),
+		},
+		notice: {
+			enabled: $("setNoticeOn").checked,
+			text: $("setNoticeText").value.trim(),
+			tone: $("setNoticeTone").value,
+		},
+	};
+}
+
+/**
+ * The one that costs real money if it is wrong. What the customer is charged
+ * belongs to the Stripe Payment Link and nothing on this page can change it, so
+ * a price change with the same link means the page and the checkout now
+ * disagree — and a customer charged a different number than they agreed to wins
+ * that chargeback every time.
+ */
+function checkoutStillMatches(next) {
+	if (!savedSettings) return true;
+	const priceChanged = next.price.amount !== savedSettings.price.amount;
+	const linkSame = next.price.checkoutUrl === savedSettings.price.checkoutUrl;
+	if (!priceChanged || !linkSame || !next.price.checkoutUrl) return true;
+	return confirm(
+		`You changed the price from $${savedSettings.price.amount} to $${next.price.amount}, ` +
+		"but the Stripe Payment Link is unchanged.\n\n" +
+		"This dashboard cannot change what Stripe charges. Unless you have already " +
+		`edited that link to charge $${next.price.amount}, the site will advertise one ` +
+		"price and the checkout will take another.\n\nSave anyway?"
+	);
+}
+
+async function saveSettings(thenPublish) {
+	const next = collectSettings();
+	if (!checkoutStillMatches(next)) return false;
+	try {
+		const d = await api("/settings", { method: "POST", body: JSON.stringify(next) });
+		savedSettings = d.settings;
+		showWarnings(d.warnings);
+		if (!thenPublish) say("Saved. The site still shows the old values until you publish.", true);
+		return true;
+	} catch (e) {
+		say(e.message, false);
+		return false;
+	}
+}
+
+async function publishSite() {
+	if (!(await saveSettings(true))) return;
+	try {
+		const d = await api("/publish", { method: "POST" });
+		say(d.note, true);
+	} catch (e) {
+		say(e.message + " — your settings are saved either way.", false);
+	}
+}
 
 $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") signIn(); });
 if (tok()) { $("gate").hidden = true; $("app").hidden = false; load(); }

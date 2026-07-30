@@ -18,10 +18,11 @@ import time
 
 import pathlib
 
+import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import crypto, mail, store, stripe_api
+from . import crypto, mail, settings, store, stripe_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("licence")
@@ -35,12 +36,11 @@ MAX_RELEASES = int(os.environ.get("LICENCE_MAX_RELEASES", "10"))
 ADMIN_TOKEN = os.environ.get("LICENCE_ADMIN_TOKEN", "")
 STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 
-# What a new affiliate gets unless they are given their own rate.
-AFFILIATE_RATE_PCT = int(os.environ.get("AFFILIATE_RATE_PCT", "30"))
-# Commission is held until the refund window has closed and then some. Paying on
-# the day of the sale means paying out on orders that come back, and clawing
-# money back from someone who has already spent it is not a database operation.
-AFFILIATE_HOLD_DAYS = int(os.environ.get("AFFILIATE_HOLD_DAYS", "30"))
+# Where "publish the site" points. A Cloudflare deploy hook, a GitHub
+# repository_dispatch, anything that rebuilds the marketing site when POSTed to.
+# Unset means the admin page says publishing is not wired up rather than
+# offering a button that silently does nothing.
+PUBLISH_HOOK_URL = os.environ.get("PUBLISH_HOOK_URL", "")
 
 app = FastAPI(title="Soft Clipper licences", docs_url=None, redoc_url=None)
 
@@ -222,6 +222,13 @@ def _credit_affiliate(ref: str, key: str, session_id: str, session: dict):
 	conversion or a price change would otherwise pay a percentage of a number
 	nobody was charged.
 	"""
+	config = settings.get()["affiliates"]
+	if not config["enabled"]:
+		# The programme is closed. Existing commission is untouched and still
+		# owed; this only stops new sales earning.
+		log.info("affiliate programme is off — not crediting %s", ref)
+		return
+
 	affiliate = store.get_affiliate(ref)
 	if not affiliate:
 		# Someone shared a link with a code that does not exist, or one that was
@@ -244,7 +251,7 @@ def _credit_affiliate(ref: str, key: str, session_id: str, session: dict):
 		gross=gross,
 		currency=session.get("currency") or "usd",
 		rate_pct=int(affiliate["rate_pct"]),
-		hold_days=AFFILIATE_HOLD_DAYS,
+		hold_days=int(config["holdDays"]),
 	)
 	if row is None:
 		log.info("session %s already credited to %s", session_id, ref)
@@ -394,10 +401,12 @@ def admin_revoke(key: str, body: dict = Body(default={}), x_admin_token: str = H
 def admin_affiliates(x_admin_token: str = Header("")):
 	"""Everyone who sells for us, with what they are owed right now."""
 	_require_admin(x_admin_token)
+	config = settings.get()["affiliates"]
 	return {
 		"affiliates": store.affiliate_summary(),
-		"rate_pct": AFFILIATE_RATE_PCT,
-		"hold_days": AFFILIATE_HOLD_DAYS,
+		"rate_pct": config["ratePct"],
+		"hold_days": config["holdDays"],
+		"programme_open": config["enabled"],
 		# The page hides the automatic-payout controls when this is false rather
 		# than offering a button that can only fail.
 		"stripe_payouts": stripe_api.configured(),
@@ -417,7 +426,7 @@ def admin_add_affiliate(body: dict = Body(...), x_admin_token: str = Header(""))
 	if not (body.get("email") or "").strip():
 		raise HTTPException(400, "email is required — it is where the money and the questions go")
 
-	rate = int(body.get("rate_pct") or AFFILIATE_RATE_PCT)
+	rate = int(body.get("rate_pct") or settings.get()["affiliates"]["ratePct"])
 	# A rate over 100 would pay out more than the sale brought in; 0 is a partner
 	# who gets a tracking link but no commission, which is a real arrangement.
 	if not 0 <= rate <= 100:
@@ -592,6 +601,110 @@ def admin_mark_paid(body: dict = Body(...), x_admin_token: str = Header("")):
 		ids, how=body.get("how", "manual"), detail=body.get("detail", "")
 	)
 	return {"ok": True, "marked": marked}
+
+
+# ── site settings ────────────────────────────────────────────────────────────
+
+
+@app.get("/api/site-config")
+def site_config():
+	"""What the marketing site reads when it builds.
+
+	Public and unauthenticated, because every value in it is about to be printed
+	into public HTML anyway. The site treats a failure here as "use the values I
+	have committed" rather than an error, so this being down delays a price
+	change; it never breaks a build or ships an empty pricing page.
+	"""
+	return JSONResponse(
+		settings.public(),
+		# A build reads this once. A short cache absorbs a burst without ever
+		# being old enough that "save, publish" reads yesterday's price.
+		headers={"Cache-Control": "public, max-age=10"},
+	)
+
+
+@app.get("/api/admin/settings")
+def admin_settings(x_admin_token: str = Header("")):
+	_require_admin(x_admin_token)
+	current = settings.get(fresh=True)
+	return {
+		"settings": current,
+		"defaults": settings.DEFAULTS,
+		# Whether the Publish button can do anything. Told, not guessed, so the
+		# page can explain instead of failing.
+		"publish_ready": bool(PUBLISH_HOOK_URL),
+		"warnings": _setting_warnings(current),
+	}
+
+
+def _setting_warnings(s: dict) -> list[str]:
+	"""Things that are allowed but are probably a mistake.
+
+	Kept apart from validation on purpose. Validation refuses to save; this only
+	says so out loud, because an owner is allowed to do something unusual
+	deliberately and being blocked from it is worse than being warned.
+	"""
+	out = []
+	price = s["price"]
+
+	if not price["checkoutUrl"]:
+		out.append("No checkout link is set, so nobody can buy. The buy button offers WhatsApp instead.")
+	elif "/test_" in price["checkoutUrl"]:
+		out.append("The checkout link is a Stripe TEST link — it takes no money.")
+
+	# The one that costs real money. The price on the page is ours; the price
+	# charged belongs to the Stripe Payment Link, and nothing here can change
+	# that. If they disagree the customer is charged something they did not
+	# agree to, which is a chargeback the buyer wins.
+	if price["checkoutUrl"]:
+		out.append(
+			f"The site now says ${price['amount']}. Check the Stripe Payment Link charges "
+			f"exactly that — this dashboard cannot change what Stripe charges."
+		)
+
+	if not s["downloads"]["enabled"]:
+		out.append("Downloads are switched off. Buyers can still pay but cannot install.")
+	if not s["affiliates"]["enabled"]:
+		out.append("The affiliate programme is closed. New referrals earn nothing; existing commission is still owed.")
+	return out
+
+
+@app.post("/api/admin/settings")
+def admin_save_settings(body: dict = Body(...), x_admin_token: str = Header("")):
+	"""Save, but do not publish. The site still shows the old values until the
+	rebuild runs — two steps rather than one, so a half-finished edit is never
+	live while you are still typing the rest of it."""
+	_require_admin(x_admin_token)
+	try:
+		saved = settings.save(body)
+	except settings.Invalid as exc:
+		raise HTTPException(400, str(exc)) from exc
+	log.info("settings saved: %s", ", ".join(sorted(body.keys())))
+	return {"ok": True, "settings": saved, "warnings": _setting_warnings(saved)}
+
+
+@app.post("/api/admin/publish")
+def admin_publish(x_admin_token: str = Header("")):
+	"""Rebuild the marketing site so the saved settings reach the public HTML.
+
+	The hook is whatever rebuilds the site — a Cloudflare deploy hook, a GitHub
+	repository_dispatch. Kept as a URL in the environment rather than wired to
+	one vendor, because the thing most likely to change here is the host.
+	"""
+	_require_admin(x_admin_token)
+	if not PUBLISH_HOOK_URL:
+		raise HTTPException(
+			503,
+			"Publishing is not wired up. Set PUBLISH_HOOK_URL on the server, or push the "
+			"site repository to rebuild it — the settings are saved either way.",
+		)
+	try:
+		res = httpx.post(PUBLISH_HOOK_URL, timeout=20)
+		res.raise_for_status()
+	except httpx.HTTPError as exc:
+		raise HTTPException(502, f"The rebuild could not be triggered: {exc}") from exc
+	log.info("site rebuild triggered")
+	return {"ok": True, "note": "Rebuilding. The site updates in about a minute."}
 
 
 _ADMIN_PAGE = pathlib.Path(__file__).with_name("admin.html")

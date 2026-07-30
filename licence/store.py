@@ -86,6 +86,15 @@ CREATE TABLE IF NOT EXISTS referrals (
 );
 CREATE INDEX IF NOT EXISTS referrals_code ON referrals(code);
 CREATE INDEX IF NOT EXISTS referrals_licence ON referrals(licence_key);
+
+-- Everything an owner can change without a developer: price, discount, download
+-- links, whether the affiliate programme is open. One JSON row, so a save is a
+-- single atomic write and there is no half-applied settings state.
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 """
 
 # Columns added after the table first shipped. SQLite has no "ADD COLUMN IF NOT

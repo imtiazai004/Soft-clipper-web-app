@@ -469,3 +469,130 @@ def test_automatic_payout_refuses_when_stripe_is_not_set_up():
 	r = client.post("/api/admin/affiliates/byhand/pay", headers=ADMIN)
 	assert r.status_code == 400
 	assert "by hand" in r.json()["error"]
+
+
+# ── site settings ────────────────────────────────────────────────────────────
+#
+# These are the switches an owner can throw without a developer, so the tests
+# are about the ones that would cost money or take the shop down: a price that
+# cannot be a price, a "discount" that is not one, and a holding period shorter
+# than the refund window.
+
+
+@pytest.fixture(autouse=True)
+def _reset_settings():
+	yield
+	from licence import settings as settings_mod
+	with store.db() as conn:
+		conn.execute("DELETE FROM settings")
+	settings_mod._cache = None
+
+
+def _save(patch: dict):
+	return client.post("/api/admin/settings", json=patch, headers=ADMIN)
+
+
+def test_settings_start_at_the_defaults_and_are_public():
+	r = client.get("/api/site-config")
+	assert r.status_code == 200
+	body = r.json()
+	assert body["price"]["amount"] == 39
+	assert body["downloads"]["enabled"] is True
+
+
+def test_a_saved_price_reaches_the_public_config():
+	assert _save({"price": {"amount": 29}}).status_code == 200
+	assert client.get("/api/site-config").json()["price"]["amount"] == 29
+
+
+def test_a_was_price_at_or_below_the_real_price_is_refused():
+	"""Not a discount — a claim that is either meaningless or false, and
+	price-marking rules treat it as the second one."""
+	r = _save({"price": {"amount": 39, "listAmount": 39}})
+	assert r.status_code == 400 and "higher" in r.json()["error"]
+
+	r = _save({"price": {"amount": 39, "listAmount": 20}})
+	assert r.status_code == 400
+
+	assert _save({"price": {"amount": 39, "listAmount": 0}}).status_code == 200
+
+
+def test_an_impossible_price_is_refused():
+	for bad in (0, -5, "free", 99999):
+		assert _save({"price": {"amount": bad}}).status_code == 400, bad
+
+
+def test_the_checkout_link_must_be_a_stripe_payment_link():
+	assert _save({"price": {"checkoutUrl": "https://evil.example.com/pay"}}).status_code == 400
+	assert _save({"price": {"checkoutUrl": "https://buy.stripe.com/abc"}}).status_code == 200
+	assert _save({"price": {"checkoutUrl": ""}}).status_code == 200
+
+
+def test_holding_commission_for_less_than_the_refund_window_is_refused():
+	"""14 days is the refund policy. Paying sooner means paying out on sales that
+	can still come back."""
+	r = _save({"affiliates": {"holdDays": 7}})
+	assert r.status_code == 400 and "refund" in r.json()["error"]
+	assert _save({"affiliates": {"holdDays": 14}}).status_code == 200
+
+
+def test_an_out_of_range_commission_is_refused():
+	assert _save({"affiliates": {"ratePct": 150}}).status_code == 400
+	assert _save({"affiliates": {"ratePct": -1}}).status_code == 400
+	assert _save({"affiliates": {"ratePct": 0}}).status_code == 200
+
+
+def test_a_notice_with_no_text_is_refused():
+	assert _save({"notice": {"enabled": True, "text": "  "}}).status_code == 400
+	assert _save({"notice": {"enabled": True, "text": "Back Monday"}}).status_code == 200
+
+
+def test_closing_the_programme_stops_new_commission_but_keeps_the_old():
+	_affiliate("closing")
+	key = _stripe_post(_sale("cs_set_1", "before@example.com", ref="closing")).json()["key"]
+	assert store.referral_for_licence(key) is not None
+
+	assert _save({"affiliates": {"enabled": False}}).status_code == 200
+
+	after = _stripe_post(_sale("cs_set_2", "after@example.com", ref="closing")).json()["key"]
+	assert store.referral_for_licence(after) is None, "a closed programme must not credit"
+	assert store.referral_for_licence(key) is not None, "existing commission must survive"
+
+
+def test_a_new_setting_does_not_come_back_missing_for_old_saves():
+	"""Settings are merged over the defaults, so a value added in a later version
+	fills in rather than leaving the site building with a hole in it."""
+	from licence import settings as settings_mod
+	with store.db() as conn:
+		conn.execute(
+			"INSERT INTO settings (key, value, updated_at) VALUES ('site', ?, 0)",
+			(json.dumps({"price": {"amount": 25}}),),
+		)
+	settings_mod._cache = None
+	body = client.get("/api/site-config").json()
+	assert body["price"]["amount"] == 25
+	assert body["downloads"]["installerUrl"].startswith("https://")
+	assert body["affiliates"]["ratePct"] == 30
+
+
+def test_settings_endpoints_need_the_admin_token():
+	assert client.get("/api/admin/settings").status_code == 401
+	assert client.post("/api/admin/settings", json={}).status_code == 401
+	assert client.post("/api/admin/publish").status_code == 401
+	# The public one is public on purpose — it is about to be printed into HTML.
+	assert client.get("/api/site-config").status_code == 200
+
+
+def test_publish_says_so_when_it_is_not_wired_up():
+	r = client.post("/api/admin/publish", headers=ADMIN)
+	assert r.status_code == 503 and "saved either way" in r.json()["error"]
+
+
+def test_the_admin_view_warns_when_the_checkout_is_a_test_link():
+	_save({"price": {"checkoutUrl": "https://buy.stripe.com/test_abc"}})
+	warnings = " ".join(client.get("/api/admin/settings", headers=ADMIN).json()["warnings"])
+	assert "TEST" in warnings
+
+	_save({"price": {"checkoutUrl": ""}})
+	warnings = " ".join(client.get("/api/admin/settings", headers=ADMIN).json()["warnings"])
+	assert "nobody can buy" in warnings
