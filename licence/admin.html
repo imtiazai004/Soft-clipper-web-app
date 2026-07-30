@@ -335,6 +335,36 @@
 	</div>
 
 	<div class="card">
+		<h2>App updates</h2>
+		<p class="hint" style="margin-top:0">
+			This is what an <em>already installed</em> copy of Soft Clipper is told when it checks
+			for a new version — once a day, in the background. It is not the site. Fill it in
+			<strong>after</strong> the new installer is on R2, because every app that reads it will
+			go straight to that link.
+		</p>
+		<label class="check">
+			<input id="setVerAnnounce" type="checkbox">
+			<span>Tell installed apps about the version below</span>
+		</label>
+		<div class="row" style="margin-top:12px">
+			<label class="field" style="max-width:180px">
+				<span>Latest version</span>
+				<input id="setVerLatest" placeholder="1.4.0">
+			</label>
+			<label class="field grow">
+				<span>What changed — shown in the app</span>
+				<input id="setVerNotes" placeholder="Faster rendering, fixes the YouTube download error">
+			</label>
+		</div>
+		<p class="hint" id="verHint"></p>
+		<p class="hint">
+			Licences are not tied to a version, so this costs the customer nothing — they run the
+			new installer over the old one and their key is still there. Leave the version empty
+			to say nothing at all.
+		</p>
+	</div>
+
+	<div class="card">
 		<h2>Affiliate programme</h2>
 		<label class="check">
 			<input id="setAffEnabled" type="checkbox">
@@ -911,6 +941,13 @@ function fillSettings(s) {
 	$("setMacEnabled").checked = !!s.downloads.macEnabled;
 	$("setMacUrl").value = s.downloads.macUrl;
 	$("setMacSize").value = s.downloads.macSize;
+	// `version` arrived after the first settings rows were written. The server
+	// merges it in from the defaults, but reading it defensively costs one `||`
+	// and means an older server cannot leave this page throwing on load.
+	const ver = s.version || {};
+	$("setVerAnnounce").checked = ver.announce !== false;
+	$("setVerLatest").value = ver.latest || "";
+	$("setVerNotes").value = ver.notes || "";
 	$("setAffEnabled").checked = !!s.affiliates.enabled;
 	$("setAffRate").value = s.affiliates.ratePct;
 	$("setAffHold").value = s.affiliates.holdDays;
@@ -918,7 +955,32 @@ function fillSettings(s) {
 	$("setNoticeText").value = s.notice.text || "";
 	$("setNoticeTone").value = s.notice.tone || "info";
 	priceHint();
+	versionHint();
 }
+
+/** Say plainly what an installed app will be told, before it is told it. */
+function versionHint() {
+	const latest = $("setVerLatest").value.trim();
+	const on = $("setVerAnnounce").checked;
+	const downloadsOn = $("setDlEnabled").checked;
+	if (!latest) {
+		$("verHint").textContent =
+			"No version set — installed apps are told nothing and stay where they are.";
+	} else if (!on) {
+		$("verHint").textContent =
+			`Announcing is off, so ${latest} stays quiet. Nothing is un-published — apps just are not nudged.`;
+	} else if (!downloadsOn) {
+		$("verHint").textContent =
+			"Downloads are switched off above, which silences this too — the app will not send " +
+			"anyone to a link the site is currently refusing to hand out.";
+	} else {
+		$("verHint").textContent =
+			`Every copy older than ${latest} will offer the download within a day. Make sure that ` +
+			"build is on R2 under the usual filename first.";
+	}
+}
+["setVerLatest", "setVerNotes"].forEach((id) => $(id).addEventListener("input", versionHint));
+["setVerAnnounce", "setDlEnabled"].forEach((id) => $(id).addEventListener("change", versionHint));
 
 function priceHint() {
 	const now = Number($("setAmount").value) || 0;
@@ -951,6 +1013,11 @@ function collectSettings() {
 			macEnabled: $("setMacEnabled").checked,
 			macUrl: $("setMacUrl").value.trim(),
 			macSize: $("setMacSize").value.trim(),
+		},
+		version: {
+			latest: $("setVerLatest").value.trim(),
+			notes: $("setVerNotes").value.trim(),
+			announce: $("setVerAnnounce").checked,
 		},
 		affiliates: {
 			enabled: $("setAffEnabled").checked,
@@ -986,9 +1053,31 @@ function checkoutStillMatches(next) {
 	);
 }
 
+/**
+ * Announcing a version is the one setting here that reaches out and touches
+ * customers' machines. Every installed copy older than the number typed above
+ * will offer that download within a day, and if the build is not on R2 yet what
+ * they get is a 404 — from the app, unprompted, which reads as the app being
+ * broken rather than the release being early. Asked only when the number
+ * actually changes to something new, so it stays a real question.
+ */
+function releaseIsReallyOut(next) {
+	if (!savedSettings) return true;
+	const was = (savedSettings.version || {}).latest || "";
+	const now = next.version.latest;
+	if (!now || now === was || !next.version.announce) return true;
+	return confirm(
+		`This tells every installed copy of Soft Clipper that ${now} is out, and sends ` +
+		"them to the installer link above.\n\n" +
+		"Is that build uploaded to R2 already, under the same filename?\n\n" +
+		"If not, cancel, upload it, then save this."
+	);
+}
+
 async function saveSettings(thenPublish) {
 	const next = collectSettings();
 	if (!checkoutStillMatches(next)) return false;
+	if (!releaseIsReallyOut(next)) return false;
 	return withBusy(thenPublish ? "publishBtn" : "saveBtn", "Saving…", async () => {
 		try {
 			const d = await api("/settings", { method: "POST", body: JSON.stringify(next) });

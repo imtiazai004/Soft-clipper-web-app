@@ -575,6 +575,76 @@ def test_a_new_setting_does_not_come_back_missing_for_old_saves():
 	assert body["affiliates"]["ratePct"] == 30
 
 
+def test_nothing_is_announced_until_a_version_is_typed():
+	"""The safe starting state. An empty version means installed apps are told
+	nothing at all — which is what should happen before anyone has released."""
+	version = client.get("/api/site-config").json()["version"]
+	assert version["latest"] == ""
+	assert version["winUrl"].startswith("https://")
+
+
+def test_a_saved_version_reaches_the_app():
+	assert _save({"version": {"latest": "1.4.0", "notes": "Faster renders"}}).status_code == 200
+	version = client.get("/api/site-config").json()["version"]
+	assert version["latest"] == "1.4.0"
+	assert version["notes"] == "Faster renders"
+	assert version["winUrl"].endswith("Soft-Clipper-Setup.exe")
+
+
+def test_something_that_is_not_a_version_number_is_refused():
+	"""The app pulls the digits out and compares them as numbers. Text with no
+	digits compares as (0,), which would quietly mean "no update" forever — a
+	silence nobody would think to look for."""
+	for bad in ("latest", "v1.4-beta", "next release", "1.4.0 (final)"):
+		r = _save({"version": {"latest": bad}})
+		assert r.status_code == 400, bad
+		assert "version number" in r.json()["error"]
+
+	for good in ("1.4.0", "v1.4.0", "2", "1.10.2.1"):
+		assert _save({"version": {"latest": good}}).status_code == 200, good
+
+
+def test_release_notes_have_a_limit():
+	assert _save({"version": {"notes": "x" * 1501}}).status_code == 400
+	assert _save({"version": {"notes": "x" * 1500}}).status_code == 200
+
+
+def test_announcing_can_be_switched_off_without_unpublishing():
+	"""For when a build turns out to be bad: stop nudging people towards it
+	without losing the version number itself."""
+	assert _save({"version": {"latest": "1.4.0", "announce": False}}).status_code == 200
+	assert client.get("/api/site-config").json()["version"]["latest"] == ""
+
+	from licence import settings as settings_mod
+	assert settings_mod.get(fresh=True)["version"]["latest"] == "1.4.0", "still stored"
+
+	assert _save({"version": {"announce": True}}).status_code == 200
+	assert client.get("/api/site-config").json()["version"]["latest"] == "1.4.0"
+
+
+def test_switching_downloads_off_silences_the_update_too():
+	"""The page says "paused while we ship an update". It would be strange for the
+	app to be queueing people up to fetch it in the same breath."""
+	assert _save({"version": {"latest": "1.4.0"}, "downloads": {"enabled": False}}).status_code == 200
+	assert client.get("/api/site-config").json()["version"]["latest"] == ""
+
+
+def test_the_mac_link_is_empty_until_the_mac_build_is_published():
+	"""So a Mac that checks for updates before there is a Mac build is not sent to
+	a file that is not there."""
+	assert _save({"downloads": {"macEnabled": False}}).status_code == 200
+	assert client.get("/api/site-config").json()["version"]["macUrl"] == ""
+
+	assert _save({"downloads": {"macEnabled": True}}).status_code == 200
+	assert client.get("/api/site-config").json()["version"]["macUrl"].endswith(".dmg")
+
+
+def test_announcing_a_version_warns_about_uploading_it():
+	"""The one setting here that reaches customers' machines unprompted."""
+	warnings = _save({"version": {"latest": "1.4.0"}}).json()["warnings"]
+	assert any("1.4.0" in w and "R2" in w for w in warnings)
+
+
 def test_settings_endpoints_need_the_admin_token():
 	assert client.get("/api/admin/settings").status_code == 401
 	assert client.post("/api/admin/settings", json={}).status_code == 401
@@ -606,10 +676,19 @@ def test_the_mac_download_cannot_be_published_without_a_link():
 	assert r.status_code == 400 and "Mac" in r.json()["error"]
 
 	assert _save({
-		"downloads": {"macEnabled": True, "macUrl": "https://dl.softclipper.pro/Soft-Clipper-macOS.zip"}
+		"downloads": {"macEnabled": True, "macUrl": "https://dl.softclipper.pro/Soft-Clipper.dmg"}
 	}).status_code == 200
 	assert client.get("/api/site-config").json()["downloads"]["macEnabled"] is True
 
 
-def test_mac_is_off_until_someone_turns_it_on():
-	assert client.get("/api/site-config").json()["downloads"]["macEnabled"] is False
+def test_the_mac_default_ships_with_a_link_to_go_with_it():
+	"""This used to assert the Mac switch defaulted to off, and it went stale the
+	day the Mac build was published — the default moved and the test did not.
+
+	What is worth holding on to is the pairing, not the value: whichever way the
+	switch starts, it must not start turned on with nowhere to send anyone. That
+	stays true the next time the default changes."""
+	downloads = client.get("/api/site-config").json()["downloads"]
+	if downloads["macEnabled"]:
+		assert downloads["macUrl"].startswith("https://")
+		assert downloads["macUrl"].endswith(".dmg"), "the dmg ships, a zip of the app does not"

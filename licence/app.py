@@ -664,6 +664,16 @@ def _setting_warnings(s: dict) -> list[str]:
 
 	if not s["downloads"]["enabled"]:
 		out.append("Downloads are switched off. Buyers can still pay but cannot install.")
+
+	version = s.get("version", {})
+	latest = str(version.get("latest", "") or "").strip()
+	if latest and version.get("announce", True) and s["downloads"]["enabled"]:
+		out.append(
+			f"Installed copies of Soft Clipper will start offering {latest} within a day. "
+			"Check that build really is on R2 under the usual filename."
+		)
+	elif latest and not version.get("announce", True):
+		out.append(f"Version {latest} is set but not announced — installed apps are told nothing.")
 	if not s["affiliates"]["enabled"]:
 		out.append("The affiliate programme is closed. New referrals earn nothing; existing commission is still owed.")
 	return out

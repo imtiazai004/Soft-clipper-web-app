@@ -21,6 +21,7 @@ rather than shipping a pricing page with nothing on it.
 from __future__ import annotations
 
 import json
+import re
 import time
 
 from . import store
@@ -59,6 +60,32 @@ DEFAULTS: dict = {
 		"macEnabled": True,
 		"macUrl": "https://dl.softclipper.pro/Soft-Clipper.dmg",
 		"macSize": "202 MB",
+	},
+	# What the *desktop app* asks for when it checks for updates — not the site.
+	#
+	# It used to ask GitHub for the latest release. That stopped working the day
+	# the repository went private: GitHub answers an unauthenticated request for a
+	# private repo's releases with 404, the app swallows the error and reports
+	# "up to date", and every customer stays on an old build forever with nothing
+	# to show that anything is wrong. Worse, when it did work it handed out a
+	# GitHub release asset — a download for anyone with the URL, which is exactly
+	# what the site stopped doing.
+	#
+	# So the app asks us instead. `latest` is typed here after the build has been
+	# uploaded to R2, and that ordering matters: announcing a version whose
+	# installer is not yet in place sends every customer to a 404.
+	"version": {
+		# Empty means "say nothing". The app treats no answer and an empty answer
+		# the same way — no update — so a blank field is the safe state, not a
+		# broken one.
+		"latest": "",
+		# Shown in the app beside the offer. A couple of lines about what changed
+		# is the difference between an update people install and one they dismiss.
+		"notes": "",
+		# Whether the app is allowed to mention it at all. Turning this off does
+		# not un-publish anything; it stops the nagging while a bad build is being
+		# replaced, which is when you least want people installing it.
+		"announce": True,
 	},
 	"affiliates": {
 		"enabled": True,
@@ -161,6 +188,27 @@ def validate(s: dict):
 	if downloads.get("macEnabled") and not downloads.get("macUrl"):
 		raise Invalid("Turning on the Mac download needs a link to the Mac build.")
 
+	version = s.get("version", {})
+	latest = str(version.get("latest", "") or "").strip()
+	if latest:
+		# The app compares this numerically against its own version — see
+		# parse_version in the desktop app's core/updates.py, which pulls the
+		# digits out and compares them as numbers so 1.10 beats 1.9. Anything
+		# without a digit in it compares as (0,) and would tell every customer
+		# they are ahead of the latest release, which is silence, not an error.
+		if not re.fullmatch(r"v?\d+(\.\d+){0,3}", latest):
+			raise Invalid(
+				f"'{latest}' is not a version number. Write it like 1.4.0 — the app "
+				"compares the digits, and anything else quietly means 'no update'."
+			)
+
+	notes = str(version.get("notes", "") or "")
+	if len(notes) > 1500:
+		# The app shows these in a small panel and truncates GitHub's at the same
+		# length. Refusing here is kinder than silently cutting a sentence in half
+		# on the customer's screen.
+		raise Invalid(f"Release notes are {len(notes)} characters. Keep them under 1500.")
+
 	aff = s.get("affiliates", {})
 	rate = aff.get("ratePct")
 	if not isinstance(rate, int) or not 0 <= rate <= 100:
@@ -184,6 +232,31 @@ def validate(s: dict):
 		raise Invalid("Notice tone must be 'info' or 'warn'.")
 
 
+def _public_version(s: dict) -> dict:
+	"""What an installed copy of the desktop app is told about newer ones.
+
+	Two conditions silence it, and both are the same judgement: never point a
+	customer at a download that is not there. `announce` off is someone deciding
+	that deliberately, usually because a build turned out to be bad. Downloads
+	being off is the same decision made on the site — it would be strange for the
+	page to say "paused while we ship an update" while the app queued people up to
+	fetch it anyway.
+
+	The installer links come from `downloads` rather than being typed again here.
+	They are the same two files, and a second copy of a URL is a second chance for
+	one of them to be wrong.
+	"""
+	version = s.get("version", DEFAULTS["version"])
+	downloads = s["downloads"]
+	quiet = not version.get("announce", True) or not downloads["enabled"]
+	return {
+		"latest": "" if quiet else str(version.get("latest", "") or "").strip(),
+		"notes": "" if quiet else str(version.get("notes", "") or ""),
+		"winUrl": downloads["installerUrl"],
+		"macUrl": downloads["macUrl"] if downloads["macEnabled"] else "",
+	}
+
+
 def public() -> dict:
 	"""What the marketing site is allowed to read, unauthenticated.
 
@@ -194,6 +267,7 @@ def public() -> dict:
 	s = get()
 	price, downloads, aff, notice = s["price"], s["downloads"], s["affiliates"], s["notice"]
 	return {
+		"version": _public_version(s),
 		"price": {
 			"amount": price["amount"],
 			"listAmount": price["listAmount"],
