@@ -127,10 +127,20 @@ def _generate_json(client, contents, schema, temperature=0.4):
     return json.loads(response.text)
 
 
-def _upload_and_wait(client, path: str, timeout_s: int = 300):
-    """Upload a file to Gemini Files API and wait until it is ACTIVE."""
+def _upload_and_wait(client, path: str, timeout_s: int = 300, on_status=None):
+    """Upload a file to Gemini Files API and wait until it is ACTIVE.
+
+    `on_status` is called with a line to show the person waiting. This stretch is
+    the longest silent gap in the whole app — a 40-minute video means a large
+    upload and then however long Google takes to process it, during which nothing
+    else has anything to report. Without it the progress bar sits still for
+    minutes and the honest conclusion is that the app has hung.
+    """
+    if on_status:
+        on_status("Uploading audio to Google...")
     uploaded = client.files.upload(file=path)
     deadline = time.time() + timeout_s
+    waited = 0
     while time.time() < deadline:
         f = client.files.get(name=uploaded.name)
         state = str(f.state)
@@ -138,7 +148,10 @@ def _upload_and_wait(client, path: str, timeout_s: int = 300):
             return uploaded
         if "FAILED" in state:
             raise RuntimeError("Gemini file processing failed")
+        if on_status:
+            on_status(f"Google is processing the audio... ({waited}s)")
         time.sleep(3)
+        waited += 3
     raise RuntimeError("Gemini file processing timeout")
 
 
@@ -479,13 +492,20 @@ def _validate_moments(moments: list[dict], duration: float, min_len: int, max_le
     return valid
 
 
-def transcribe_audio(audio_path: str, api_key: str) -> list[dict]:
+def transcribe_audio(audio_path: str, api_key: str, on_status=None) -> list[dict]:
     """Transcribe audio via Gemini Files API. Returns transcript segments
     [{"start": sec, "duration": sec, "text": ...}] or raises on failure.
     Works for Urdu, Pashto, Hindi, English, etc.
+
+    `on_status(message)` is optional and reports what this is doing while it
+    does it — upload, then Google's processing, then the transcription itself.
+    Optional rather than required because two callers already exist and only one
+    of them has a job to write progress into.
     """
     client = _client(api_key)
-    uploaded = _upload_and_wait(client, audio_path)
+    uploaded = _upload_and_wait(client, audio_path, on_status=on_status)
+    if on_status:
+        on_status("Transcribing the audio...")
     try:
         prompt = """Transcribe this audio with accurate timestamps.
 Split into short segments of at most 8-10 words each.
