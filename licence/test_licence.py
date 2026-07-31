@@ -26,6 +26,7 @@ from fastapi.testclient import TestClient
 # Configure before importing the app — module-level env reads happen at import.
 _tmp = tempfile.mkdtemp()
 os.environ["LICENCE_DB"] = os.path.join(_tmp, "test.db")
+os.environ["BANK_PROOF_DIR"] = os.path.join(_tmp, "payment-proofs")
 _priv = Ed25519PrivateKey.generate()
 os.environ["LICENCE_PRIVATE_KEY"] = base64.b64encode(
 	_priv.private_bytes(
@@ -43,7 +44,7 @@ os.environ["AFFILIATE_COOKIE_SECURE"] = "0"
 os.environ["AFFILIATE_PORTAL_URL"] = "http://testserver/partner"
 
 from licence import app as licence_app  # noqa: E402
-from licence import crypto, mail, store  # noqa: E402
+from licence import bank_payments, crypto, mail, store  # noqa: E402
 
 client = TestClient(licence_app.app)
 ADMIN = {"x-admin-token": "test-admin-token"}
@@ -262,7 +263,13 @@ def _stripe_post(event: dict, secret="whsec_test", ts: int | None = None):
 def _session(session_id: str, email: str) -> dict:
 	return {
 		"type": "checkout.session.completed",
-		"data": {"object": {"id": session_id, "customer_details": {"email": email}}},
+		"data": {
+			"object": {
+				"id": session_id,
+				"customer_details": {"email": email},
+				"payment_status": "paid",
+			}
+		},
 	}
 
 
@@ -278,6 +285,21 @@ def test_stripe_retry_does_not_issue_a_second_licence():
 	second = _stripe_post(_session("cs_test_2", "retry@example.com")).json()
 	assert second["key"] == first["key"]
 	assert second["duplicate"] is True
+
+
+def test_a_delayed_stripe_session_waits_until_payment_succeeds():
+	event = _session("cs_delayed_1", "delayed@example.com")
+	event["data"]["object"]["payment_status"] = "unpaid"
+	first = _stripe_post(event)
+	assert first.status_code == 200
+	assert first.json()["pending"] is True
+	assert store.find_by_source("cs_delayed_1") is None
+
+	event["type"] = "checkout.session.async_payment_succeeded"
+	event["data"]["object"]["payment_status"] = "paid"
+	paid = _stripe_post(event)
+	assert paid.status_code == 200
+	assert store.get(paid.json()["key"])["email"] == "delayed@example.com"
 
 
 def test_a_forged_or_stale_webhook_is_rejected():
@@ -300,6 +322,122 @@ def test_a_refund_revokes_the_licence():
 	assert client.post("/api/licence/validate", json={"key": key, "fingerprint": PC_A}).status_code == 403
 
 
+# ── Pakistani bank checkout ─────────────────────────────────────────────────
+
+
+def _bank_order(email: str = "pk-buyer@example.com", method: str = "bank", ref: str = "") -> dict:
+	# A fresh persisted rate keeps tests deterministic and exercises the same
+	# outage/cache path production uses without calling the State Bank website.
+	store.save_fx_rate("USD/PKR", "280.00", "31-Jul-2026", int(time.time()))
+	r = client.post(
+		"/api/checkout/bank/orders",
+		json={"email": email, "method": method, "ref": ref},
+	)
+	assert r.status_code == 200, r.text
+	return r.json()
+
+
+def _submit_bank(order_data: dict, transaction: str, proof: str = ""):
+	return client.post(
+		f"/api/checkout/bank/orders/{order_data['order']['reference']}/submit",
+		json={
+			"token": order_data["token"],
+			"transaction_id": transaction,
+			"proof_data": proof,
+		},
+	)
+
+
+def test_state_bank_rate_parser_reads_the_weighted_average_offer():
+	raw = """
+		<section><h4>USD/ PKR Rates</h4><p>As on 30-Jul - 2026</p>
+		<p>M2M Revaluation Rate</p><strong>277.8118</strong>
+		<h5>Weighted Average Rate</h5><span>BID</span><b>277.5321</b>
+		<span>Offer</span><b>277.9572</b><h4>Cut-off Rates in the Latest Auctions</h4></section>
+	"""
+	rate, date = bank_payments.parse_sbp_rate(raw)
+	assert str(rate) == "277.9572"
+	assert date == "30-Jul - 2026"
+
+
+def test_bank_order_uses_the_current_configured_usd_price_and_locked_pkr_quote():
+	order = _bank_order(method="jazzcash")
+	assert order["order"]["usd_cents"] == 3900
+	assert order["order"]["pkr_amount"] == 10920
+	assert order["order"]["fx_rate"] == "280.00"
+	assert order["order"]["method"] == "jazzcash"
+	assert order["payment_details"]["bank"]["name"] == "Bank Al-Habib"
+
+
+def test_submitted_bank_payment_only_issues_a_licence_after_admin_approval(monkeypatch):
+	sent = []
+	monkeypatch.setattr(mail, "send_bank_payment_submitted", lambda *args: True)
+	monkeypatch.setattr(mail, "notify_bank_payment", lambda *args: True)
+	monkeypatch.setattr(mail, "send_licence", lambda email, key: sent.append((email, key)) or True)
+
+	created = _bank_order("approve-me@example.com")
+	reference = created["order"]["reference"]
+	submitted = _submit_bank(created, "BAH-APPROVE-1001")
+	assert submitted.status_code == 200, submitted.text
+	assert store.bank_order(reference)["status"] == "submitted"
+	assert store.find_by_source(f"bank:{reference}") is None
+
+	approved = client.post(f"/api/admin/bank-orders/{reference}/approve", headers=ADMIN)
+	assert approved.status_code == 200, approved.text
+	order = store.bank_order(reference)
+	licence = store.find_by_source(f"bank:{reference}")
+	assert order["status"] == "paid"
+	assert licence["key"] == order["licence_key"]
+	assert sent == [("approve-me@example.com", licence["key"])]
+
+	# Retrying the admin request returns the original result and sends nothing.
+	second = client.post(f"/api/admin/bank-orders/{reference}/approve", headers=ADMIN)
+	assert second.status_code == 200
+	assert second.json()["duplicate"] is True
+	assert sent == [("approve-me@example.com", licence["key"])]
+
+
+def test_transaction_id_cannot_be_reused_for_a_second_bank_order(monkeypatch):
+	monkeypatch.setattr(mail, "send_bank_payment_submitted", lambda *args: True)
+	monkeypatch.setattr(mail, "notify_bank_payment", lambda *args: True)
+	first = _bank_order("first-bank@example.com")
+	second = _bank_order("second-bank@example.com")
+	assert _submit_bank(first, "ONE-REAL-TRANSACTION").status_code == 200
+	duplicate = _submit_bank(second, "ONE-REAL-TRANSACTION")
+	assert duplicate.status_code == 409
+	assert "already been submitted" in duplicate.json()["error"]
+
+
+def test_payment_proof_is_private_and_requires_admin_token(monkeypatch):
+	monkeypatch.setattr(mail, "send_bank_payment_submitted", lambda *args: True)
+	monkeypatch.setattr(mail, "notify_bank_payment", lambda *args: True)
+	created = _bank_order("proof@example.com")
+	png = base64.b64encode(b"\x89PNG\r\n\x1a\nprivate-proof").decode()
+	assert _submit_bank(created, "PROOF-TRANSACTION-1", f"data:image/png;base64,{png}").status_code == 200
+	reference = created["order"]["reference"]
+	path = f"/api/admin/bank-orders/{reference}/proof"
+	assert client.get(path).status_code == 401
+	proof = client.get(path, headers=ADMIN)
+	assert proof.status_code == 200
+	assert proof.content.startswith(b"\x89PNG")
+
+
+def test_approved_bank_sale_credits_affiliate_at_the_same_usd_price(monkeypatch):
+	monkeypatch.setattr(mail, "send_bank_payment_submitted", lambda *args: True)
+	monkeypatch.setattr(mail, "notify_bank_payment", lambda *args: True)
+	monkeypatch.setattr(mail, "send_licence", lambda *args: True)
+	_affiliate("pkpartner", rate=30)
+	created = _bank_order("pk-customer@example.com", ref="pkpartner")
+	reference = created["order"]["reference"]
+	assert _submit_bank(created, "PK-AFFILIATE-1001").status_code == 200
+	approved = client.post(f"/api/admin/bank-orders/{reference}/approve", headers=ADMIN)
+	assert approved.status_code == 200, approved.text
+	referral = store.referral_for_licence(approved.json()["order"]["licence_key"])
+	assert referral["currency"] == "usd"
+	assert referral["gross"] == 3900
+	assert referral["commission"] == 1170
+
+
 # ── affiliates ───────────────────────────────────────────────────────────────
 #
 # This is the part of the service that decides how much money leaves the
@@ -319,6 +457,7 @@ def _sale(session_id: str, email: str, ref: str = "", total: int = 3900) -> dict
 				"client_reference_id": ref,
 				"amount_total": total,
 				"currency": "usd",
+				"payment_status": "paid",
 			}
 		},
 	}

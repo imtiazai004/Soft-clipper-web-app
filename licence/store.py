@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import hashlib
+import hmac
 from contextlib import contextmanager
 
 DB_PATH = os.environ.get("LICENCE_DB", "/data/licences.db")
@@ -119,6 +121,47 @@ CREATE TABLE IF NOT EXISTS referrals (
 );
 CREATE INDEX IF NOT EXISTS referrals_code ON referrals(code);
 CREATE INDEX IF NOT EXISTS referrals_licence ON referrals(licence_key);
+
+-- A domestic transfer is not a sale until the owner has seen the money arrive.
+-- The quote and the submitted evidence live here while it is waiting. The
+-- public token is stored as a hash, like a password, so a database copy cannot
+-- be used to look up somebody else's order.
+CREATE TABLE IF NOT EXISTS bank_orders (
+    reference       TEXT PRIMARY KEY,
+    token_hash      TEXT NOT NULL,
+    email           TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'awaiting_payment',
+    method          TEXT NOT NULL,                    -- bank | jazzcash
+    usd_cents       INTEGER NOT NULL,
+    fx_rate         TEXT NOT NULL,
+    rate_date       TEXT NOT NULL,
+    rate_stale      INTEGER NOT NULL DEFAULT 0,
+    pkr_amount      INTEGER NOT NULL,                 -- whole rupees
+    affiliate_code  TEXT,
+    transaction_id  TEXT COLLATE NOCASE,
+    proof_path      TEXT,
+    proof_sha256    TEXT,
+    created_at      INTEGER NOT NULL,
+    expires_at      INTEGER NOT NULL,
+    submitted_at    INTEGER,
+    decided_at      INTEGER,
+    decided_note    TEXT,
+    licence_key     TEXT
+);
+CREATE INDEX IF NOT EXISTS bank_orders_status ON bank_orders(status, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS bank_orders_transaction
+    ON bank_orders(transaction_id) WHERE transaction_id IS NOT NULL AND transaction_id <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS bank_orders_proof
+    ON bank_orders(proof_sha256) WHERE proof_sha256 IS NOT NULL AND proof_sha256 <> '';
+
+-- The State Bank page is fetched on demand. Persisting the last good result
+-- means a short SBP outage does not take the Pakistani checkout down.
+CREATE TABLE IF NOT EXISTS fx_rates (
+    pair       TEXT PRIMARY KEY,
+    rate       TEXT NOT NULL,
+    rate_date  TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+);
 
 -- Everything an owner can change without a developer: price, discount, download
 -- links, whether the affiliate programme is open. One JSON row, so a save is a
@@ -256,6 +299,199 @@ def events_for(key: str, limit: int = 50) -> list[dict]:
 			"SELECT * FROM events WHERE key = ? ORDER BY at DESC LIMIT ?", (key, limit)
 		).fetchall()
 		return [dict(r) for r in rows]
+
+
+# ── Pakistani bank orders ────────────────────────────────────────────────────
+
+
+class DuplicatePayment(ValueError):
+	"""A transaction id or receipt has already been submitted for another order."""
+
+
+class BankOrderState(ValueError):
+	"""The requested transition does not make sense for the order's state."""
+
+
+def _order_token_hash(token: str) -> str:
+	return hashlib.sha256((token or "").encode()).hexdigest()
+
+
+def create_bank_order(
+	reference: str,
+	token: str,
+	email: str,
+	method: str,
+	usd_cents: int,
+	fx_rate: str,
+	rate_date: str,
+	rate_stale: bool,
+	pkr_amount: int,
+	affiliate_code: str = "",
+	expires_at: int = 0,
+) -> dict:
+	now = int(time.time())
+	with db() as conn:
+		conn.execute(
+			"INSERT INTO bank_orders (reference, token_hash, email, method, usd_cents, fx_rate,"
+			" rate_date, rate_stale, pkr_amount, affiliate_code, created_at, expires_at)"
+			" VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+			(
+				reference,
+				_order_token_hash(token),
+				email.lower().strip(),
+				method,
+				int(usd_cents),
+				str(fx_rate),
+				rate_date,
+				int(bool(rate_stale)),
+				int(pkr_amount),
+				normalise_code(affiliate_code) or None,
+				now,
+				int(expires_at),
+			),
+		)
+		log(conn, None, "bank_order_created", f"{reference} {pkr_amount} PKR {method}")
+	return bank_order(reference)
+
+
+def bank_order(reference: str, token: str = "") -> dict | None:
+	with db() as conn:
+		row = conn.execute(
+			"SELECT * FROM bank_orders WHERE reference = ?", ((reference or "").upper(),)
+		).fetchone()
+	if not row:
+		return None
+	out = dict(row)
+	if token and not hmac.compare_digest(out["token_hash"], _order_token_hash(token)):
+		return None
+	return out
+
+
+def submit_bank_order(
+	reference: str,
+	token: str,
+	transaction_id: str,
+	proof_path: str = "",
+	proof_sha256: str = "",
+) -> dict:
+	reference = (reference or "").upper()
+	now = int(time.time())
+	with db() as conn:
+		conn.execute("BEGIN IMMEDIATE")
+		row = conn.execute("SELECT * FROM bank_orders WHERE reference = ?", (reference,)).fetchone()
+		if not row or not hmac.compare_digest(row["token_hash"], _order_token_hash(token)):
+			raise BankOrderState("That bank-payment order was not found.")
+		if row["status"] == "submitted" and (row["transaction_id"] or "") == transaction_id:
+			return dict(row)
+		if row["status"] != "awaiting_payment":
+			raise BankOrderState(f"This order is already {row['status'].replace('_', ' ')}.")
+		if now > int(row["expires_at"]):
+			raise BankOrderState("This PKR quote has expired. Start a new bank-payment order.")
+
+		try:
+			conn.execute(
+				"UPDATE bank_orders SET status = 'submitted', transaction_id = ?, proof_path = ?,"
+				" proof_sha256 = ?, submitted_at = ? WHERE reference = ?",
+				(transaction_id, proof_path or None, proof_sha256 or None, now, reference),
+			)
+		except sqlite3.IntegrityError as exc:
+			raise DuplicatePayment(
+				"That transaction ID or payment screenshot has already been submitted."
+			) from exc
+		log(conn, None, "bank_order_submitted", f"{reference} transaction:{transaction_id}")
+		updated = conn.execute("SELECT * FROM bank_orders WHERE reference = ?", (reference,)).fetchone()
+		return dict(updated)
+
+
+def bank_orders(status: str = "", limit: int = 200) -> list[dict]:
+	with db() as conn:
+		if status:
+			rows = conn.execute(
+				"SELECT * FROM bank_orders WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+				(status, int(limit)),
+			).fetchall()
+		else:
+			rows = conn.execute(
+				"SELECT * FROM bank_orders ORDER BY created_at DESC LIMIT ?", (int(limit),)
+			).fetchall()
+	return [dict(row) for row in rows]
+
+
+def fulfil_bank_order(reference: str, key: str, note: str = "") -> tuple[dict, bool]:
+	"""Atomically turn one verified transfer into one licence.
+
+	Returns ``(order, duplicate)`` so a retried admin click does not resend the
+	licence email or credit an affiliate twice.
+	"""
+	reference = (reference or "").upper()
+	now = int(time.time())
+	with db() as conn:
+		conn.execute("BEGIN IMMEDIATE")
+		row = conn.execute("SELECT * FROM bank_orders WHERE reference = ?", (reference,)).fetchone()
+		if not row:
+			raise BankOrderState("That bank-payment order was not found.")
+		if row["status"] == "paid" and row["licence_key"]:
+			return dict(row), True
+		if row["status"] != "submitted":
+			raise BankOrderState("Only a submitted payment can be approved.")
+
+		source = f"bank:{reference}"
+		conn.execute(
+			"INSERT INTO licences (key, email, created_at, source, note, ref) VALUES (?,?,?,?,?,?)",
+			(
+				key,
+				row["email"],
+				now,
+				source,
+				f"Verified Pakistani transfer {reference}" + (f" — {note}" if note else ""),
+				row["affiliate_code"] or None,
+			),
+		)
+		conn.execute(
+			"UPDATE bank_orders SET status = 'paid', decided_at = ?, decided_note = ?,"
+			" licence_key = ? WHERE reference = ?",
+			(now, note, key, reference),
+		)
+		log(conn, key, "created", f"{row['email']} via {source}")
+		log(conn, key, "bank_order_approved", f"{reference} {row['pkr_amount']} PKR")
+		updated = conn.execute("SELECT * FROM bank_orders WHERE reference = ?", (reference,)).fetchone()
+		return dict(updated), False
+
+
+def reject_bank_order(reference: str, note: str = "") -> dict:
+	reference = (reference or "").upper()
+	with db() as conn:
+		conn.execute("BEGIN IMMEDIATE")
+		row = conn.execute("SELECT * FROM bank_orders WHERE reference = ?", (reference,)).fetchone()
+		if not row:
+			raise BankOrderState("That bank-payment order was not found.")
+		if row["status"] != "submitted":
+			raise BankOrderState("Only a submitted payment can be rejected.")
+		now = int(time.time())
+		conn.execute(
+			"UPDATE bank_orders SET status = 'rejected', decided_at = ?, decided_note = ?"
+			" WHERE reference = ?",
+			(now, note, reference),
+		)
+		log(conn, None, "bank_order_rejected", f"{reference} {note}".strip())
+		updated = conn.execute("SELECT * FROM bank_orders WHERE reference = ?", (reference,)).fetchone()
+		return dict(updated)
+
+
+def get_fx_rate(pair: str) -> dict | None:
+	with db() as conn:
+		row = conn.execute("SELECT * FROM fx_rates WHERE pair = ?", (pair,)).fetchone()
+		return dict(row) if row else None
+
+
+def save_fx_rate(pair: str, rate: str, rate_date: str, fetched_at: int):
+	with db() as conn:
+		conn.execute(
+			"INSERT INTO fx_rates (pair, rate, rate_date, fetched_at) VALUES (?,?,?,?)"
+			" ON CONFLICT(pair) DO UPDATE SET rate = excluded.rate,"
+			" rate_date = excluded.rate_date, fetched_at = excluded.fetched_at",
+			(pair, str(rate), rate_date, int(fetched_at)),
+		)
 
 
 # ── affiliates ───────────────────────────────────────────────────────────────

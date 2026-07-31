@@ -108,6 +108,69 @@ Stuck? Reply to this email, or WhatsApp {SUPPORT_WHATSAPP}.
 	return _send(to, "Your Soft Clipper licence key", body, what=f"licence {key}")
 
 
+# ── Pakistani bank payments ─────────────────────────────────────────────────
+
+
+def send_bank_payment_submitted(to: str, reference: str, amount_pkr: int) -> bool:
+	return _send(
+		to,
+		f"Payment submitted — {reference}",
+		f"""Thanks. We received the payment details for your Soft Clipper order.
+
+Order reference: {reference}
+Amount to verify: PKR {amount_pkr:,}
+
+This is not a payment confirmation yet. We will compare the transaction with
+the receiving account. Once it is verified, your licence key and download link
+will be emailed to this address.
+
+If anything was entered incorrectly, reply to this email or WhatsApp
+{SUPPORT_WHATSAPP} and quote {reference}.
+
+— Soft Clipper
+""",
+		what=f"bank-payment receipt {reference}",
+	)
+
+
+def notify_bank_payment(reference: str, email: str, amount_pkr: int, method: str, transaction_id: str) -> bool:
+	return _send(
+		OWNER_EMAIL,
+		f"Bank payment waiting — {reference}",
+		f"""A Pakistani payment is waiting for verification.
+
+Order: {reference}
+Customer: {email}
+Expected: PKR {amount_pkr:,}
+Method: {method}
+Transaction ID: {transaction_id}
+
+Open the licence admin dashboard, compare it with the actual incoming bank or
+JazzCash transaction, then approve or reject it there. A screenshot is supporting
+evidence only; do not approve without seeing the credit in the receiving account.
+""",
+		what=f"bank-payment notification {reference}",
+	)
+
+
+def send_bank_payment_rejected(to: str, reference: str, reason: str = "") -> bool:
+	detail = reason or "The submitted transaction could not be matched to the receiving account."
+	return _send(
+		to,
+		f"We could not verify payment — {reference}",
+		f"""We could not verify the payment submitted for Soft Clipper order {reference}.
+
+{detail}
+
+No licence has been issued. Reply to this email or WhatsApp {SUPPORT_WHATSAPP}
+with the order reference and your transaction details so we can check it with you.
+
+— Soft Clipper
+""",
+		what=f"bank-payment rejection {reference}",
+	)
+
+
 # ── affiliates ───────────────────────────────────────────────────────────────
 #
 # Four messages, and between them they are the whole of an affiliate's contact

@@ -14,6 +14,8 @@ import hmac
 import json
 import logging
 import os
+import re
+import secrets
 import time
 import urllib.parse
 
@@ -22,9 +24,9 @@ import pathlib
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from . import crypto, mail, settings, store, stripe_api
+from . import bank_payments, crypto, mail, settings, store, stripe_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("licence")
@@ -338,6 +340,47 @@ def _credit_affiliate(ref: str, key: str, session_id: str, session: dict, buyer_
 		log.info("credited %s: %s of %s to %s", session_id, row["commission"], gross, ref)
 
 
+def _fulfil_stripe_checkout(obj: dict) -> dict:
+	session_id = obj.get("id", "")
+	email = (
+		obj.get("customer_details", {}).get("email")
+		or obj.get("customer_email")
+		or ""
+	).strip()
+
+	# Stripe retries on any non-2xx, so this must be safe to run twice.
+	existing = store.find_by_source(session_id)
+	if existing:
+		log.info("session %s already has licence %s", session_id, existing["key"])
+		return {"ok": True, "key": existing["key"], "duplicate": True}
+
+	if not email:
+		log.error("session %s completed with no email — cannot deliver a key", session_id)
+		raise HTTPException(400, "No email on session")
+
+	# The affiliate tag, if the buyer arrived through a referral link. Stripe
+	# carries it from the Payment Link URL to here untouched, which is why the
+	# site does not need a server of its own to attribute a sale.
+	ref = store.normalise_code(obj.get("client_reference_id") or "")
+
+	key = crypto.new_key()
+	store.create(key, email, source=session_id, ref=ref)
+	mail.send_licence(email, key)
+	log.info("licence %s created for %s", key, email)
+
+	# Attribution is deliberately after the key exists and the email has gone.
+	# A customer who paid must get their licence even if the commission
+	# bookkeeping fails, so nothing in here is allowed to fail the webhook —
+	# an unpaid affiliate is a conversation, an undelivered licence is a refund.
+	if ref:
+		try:
+			_credit_affiliate(ref, key, session_id, obj, buyer_email=email)
+		except Exception:
+			log.exception("could not credit affiliate %s for session %s", ref, session_id)
+
+	return {"ok": True, "key": key}
+
+
 @app.post("/webhooks/stripe")
 async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 	payload = await request.body()
@@ -349,44 +392,20 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 	obj = event.get("data", {}).get("object", {})
 
 	if kind == "checkout.session.completed":
-		session_id = obj.get("id", "")
-		email = (
-			obj.get("customer_details", {}).get("email")
-			or obj.get("customer_email")
-			or ""
-		).strip()
+		# Card sessions are paid at completion. Delayed methods also emit this
+		# event, but at that point they only mean "instructions were shown". A key
+		# here would give the product away before a transfer arrived.
+		if obj.get("payment_status") != "paid":
+			log.info("session %s completed but is not paid yet", obj.get("id", ""))
+			return {"ok": True, "pending": True}
+		return _fulfil_stripe_checkout(obj)
 
-		# Stripe retries on any non-2xx, so this must be safe to run twice.
-		existing = store.find_by_source(session_id)
-		if existing:
-			log.info("session %s already has licence %s", session_id, existing["key"])
-			return {"ok": True, "key": existing["key"], "duplicate": True}
+	if kind == "checkout.session.async_payment_succeeded":
+		return _fulfil_stripe_checkout(obj)
 
-		if not email:
-			log.error("session %s completed with no email — cannot deliver a key", session_id)
-			raise HTTPException(400, "No email on session")
-
-		# The affiliate tag, if the buyer arrived through a referral link. Stripe
-		# carries it from the Payment Link URL to here untouched, which is why the
-		# site does not need a server of its own to attribute a sale.
-		ref = store.normalise_code(obj.get("client_reference_id") or "")
-
-		key = crypto.new_key()
-		store.create(key, email, source=session_id, ref=ref)
-		mail.send_licence(email, key)
-		log.info("licence %s created for %s", key, email)
-
-		# Attribution is deliberately after the key exists and the email has gone.
-		# A customer who paid must get their licence even if the commission
-		# bookkeeping fails, so nothing in here is allowed to fail the webhook —
-		# an unpaid affiliate is a conversation, an undelivered licence is a refund.
-		if ref:
-			try:
-				_credit_affiliate(ref, key, session_id, obj, buyer_email=email)
-			except Exception:
-				log.exception("could not credit affiliate %s for session %s", ref, session_id)
-
-		return {"ok": True, "key": key}
+	if kind == "checkout.session.async_payment_failed":
+		log.warning("delayed Stripe payment failed for session %s", obj.get("id", ""))
+		return {"ok": True, "failed": True}
 
 	if kind in ("charge.refunded", "charge.dispute.created"):
 		# Find the licence by the payment intent's checkout session where we can;
@@ -418,6 +437,208 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 		return {"ok": True}
 
 	return {"ok": True, "ignored": kind}
+
+
+# ── Pakistani bank checkout ─────────────────────────────────────────────────
+
+
+def _public_bank_order(order: dict) -> dict:
+	"""The customer/admin-safe fields. Token hashes and server paths never leave."""
+	return {
+		"reference": order["reference"],
+		"email": order["email"],
+		"status": order["status"],
+		"method": order["method"],
+		"usd_cents": order["usd_cents"],
+		"fx_rate": order["fx_rate"],
+		"rate_date": order["rate_date"],
+		"rate_stale": bool(order["rate_stale"]),
+		"pkr_amount": order["pkr_amount"],
+		"transaction_id": order.get("transaction_id") or "",
+		"affiliate_code": order.get("affiliate_code") or "",
+		"has_proof": bool(order.get("proof_path")),
+		"created_at": order["created_at"],
+		"expires_at": order["expires_at"],
+		"submitted_at": order.get("submitted_at"),
+		"decided_at": order.get("decided_at"),
+		"decided_note": order.get("decided_note") or "",
+		"licence_key": order.get("licence_key") or "",
+	}
+
+
+@app.post("/api/checkout/bank/orders")
+def create_bank_order(request: Request, body: dict = Body(...)):
+	"""Create and lock a USD-to-PKR quote before showing payment details."""
+	_throttle(f"bank-create:{_client_ip(request)}", limit=8, window=600)
+	if not bank_payments.BANK_ENABLED:
+		raise HTTPException(503, "Pakistani bank payments are temporarily unavailable.")
+
+	email = (body.get("email") or "").strip().lower()
+	if not _looks_like_email(email):
+		raise HTTPException(400, "Enter the email address where your licence should be sent.")
+	method = (body.get("method") or "bank").strip().lower()
+	if method not in ("bank", "jazzcash"):
+		raise HTTPException(400, "Choose Bank Al-Habib or JazzCash.")
+
+	price = settings.get()["price"]
+	if str(price.get("currency", "USD")).upper() != "USD":
+		raise HTTPException(503, "Pakistani checkout currently requires the product price in USD.")
+	try:
+		quoted = bank_payments.quote(int(price["amount"]) * 100)
+	except bank_payments.BankPaymentError as exc:
+		log.warning("bank quote unavailable: %s", exc)
+		raise HTTPException(503, str(exc)) from exc
+
+	reference = "SC-" + secrets.token_hex(4).upper()
+	token = secrets.token_urlsafe(32)
+	order = store.create_bank_order(
+		reference=reference,
+		token=token,
+		email=email,
+		method=method,
+		usd_cents=quoted["usd_cents"],
+		fx_rate=quoted["rate"],
+		rate_date=quoted["rate_date"],
+		rate_stale=quoted["rate_stale"],
+		pkr_amount=quoted["pkr_amount"],
+		affiliate_code=body.get("ref", ""),
+		expires_at=int(time.time()) + bank_payments.ORDER_QUOTE_SECONDS,
+	)
+	return {
+		"ok": True,
+		"order": _public_bank_order(order),
+		"token": token,
+		"payment_details": bank_payments.public_details(),
+	}
+
+
+@app.post("/api/checkout/bank/orders/{reference}/submit")
+async def submit_bank_order(reference: str, request: Request):
+	"""Attach the transfer reference and optional receipt to a pending order."""
+	_throttle(f"bank-submit:{_client_ip(request)}", limit=12, window=600)
+	reference = (reference or "").upper()
+	if not re.fullmatch(r"SC-[A-F0-9]{8}", reference):
+		raise HTTPException(404, "That bank-payment order was not found.")
+
+	length = int(request.headers.get("content-length") or 0)
+	if length > 6 * 1024 * 1024:
+		raise HTTPException(413, "The payment screenshot must be smaller than 4 MB.")
+	raw = await request.body()
+	if len(raw) > 6 * 1024 * 1024:
+		raise HTTPException(413, "The payment screenshot must be smaller than 4 MB.")
+	try:
+		body = json.loads(raw or b"{}")
+	except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+		raise HTTPException(400, "The payment submission could not be read.") from exc
+
+	token = str(body.get("token") or "")
+	transaction_id = str(body.get("transaction_id") or "").strip()
+	if not 4 <= len(transaction_id) <= 100 or any(ord(c) < 32 for c in transaction_id):
+		raise HTTPException(400, "Enter the transaction ID shown by your bank or JazzCash.")
+	current = store.bank_order(reference, token)
+	if not current:
+		raise HTTPException(404, "That bank-payment order was not found.")
+	if current["status"] == "submitted" and (current["transaction_id"] or "") == transaction_id:
+		return {"ok": True, "order": _public_bank_order(current), "duplicate": True}
+	if current["status"] != "awaiting_payment":
+		raise HTTPException(409, f"This order is already {current['status'].replace('_', ' ')}.")
+
+	proof_path = proof_sha = ""
+	try:
+		proof_path, proof_sha = bank_payments.save_proof(
+			reference, str(body.get("proof_data") or "")
+		)
+		order = store.submit_bank_order(
+			reference, token, transaction_id, proof_path=proof_path, proof_sha256=proof_sha
+		)
+	except (bank_payments.BankPaymentError, store.DuplicatePayment, store.BankOrderState) as exc:
+		bank_payments.remove_proof(proof_path)
+		raise HTTPException(409 if isinstance(exc, store.DuplicatePayment) else 400, str(exc)) from exc
+
+	mail.send_bank_payment_submitted(order["email"], reference, int(order["pkr_amount"]))
+	mail.notify_bank_payment(
+		reference,
+		order["email"],
+		int(order["pkr_amount"]),
+		order["method"],
+		transaction_id,
+	)
+	return {"ok": True, "order": _public_bank_order(order)}
+
+
+@app.get("/api/admin/bank-orders")
+def admin_bank_orders(
+	status: str = "", limit: int = 200, x_admin_token: str = Header("")
+):
+	_require_admin(x_admin_token)
+	if status and status not in ("awaiting_payment", "submitted", "paid", "rejected"):
+		raise HTTPException(400, "Unknown bank-order status.")
+	return {"orders": [_public_bank_order(o) for o in store.bank_orders(status, limit)]}
+
+
+@app.get("/api/admin/bank-orders/{reference}/proof")
+def admin_bank_order_proof(reference: str, x_admin_token: str = Header("")):
+	_require_admin(x_admin_token)
+	order = store.bank_order(reference)
+	if not order or not order.get("proof_path"):
+		raise HTTPException(404, "This order has no payment screenshot.")
+	path = pathlib.Path(order["proof_path"]).resolve()
+	root = bank_payments.PROOF_DIR.resolve()
+	if root not in path.parents or not path.is_file():
+		raise HTTPException(404, "The payment screenshot is missing from private storage.")
+	media = {".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(
+		path.suffix.lower(), "application/octet-stream"
+	)
+	return FileResponse(path, media_type=media, filename=f"{order['reference']}-payment{path.suffix}")
+
+
+@app.post("/api/admin/bank-orders/{reference}/approve")
+def admin_approve_bank_order(
+	reference: str, body: dict = Body(default={}), x_admin_token: str = Header("")
+):
+	_require_admin(x_admin_token)
+	key = crypto.new_key()
+	try:
+		order, duplicate = store.fulfil_bank_order(
+			reference, key, (body.get("note") or "").strip()[:500]
+		)
+	except store.BankOrderState as exc:
+		raise HTTPException(400, str(exc)) from exc
+	if duplicate:
+		return {"ok": True, "order": _public_bank_order(order), "duplicate": True}
+
+	mail.send_licence(order["email"], order["licence_key"])
+	ref = order.get("affiliate_code") or ""
+	if ref:
+		try:
+			_credit_affiliate(
+				ref,
+				order["licence_key"],
+				f"bank:{order['reference']}",
+				# The affiliate programme is denominated in USD. This is the exact
+				# configured USD price from which the customer's locked PKR quote was
+				# calculated, so adding a Pakistani sale does not mix currencies in
+				# affiliate balances or make a Stripe payout impossible.
+				{"amount_total": int(order["usd_cents"]), "currency": "usd"},
+				buyer_email=order["email"],
+			)
+		except Exception:
+			log.exception("could not credit affiliate %s for bank order %s", ref, order["reference"])
+	return {"ok": True, "order": _public_bank_order(order)}
+
+
+@app.post("/api/admin/bank-orders/{reference}/reject")
+def admin_reject_bank_order(
+	reference: str, body: dict = Body(default={}), x_admin_token: str = Header("")
+):
+	_require_admin(x_admin_token)
+	reason = (body.get("reason") or "").strip()[:500]
+	try:
+		order = store.reject_bank_order(reference, reason)
+	except store.BankOrderState as exc:
+		raise HTTPException(400, str(exc)) from exc
+	mail.send_bank_payment_rejected(order["email"], order["reference"], reason)
+	return {"ok": True, "order": _public_bank_order(order)}
 
 
 # ── admin ────────────────────────────────────────────────────────────────────

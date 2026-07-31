@@ -141,6 +141,7 @@
 
 	<div class="tabs">
 		<button id="tabLicences" aria-current="true" onclick="showTab('licences')">Licences</button>
+		<button id="tabPayments" aria-current="false" onclick="showTab('payments')">Bank payments</button>
 		<button id="tabAffiliates" aria-current="false" onclick="showTab('affiliates')">Affiliates</button>
 		<button id="tabSite" aria-current="false" onclick="showTab('site')">Site</button>
 	</div>
@@ -190,6 +191,38 @@
 		<div id="events" class="events"></div>
 	</div>
 </div><!-- /viewLicences -->
+
+<div id="viewPayments" hidden>
+	<div class="warnbar">
+		A screenshot is supporting evidence only. Approve after the matching amount and
+		transaction ID are visible in Bank Al-Habib or JazzCash.
+	</div>
+	<div class="card">
+		<div class="row" style="margin-bottom:14px">
+			<h2 style="margin:0">Pakistani bank payments</h2>
+			<span class="spacer"></span>
+			<select id="bankStatus" onchange="loadPayments()">
+				<option value="submitted">Waiting for verification</option>
+				<option value="awaiting_payment">Not submitted</option>
+				<option value="paid">Approved</option>
+				<option value="rejected">Rejected</option>
+				<option value="">All orders</option>
+			</select>
+		</div>
+		<div class="wrapscroll">
+			<table>
+				<thead>
+					<tr>
+						<th>Order</th><th>Customer</th><th>Method</th><th class="num">Expected</th>
+						<th>Transaction ID</th><th>Submitted</th><th>Status</th><th></th>
+					</tr>
+				</thead>
+				<tbody id="bankRows"></tbody>
+			</table>
+		</div>
+		<div id="bankEmpty" class="empty" hidden>No bank-payment orders in this view.</div>
+	</div>
+</div><!-- /viewPayments -->
 
 <div id="viewAffiliates" hidden>
 	<div id="mixedCurrency" class="warnbar" hidden></div>
@@ -473,6 +506,7 @@ const SITE = "https://softclipper.pro";
 let all = [];
 let affiliates = [];
 let salesRows = [];
+let bankOrders = [];
 let openCode = "";
 let defaults = { rate_pct: 30, hold_days: 30 };
 let tab = "licences";
@@ -563,7 +597,7 @@ function signOut() {
 	location.reload();
 }
 
-const TABS = { licences: "Licences", affiliates: "Affiliates", site: "Site" };
+const TABS = { licences: "Licences", payments: "Bank payments", affiliates: "Affiliates", site: "Site" };
 
 function showTab(which) {
 	tab = which;
@@ -576,6 +610,7 @@ function showTab(which) {
 }
 
 async function load() {
+	if (tab === "payments") return loadPayments();
 	if (tab === "affiliates") return loadAffiliates();
 	if (tab === "site") return loadSettings();
 	try {
@@ -583,6 +618,102 @@ async function load() {
 		all = d.licences || [];
 		$("count").textContent = all.length + (all.length === 1 ? " licence" : " licences");
 		render();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function bankState(status) {
+	return status === "paid" ? "active" : status === "submitted" ? "holding" : status === "rejected" ? "revoked" : "unused";
+}
+
+async function loadPayments() {
+	try {
+		const status = $("bankStatus").value;
+		const d = await api("/bank-orders?limit=300&status=" + encodeURIComponent(status));
+		bankOrders = d.orders || [];
+		const waiting = bankOrders.filter((o) => o.status === "submitted").length;
+		$("count").textContent = waiting ? `${waiting} waiting` : `${bankOrders.length} order${bankOrders.length === 1 ? "" : "s"}`;
+		renderPayments();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function renderPayments() {
+	$("bankRows").innerHTML = bankOrders.map((o) => {
+		const submitted = o.submitted_at ? new Date(o.submitted_at * 1000).toLocaleString() : "—";
+		const actions = o.status === "submitted"
+			? `<div class="acts">
+				${o.has_proof ? `<button onclick="viewBankProof('${o.reference}')">Proof</button>` : ""}
+				<button class="primary" onclick="approveBank('${o.reference}')">Approve</button>
+				<button class="danger" onclick="rejectBank('${o.reference}')">Reject</button>
+			</div>`
+			: o.has_proof ? `<div class="acts"><button onclick="viewBankProof('${o.reference}')">Proof</button></div>` : "";
+		return `<tr>
+			<td class="key">${esc(o.reference)}</td>
+			<td class="email">${esc(o.email)}</td>
+			<td>${esc(o.method === "jazzcash" ? "JazzCash" : "Bank Al-Habib")}</td>
+			<td class="num">PKR ${Number(o.pkr_amount || 0).toLocaleString("en-PK")}</td>
+			<td class="key">${esc(o.transaction_id || "—")}</td>
+			<td>${esc(submitted)}</td>
+			<td><span class="pill ${bankState(o.status)}">${esc(o.status.replaceAll("_", " "))}</span></td>
+			<td>${actions}</td>
+		</tr>`;
+	}).join("");
+	$("bankEmpty").hidden = bankOrders.length > 0;
+}
+
+async function viewBankProof(reference) {
+	const popup = window.open("", "_blank");
+	try {
+		const res = await fetch(`/api/admin/bank-orders/${encodeURIComponent(reference)}/proof`, {
+			headers: { "X-Admin-Token": tok() },
+		});
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			throw new Error(body.error || `HTTP ${res.status}`);
+		}
+		const url = URL.createObjectURL(await res.blob());
+		if (popup) popup.location = url;
+		else window.open(url, "_blank");
+		setTimeout(() => URL.revokeObjectURL(url), 60000);
+	} catch (e) {
+		if (popup) popup.close();
+		say(e.message, false);
+	}
+}
+
+async function approveBank(reference) {
+	const order = bankOrders.find((o) => o.reference === reference);
+	if (!order || !confirm(
+		`Approve ${reference}?\n\nConfirm that PKR ${Number(order.pkr_amount).toLocaleString("en-PK")} ` +
+		`with transaction ID ${order.transaction_id} is visible in the receiving account.\n\n` +
+		"This immediately creates and emails the licence."
+	)) return;
+	try {
+		await api(`/bank-orders/${encodeURIComponent(reference)}/approve`, {
+			method: "POST", body: JSON.stringify({}),
+		});
+		say(`✓ ${reference} approved. The licence was created and emailed.`, true);
+		loadPayments();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function rejectBank(reference) {
+	const reason = prompt(
+		`Why is ${reference} being rejected? This is emailed to the customer.`,
+		"The transaction could not be matched to the receiving account."
+	);
+	if (reason == null) return;
+	try {
+		await api(`/bank-orders/${encodeURIComponent(reference)}/reject`, {
+			method: "POST", body: JSON.stringify({ reason }),
+		});
+		say(`✓ ${reference} rejected and the customer was notified.`, true);
+		loadPayments();
 	} catch (e) {
 		say(e.message, false);
 	}
