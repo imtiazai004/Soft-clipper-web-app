@@ -141,7 +141,7 @@
 
 	<div class="tabs">
 		<button id="tabLicences" aria-current="true" onclick="showTab('licences')">Licences</button>
-		<button id="tabPayments" aria-current="false" onclick="showTab('payments')">Bank payments</button>
+		<button id="tabPayments" aria-current="false" onclick="showTab('payments')">Bank Transfer/Wallet</button>
 		<button id="tabAffiliates" aria-current="false" onclick="showTab('affiliates')">Affiliates</button>
 		<button id="tabSite" aria-current="false" onclick="showTab('site')">Site</button>
 	</div>
@@ -199,7 +199,7 @@
 	</div>
 	<div class="card">
 		<div class="row" style="margin-bottom:14px">
-			<h2 style="margin:0">Pakistani bank payments</h2>
+			<h2 style="margin:0">Bank Transfer/Wallet</h2>
 			<span class="spacer"></span>
 			<select id="bankStatus" onchange="loadPayments()">
 				<option value="submitted">Waiting for verification</option>
@@ -597,7 +597,7 @@ function signOut() {
 	location.reload();
 }
 
-const TABS = { licences: "Licences", payments: "Bank payments", affiliates: "Affiliates", site: "Site" };
+const TABS = { licences: "Licences", payments: "Bank Transfer/Wallet", affiliates: "Affiliates", site: "Site" };
 
 function showTab(which) {
 	tab = which;

@@ -1,4 +1,4 @@
-"""Manual Pakistani bank-payment support.
+"""Manual bank transfer and wallet payment support.
 
 Stripe remains the card/international path.  This module supplies the pieces
 that are specific to a domestic PKR transfer: an official USD/PKR quote, the
@@ -40,7 +40,11 @@ ORDER_QUOTE_SECONDS = 24 * 60 * 60
 BANK_ENABLED = os.environ.get("BANK_PAYMENTS_ENABLED", "1") != "0"
 BANK_NAME = os.environ.get("BANK_PAYMENT_BANK", "Bank Al-Habib")
 BANK_TITLE = os.environ.get("BANK_PAYMENT_TITLE", "Imtiaz Ahmad")
-BANK_ACCOUNT = os.environ.get("BANK_PAYMENT_ACCOUNT", "20300981005116011")
+BANK_IBAN = (
+	os.environ.get("BANK_PAYMENT_IBAN", "").strip()
+	or os.environ.get("BANK_PAYMENT_ACCOUNT", "").strip()
+	or "PK76BAHL2030098100511601"
+)
 BANK_QR_URL = os.environ.get(
 	"BANK_PAYMENT_QR_URL", "https://softclipper.pro/payments/bank-al-habib-qr.jpeg"
 )
@@ -59,7 +63,10 @@ def public_details() -> dict:
 		"bank": {
 			"name": BANK_NAME,
 			"title": BANK_TITLE,
-			"account": BANK_ACCOUNT,
+			# Keep ``account`` during the rollout so an older cached checkout page
+			# still works while the new page reads the semantically correct key.
+			"iban": BANK_IBAN,
+			"account": BANK_IBAN,
 			"qr_url": BANK_QR_URL,
 		},
 		"jazzcash": {"title": JAZZCASH_TITLE, "number": JAZZCASH_NUMBER},

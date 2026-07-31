@@ -322,7 +322,7 @@ def test_a_refund_revokes_the_licence():
 	assert client.post("/api/licence/validate", json={"key": key, "fingerprint": PC_A}).status_code == 403
 
 
-# ── Pakistani bank checkout ─────────────────────────────────────────────────
+# ── Bank transfer / wallet checkout ─────────────────────────────────────────
 
 
 def _bank_order(email: str = "pk-buyer@example.com", method: str = "bank", ref: str = "") -> dict:
@@ -367,6 +367,8 @@ def test_bank_order_uses_the_current_configured_usd_price_and_locked_pkr_quote()
 	assert order["order"]["fx_rate"] == "280.00"
 	assert order["order"]["method"] == "jazzcash"
 	assert order["payment_details"]["bank"]["name"] == "Bank Al-Habib"
+	assert order["payment_details"]["bank"]["iban"] == "PK76BAHL2030098100511601"
+	assert order["payment_details"]["bank"]["account"] == "PK76BAHL2030098100511601"
 
 
 def test_submitted_bank_payment_only_issues_a_licence_after_admin_approval(monkeypatch):

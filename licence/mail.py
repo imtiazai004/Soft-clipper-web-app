@@ -108,7 +108,7 @@ Stuck? Reply to this email, or WhatsApp {SUPPORT_WHATSAPP}.
 	return _send(to, "Your Soft Clipper licence key", body, what=f"licence {key}")
 
 
-# ── Pakistani bank payments ─────────────────────────────────────────────────
+# ── Bank transfer / wallet payments ─────────────────────────────────────────
 
 
 def send_bank_payment_submitted(to: str, reference: str, amount_pkr: int) -> bool:
@@ -137,7 +137,7 @@ def notify_bank_payment(reference: str, email: str, amount_pkr: int, method: str
 	return _send(
 		OWNER_EMAIL,
 		f"Bank payment waiting — {reference}",
-		f"""A Pakistani payment is waiting for verification.
+		f"""A bank transfer/wallet payment is waiting for verification.
 
 Order: {reference}
 Customer: {email}

@@ -439,7 +439,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 	return {"ok": True, "ignored": kind}
 
 
-# ── Pakistani bank checkout ─────────────────────────────────────────────────
+# ── Bank transfer / wallet checkout ─────────────────────────────────────────
 
 
 def _public_bank_order(order: dict) -> dict:
@@ -471,7 +471,7 @@ def create_bank_order(request: Request, body: dict = Body(...)):
 	"""Create and lock a USD-to-PKR quote before showing payment details."""
 	_throttle(f"bank-create:{_client_ip(request)}", limit=8, window=600)
 	if not bank_payments.BANK_ENABLED:
-		raise HTTPException(503, "Pakistani bank payments are temporarily unavailable.")
+		raise HTTPException(503, "Bank transfer/wallet payments are temporarily unavailable.")
 
 	email = (body.get("email") or "").strip().lower()
 	if not _looks_like_email(email):
@@ -482,7 +482,7 @@ def create_bank_order(request: Request, body: dict = Body(...)):
 
 	price = settings.get()["price"]
 	if str(price.get("currency", "USD")).upper() != "USD":
-		raise HTTPException(503, "Pakistani checkout currently requires the product price in USD.")
+		raise HTTPException(503, "Bank transfer/wallet checkout currently requires the product price in USD.")
 	try:
 		quoted = bank_payments.quote(int(price["amount"]) * 100)
 	except bank_payments.BankPaymentError as exc:
@@ -617,7 +617,7 @@ def admin_approve_bank_order(
 				f"bank:{order['reference']}",
 				# The affiliate programme is denominated in USD. This is the exact
 				# configured USD price from which the customer's locked PKR quote was
-				# calculated, so adding a Pakistani sale does not mix currencies in
+				# calculated, so adding a bank-transfer sale does not mix currencies in
 				# affiliate balances or make a Stripe payout impossible.
 				{"amount_total": int(order["usd_cents"]), "currency": "usd"},
 				buyer_email=order["email"],

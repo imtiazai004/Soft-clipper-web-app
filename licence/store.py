@@ -155,7 +155,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS bank_orders_proof
     ON bank_orders(proof_sha256) WHERE proof_sha256 IS NOT NULL AND proof_sha256 <> '';
 
 -- The State Bank page is fetched on demand. Persisting the last good result
--- means a short SBP outage does not take the Pakistani checkout down.
+-- means a short SBP outage does not take the bank transfer/wallet checkout down.
 CREATE TABLE IF NOT EXISTS fx_rates (
     pair       TEXT PRIMARY KEY,
     rate       TEXT NOT NULL,
@@ -301,7 +301,7 @@ def events_for(key: str, limit: int = 50) -> list[dict]:
 		return [dict(r) for r in rows]
 
 
-# ── Pakistani bank orders ────────────────────────────────────────────────────
+# ── Bank transfer / wallet orders ───────────────────────────────────────────
 
 
 class DuplicatePayment(ValueError):
@@ -443,7 +443,7 @@ def fulfil_bank_order(reference: str, key: str, note: str = "") -> tuple[dict, b
 				row["email"],
 				now,
 				source,
-				f"Verified Pakistani transfer {reference}" + (f" — {note}" if note else ""),
+				f"Verified bank transfer/wallet payment {reference}" + (f" — {note}" if note else ""),
 				row["affiliate_code"] or None,
 			),
 		)
