@@ -20,7 +20,8 @@ import pathlib
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from . import crypto, mail, settings, store, stripe_api
 
@@ -42,7 +43,50 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 # offering a button that silently does nothing.
 PUBLISH_HOOK_URL = os.environ.get("PUBLISH_HOOK_URL", "")
 
+# ── the affiliate self-sign-up surface ───────────────────────────────────────
+#
+# The marketing site is static and lives on another origin, so its sign-up form
+# posts here across origins. That is the only cross-origin call this service
+# accepts, and the list below is exactly who may make it — a wildcard would let
+# any page on the internet drive these endpoints on a visitor's behalf.
+SITE_ORIGINS = [
+	o.strip() for o in os.environ.get(
+		"SITE_ORIGIN", "https://softclipper.pro,https://www.softclipper.pro"
+	).split(",") if o.strip()
+]
+# Where the affiliate's own dashboard lives, for the links inside emails. Served
+# by this service, on this host — an affiliate signing in has to reach a server,
+# and the static site is not one.
+PORTAL_URL = os.environ.get("AFFILIATE_PORTAL_URL", "https://app.softclipper.pro/affiliate")
+ADMIN_URL = os.environ.get("ADMIN_URL", "https://app.softclipper.pro/admin")
+# Where an affiliate's link points. The shop, not this API.
+SHOP_URL = os.environ.get("SHOP_URL", SITE_ORIGINS[0] if SITE_ORIGINS else "https://softclipper.pro")
+
+# A sign-in link is good for half an hour; the session it grants lasts a month.
+# Short for the thing that arrives by email and may sit in an inbox, long for the
+# thing that lives in the browser of the person who already proved who they are.
+LOGIN_LINK_MINUTES = int(os.environ.get("AFFILIATE_LINK_MINUTES", "30"))
+VERIFY_LINK_MINUTES = int(os.environ.get("AFFILIATE_VERIFY_MINUTES", str(24 * 60)))
+SESSION_DAYS = int(os.environ.get("AFFILIATE_SESSION_DAYS", "30"))
+SESSION_COOKIE = "sc_aff"
+# Off only for local testing over plain HTTP. In production the cookie is the
+# affiliate's whole identity and must never travel in the clear.
+COOKIE_SECURE = os.environ.get("AFFILIATE_COOKIE_SECURE", "1") != "0"
+
 app = FastAPI(title="Soft Clipper licences", docs_url=None, redoc_url=None)
+
+# Credentials are off, and that is not an oversight: the portal session cookie is
+# only ever used same-origin, from the page this service serves itself. Nothing
+# the site posts here needs to carry it, so nothing here has to trust a cookie
+# that arrived from another origin.
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=SITE_ORIGINS,
+	allow_credentials=False,
+	allow_methods=["GET", "POST"],
+	allow_headers=["Content-Type"],
+	max_age=3600,
+)
 
 # Created at import rather than on a startup event: creating the tables is
 # cheap and idempotent, and doing it here means the service is usable however
@@ -62,6 +106,15 @@ def _throttle(ip: str, limit: int = 30, window: int = 60):
 	hits = [t for t in _hits.get(ip, []) if now - t < window]
 	hits.append(now)
 	_hits[ip] = hits
+
+	# Nothing used to remove an address from this dict, which was survivable while
+	# every caller was a licensed copy of the app. The affiliate sign-up and click
+	# endpoints are reachable by anyone, so an idle entry per address that has
+	# ever touched the service is now a leak with the whole internet feeding it.
+	if len(_hits) > 5000:
+		for key in [k for k, v in _hits.items() if not v or now - v[-1] > 3600]:
+			del _hits[key]
+
 	if len(hits) > limit:
 		raise HTTPException(429, "Too many requests — wait a minute and try again.")
 
@@ -214,7 +267,7 @@ def _verify_stripe(payload: bytes, sig_header: str) -> bool:
 	return hmac.compare_digest(expected, signature)
 
 
-def _credit_affiliate(ref: str, key: str, session_id: str, session: dict):
+def _credit_affiliate(ref: str, key: str, session_id: str, session: dict, buyer_email: str = ""):
 	"""Record what an affiliate earned on one sale.
 
 	The commission is worked out from `amount_total` — what Stripe actually
@@ -236,7 +289,18 @@ def _credit_affiliate(ref: str, key: str, session_id: str, session: dict):
 		log.warning("session %s carried unknown ref %r", session_id, ref)
 		return
 	if affiliate["status"] != "active":
-		log.warning("session %s carried disabled ref %r", session_id, ref)
+		# Covers a disabled code and every stage of an unfinished sign-up —
+		# pending, under review, rejected. All of them are "there is a row, but it
+		# is not earning", and the sale itself stands regardless.
+		log.warning("session %s carried ref %r with status %s", session_id, ref, affiliate["status"])
+		return
+
+	# The one rule the affiliate terms name as grounds for closing an account, now
+	# enforced rather than only published. Buying through your own link is a 30%
+	# discount that costs us a commission and shows up as a sale, and the honest
+	# version of it — "can I have it cheaper" — is a question we would say yes to.
+	if buyer_email and buyer_email.lower().strip() == (affiliate["email"] or "").lower().strip():
+		log.warning("session %s is a self-referral by %s — not crediting", session_id, ref)
 		return
 
 	gross = int(session.get("amount_total") or 0)
@@ -303,7 +367,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header("")):
 		# an unpaid affiliate is a conversation, an undelivered licence is a refund.
 		if ref:
 			try:
-				_credit_affiliate(ref, key, session_id, obj)
+				_credit_affiliate(ref, key, session_id, obj, buyer_email=email)
 			except Exception:
 				log.exception("could not credit affiliate %s for session %s", ref, session_id)
 
@@ -410,6 +474,10 @@ def admin_affiliates(x_admin_token: str = Header("")):
 		# The page hides the automatic-payout controls when this is false rather
 		# than offering a button that can only fail.
 		"stripe_payouts": stripe_api.configured(),
+		# So the page can say why nobody is signing up, when the reason is that
+		# the form is switched off.
+		"self_signup": bool(config["enabled"]) and bool(config.get("selfSignup", True)),
+		"auto_approve": bool(config.get("autoApprove", True)),
 	}
 
 
@@ -473,15 +541,9 @@ def admin_affiliate_stripe(code: str, body: dict = Body(default={}), x_admin_tok
 		raise HTTPException(404, "Unknown affiliate")
 
 	try:
-		account_id = affiliate["stripe_account"]
-		if not account_id:
-			country = (body.get("country") or "").strip()
-			if len(country) != 2:
-				raise HTTPException(400, "A two-letter country code is required, e.g. GB or DE")
-			created = stripe_api.create_express_account(affiliate["email"], country)
-			account_id = created["id"]
-			store.set_affiliate_stripe(code, account_id, ready=False)
-		return {"ok": True, "account": account_id, "url": stripe_api.onboarding_link(account_id)}
+		# The same helper the affiliate's own dashboard calls, so neither path can
+		# create a second Connect account for somebody who already has one.
+		return _stripe_onboarding(affiliate, (body.get("country") or "").strip())
 	except stripe_api.StripeError as exc:
 		# Stripe's own message is the useful one — "country not supported" is
 		# exactly what an admin needs to read, and rewording it would hide it.
@@ -574,8 +636,49 @@ def admin_affiliate_status(code: str, body: dict = Body(default={}), x_admin_tok
 		raise HTTPException(400, "status must be 'active' or 'disabled'")
 	if not store.get_affiliate(code):
 		raise HTTPException(404, "Unknown affiliate")
-	store.set_affiliate_status(code, status)
+	store.set_affiliate_status(code, status, body.get("reason", ""))
 	return {"ok": True}
+
+
+@app.post("/api/admin/affiliates/{code}/decide")
+def admin_decide_affiliate(code: str, body: dict = Body(...), x_admin_token: str = Header("")):
+	"""Approve or reject an application that came in through the public form.
+
+	Only reachable for someone actually waiting — `review`. Approving an active
+	affiliate is a no-op that would send them a second welcome email, and
+	rejecting one whose sales are already recorded is a different decision
+	entirely, which is what Disable is for.
+
+	Either way they are told. An applicant who hears nothing assumes the form is
+	broken and applies again from another address, and one rejection quietly
+	becomes three accounts.
+	"""
+	_require_admin(x_admin_token)
+	affiliate = store.get_affiliate(code)
+	if not affiliate:
+		raise HTTPException(404, "Unknown affiliate")
+	if affiliate["status"] != "review":
+		raise HTTPException(
+			400,
+			f"'{code}' is {affiliate['status']}, not waiting for a decision. "
+			"Use Enable or Disable instead.",
+		)
+
+	approve = bool(body.get("approve"))
+	reason = (body.get("reason") or "").strip()
+	store.set_affiliate_status(code, "active" if approve else "rejected", reason)
+
+	if approve:
+		mail.send_affiliate_welcome(
+			affiliate["email"], affiliate["name"], code,
+			_ref_link(code), PORTAL_URL, int(affiliate["rate_pct"]),
+		)
+	else:
+		mail.send_affiliate_decision(
+			affiliate["email"], affiliate["name"], False, reason, _ref_link(code), PORTAL_URL
+		)
+	log.info("affiliate %s %s by admin", code, "approved" if approve else "rejected")
+	return {"ok": True, "status": "active" if approve else "rejected"}
 
 
 @app.get("/api/admin/referrals")
@@ -601,6 +704,416 @@ def admin_mark_paid(body: dict = Body(...), x_admin_token: str = Header("")):
 		ids, how=body.get("how", "manual"), detail=body.get("detail", "")
 	)
 	return {"ok": True, "marked": marked}
+
+
+# ── affiliates: signing themselves up ────────────────────────────────────────
+#
+# Everything from here to the next heading is reachable without an admin token,
+# which makes it the only part of this service a stranger can drive. The rules
+# it works to:
+#
+#   · Nothing earns until an email address has been proved. That is the entire
+#     gate on an open form — a code, a name and a country are free to type, and
+#     only the mailbox is not.
+#   · Nothing here says whether an address or a code belongs to somebody.
+#     Sign-in answers identically for an account that exists and one that does
+#     not, because the alternative is a way to ask us who our affiliates are.
+#   · Nothing here can move money. An affiliate can change where their payout
+#     goes; sending it is still the owner pressing a button on the admin page.
+#
+# The commission rate is taken from settings, never from the request. It arrives
+# from a form on a page we do not control, and a rate that came in with it would
+# be a rate the applicant chose.
+
+
+def _affiliate_settings() -> dict:
+	return settings.get()["affiliates"]
+
+
+def _ref_link(code: str) -> str:
+	return f"{SHOP_URL}/?ref={code}"
+
+
+def _sign_in(code: str, to: str = "") -> RedirectResponse:
+	"""Land the affiliate on their dashboard, signed in.
+
+	A redirect rather than a JSON token, because this is the end of a link
+	clicked in an email client — whatever opens it has to be handed a page, and
+	the session goes in an HttpOnly cookie the page itself cannot read or leak.
+	"""
+	store.touch_affiliate(code)
+	res = RedirectResponse(to or PORTAL_URL, status_code=303)
+	res.set_cookie(
+		SESSION_COOKIE,
+		crypto.make_scoped("aff-session", code, SESSION_DAYS * 24 * 60),
+		max_age=SESSION_DAYS * 86400,
+		httponly=True,
+		secure=COOKIE_SECURE,
+		samesite="lax",
+		path="/",
+	)
+	return res
+
+
+def _looks_like_email(value: str) -> bool:
+	"""Enough to catch a typo, not an attempt to decide what is deliverable.
+
+	Whether an address works is answered by the confirmation email either
+	arriving or not, and every regex that tries to answer it in advance rejects
+	somebody's real address.
+	"""
+	value = (value or "").strip()
+	return "@" in value[1:-1] and "." in value.rsplit("@", 1)[-1] and len(value) <= 200
+
+
+@app.post("/api/affiliates/apply")
+def affiliate_apply(request: Request, body: dict = Body(...)):
+	"""The public sign-up form.
+
+	Creates the affiliate straight away, but as `pending`: the row is real, the
+	code is reserved so nobody else can take it while they read their email, and
+	`_credit_affiliate` will not pay a penny to anything that is not `active`.
+	"""
+	# Its own bucket, and a much tighter one than the licence endpoints: five
+	# sign-ups from one address in ten minutes is either a mistake or a script.
+	_throttle(f"apply:{_client_ip(request)}", limit=5, window=600)
+
+	config = _affiliate_settings()
+	if not config["enabled"] or not config.get("selfSignup", True):
+		raise HTTPException(
+			403,
+			"Sign-ups are closed at the moment. Email us and we will sort you out by hand.",
+		)
+
+	# A field a person never sees and never fills in. A bot fills in everything.
+	# Answered with success rather than an error, because an error is feedback a
+	# script can use to work out what it got wrong.
+	if (body.get("website") or "").strip():
+		log.info("affiliate sign-up honeypot tripped from %s", _client_ip(request))
+		return {"ok": True, "status": "pending"}
+
+	name = (body.get("name") or "").strip()[:120]
+	email = (body.get("email") or "").strip().lower()[:200]
+	code = store.normalise_code(body.get("code", ""))
+	country = (body.get("country") or "").strip().upper()[:2]
+	promo = (body.get("promo") or "").strip()[:500]
+
+	if not name:
+		raise HTTPException(400, "Your name is required.")
+	if not _looks_like_email(email):
+		raise HTTPException(400, "That does not look like an email address.")
+	problem = store.code_problem(code)
+	if problem:
+		raise HTTPException(400, problem)
+	if store.get_affiliate(code):
+		raise HTTPException(409, f"'{code}' is taken. Try adding your channel name or a number.")
+	if store.affiliate_by_email(email):
+		# Not "you already applied" — this is answered to whoever typed the
+		# address, who may not be its owner. It points at sign-in, which sends a
+		# link to the mailbox and tells an outsider nothing.
+		raise HTTPException(
+			409,
+			"There is already an account for that email. Use the sign-in link on the "
+			"dashboard and we will email you a way in.",
+		)
+	if country and not country.isalpha():
+		raise HTTPException(400, "Country should be two letters, e.g. PK, GB, US.")
+
+	affiliate = store.add_affiliate(
+		code=code,
+		name=name,
+		email=email,
+		# From settings, never from the form.
+		rate_pct=int(config["ratePct"]),
+		payout_method="manual",
+		payout_to="",
+		status="pending",
+		source="signup",
+		country=country,
+		promo=promo,
+	)
+	mail.send_affiliate_verify(
+		email,
+		name,
+		f"{PORTAL_URL}/verify?t={crypto.make_scoped('aff-verify', code, VERIFY_LINK_MINUTES)}",
+	)
+	log.info("affiliate %s applied (%s, %s)", code, email, country or "no country")
+	return {"ok": True, "status": "pending", "code": affiliate["code"], "email": email}
+
+
+@app.get("/api/affiliates/verify")
+def affiliate_verify(t: str = ""):
+	"""The link in the confirmation email.
+
+	Idempotent on purpose. People click these twice, and forwarded mail gets
+	opened by a scanner first — the second visit has to sign them in rather than
+	tell them the link is dead.
+	"""
+	code = crypto.read_scoped(t, "aff-verify")
+	affiliate = store.get_affiliate(code) if code else None
+	if not affiliate:
+		return RedirectResponse(f"{PORTAL_URL}?problem=link", status_code=303)
+
+	if affiliate["status"] == "pending":
+		config = _affiliate_settings()
+		auto = bool(config.get("autoApprove", True))
+		affiliate = store.verify_affiliate_email(code, "active" if auto else "review")
+		if auto:
+			mail.send_affiliate_welcome(
+				affiliate["email"], affiliate["name"], code,
+				_ref_link(code), PORTAL_URL, int(affiliate["rate_pct"]),
+			)
+		# The owner hears about it once the address is proved, not when the form
+		# was submitted — so the inbox only ever sees real people.
+		mail.notify_owner_new_affiliate(affiliate, needs_review=not auto, admin_url=ADMIN_URL)
+		log.info("affiliate %s confirmed -> %s", code, affiliate["status"])
+
+	return _sign_in(code)
+
+
+@app.post("/api/affiliates/login")
+def affiliate_login(request: Request, body: dict = Body(...)):
+	"""Ask for a sign-in link.
+
+	No passwords anywhere in this system. There is nothing to store, nothing to
+	reset, nothing to leak, and the mailbox is already the thing that proves who
+	an affiliate is — it is where their money is arranged and where their link
+	was sent.
+
+	The answer is the same whatever is behind the address. Anything else turns
+	this into a way to test whether a given person promotes us.
+	"""
+	_throttle(f"login:{_client_ip(request)}", limit=6, window=600)
+	email = (body.get("email") or "").strip().lower()
+	affiliate = store.affiliate_by_email(email) if _looks_like_email(email) else None
+
+	if affiliate and affiliate["status"] != "rejected":
+		if not affiliate["email_verified"]:
+			# They never finished signing up. Send the confirmation again rather
+			# than a sign-in link, which would skip the one check that matters.
+			mail.send_affiliate_verify(
+				affiliate["email"], affiliate["name"],
+				f"{PORTAL_URL}/verify?t={crypto.make_scoped('aff-verify', affiliate['code'], VERIFY_LINK_MINUTES)}",
+			)
+		else:
+			mail.send_affiliate_login(
+				affiliate["email"],
+				f"{PORTAL_URL}/session?t={crypto.make_scoped('aff-login', affiliate['code'], LOGIN_LINK_MINUTES)}",
+			)
+
+	return {"ok": True, "sent": True}
+
+
+@app.get("/api/affiliates/session")
+def affiliate_session(t: str = ""):
+	code = crypto.read_scoped(t, "aff-login")
+	if not code or not store.get_affiliate(code):
+		return RedirectResponse(f"{PORTAL_URL}?problem=link", status_code=303)
+	return _sign_in(code)
+
+
+@app.post("/api/affiliates/click")
+def affiliate_click(request: Request, code: str = ""):
+	"""A visit through somebody's referral link.
+
+	Taken as a query parameter with no body, so the browser sends it as a plain
+	beacon with no preflight — the site fires this with `sendBeacon` while the
+	page is loading and must not pay a round trip for the privilege.
+
+	The answer is `{"ok": true}` whether or not the code exists. It is a counter,
+	not a lookup, and a version that said "unknown code" would enumerate our
+	affiliates for anybody who asked.
+	"""
+	_throttle(f"click:{_client_ip(request)}", limit=60, window=60)
+	try:
+		store.record_click(code)
+	except Exception:  # noqa: BLE001 - a statistic must never fail a page view
+		log.exception("could not record a click for %r", code)
+	return {"ok": True}
+
+
+# ── affiliates: their own dashboard ──────────────────────────────────────────
+
+
+def current_affiliate(request: Request) -> dict:
+	"""Whoever the session cookie names, as they stand right now.
+
+	Re-read from the database on every request rather than trusted from the
+	token. The token is signed and cannot be edited, but it was minted up to a
+	month ago and says nothing about whether the account has been disabled since.
+	"""
+	code = crypto.read_scoped(request.cookies.get(SESSION_COOKIE, ""), "aff-session")
+	affiliate = store.get_affiliate(code) if code else None
+	if not affiliate:
+		raise HTTPException(401, "Please sign in again — we will email you a link.")
+	return affiliate
+
+
+@app.get("/api/affiliate/me")
+def affiliate_me(request: Request):
+	"""Everything an affiliate's own dashboard shows.
+
+	A disabled or rejected account still gets to see this. Commission already
+	earned is still owed to them — the terms say so — and locking somebody out of
+	the page that says what they are owed is how a disagreement becomes a
+	complaint.
+	"""
+	affiliate = current_affiliate(request)
+	code = affiliate["code"]
+	config = _affiliate_settings()
+	rows = store.referrals(code, limit=200)
+	clicks = store.clicks_for(code)
+
+	# Same split the admin page uses, worked out from the same rows, so the two
+	# screens can never quote different numbers to the two people in the
+	# conversation.
+	now = int(time.time())
+	due = sum(r["commission"] for r in rows if r["status"] == "pending" and r["due_at"] <= now)
+	holding = sum(r["commission"] for r in rows if r["status"] == "pending" and r["due_at"] > now)
+	paid = sum(r["commission"] for r in rows if r["status"] == "paid")
+	sales = [r for r in rows if r["status"] != "void"]
+
+	return {
+		"affiliate": {
+			"code": code,
+			"name": affiliate["name"],
+			"email": affiliate["email"],
+			"status": affiliate["status"],
+			"rate_pct": affiliate["rate_pct"],
+			"country": affiliate["country"] or "",
+			"payout_method": affiliate["payout_method"],
+			"payout_to": affiliate["payout_to"] or "",
+			"stripe_account": bool(affiliate["stripe_account"]),
+			"stripe_ready": bool(affiliate["stripe_ready"]),
+			"decided_note": affiliate["decided_note"] or "",
+		},
+		"link": _ref_link(code),
+		"clicks": clicks,
+		"totals": {
+			"due": due,
+			"holding": holding,
+			"paid": paid,
+			"sales": len(sales),
+			"currency": (rows[0]["currency"] if rows else "usd"),
+		},
+		# Their own sales, without the buyer's email address. An affiliate is owed
+		# the fact of the sale and the money; they are not owed the identity of a
+		# customer who never dealt with them.
+		"sales": [
+			{
+				"created_at": r["created_at"],
+				"due_at": r["due_at"],
+				"gross": r["gross"],
+				"commission": r["commission"],
+				"currency": r["currency"],
+				"status": r["status"],
+				"payable": bool(r["payable"]),
+			}
+			for r in rows
+		],
+		"programme": {
+			"open": bool(config["enabled"]),
+			"hold_days": int(config["holdDays"]),
+			"stripe_payouts": stripe_api.configured(),
+		},
+	}
+
+
+@app.post("/api/affiliate/payout")
+def affiliate_set_payout(request: Request, body: dict = Body(...)):
+	"""Where the affiliate wants their money sent.
+
+	This is the part of the programme that has to work from anywhere. Stripe
+	pays out to around fifty countries and to nobody else, so an affiliate in
+	Pakistan, Bangladesh or Nigeria picks `manual` and writes down a Wise or
+	PayPal address — the same commission, on the same schedule, sent by hand.
+	"""
+	affiliate = current_affiliate(request)
+	method = (body.get("payout_method") or "").strip().lower()
+	if method not in ("manual", "stripe"):
+		raise HTTPException(400, "Choose either automatic Stripe payouts or being paid by hand.")
+
+	payout_to = (body.get("payout_to") or "").strip()
+	if method == "manual" and not payout_to:
+		raise HTTPException(
+			400, "Tell us where to send it — a Wise or PayPal email, or account details."
+		)
+	if method == "stripe" and not stripe_api.configured():
+		raise HTTPException(
+			503,
+			"Automatic Stripe payouts are not switched on yet. Choose paying by hand for now — "
+			"you will be paid exactly the same, we just send it ourselves.",
+		)
+
+	store.set_affiliate_payout(affiliate["code"], method, payout_to if method == "manual" else "")
+	return {"ok": True}
+
+
+def _stripe_onboarding(affiliate: dict, country: str) -> dict:
+	"""Create the Connect account if there is not one, and return a fresh link.
+
+	Shared by the affiliate doing it themselves and the owner doing it for them,
+	so both paths create at most one account per person. Two Stripe accounts for
+	one affiliate is a mess only Stripe support can untangle.
+	"""
+	account_id = affiliate["stripe_account"]
+	if not account_id:
+		country = (country or affiliate["country"] or "").strip()
+		if len(country) != 2:
+			raise HTTPException(400, "A two-letter country code is required, e.g. GB or DE")
+		account_id = stripe_api.create_express_account(affiliate["email"], country)["id"]
+		store.set_affiliate_stripe(affiliate["code"], account_id, ready=False)
+	return {"ok": True, "account": account_id, "url": stripe_api.onboarding_link(account_id)}
+
+
+@app.post("/api/affiliate/stripe")
+def affiliate_stripe(request: Request, body: dict = Body(default={})):
+	"""The affiliate starts their own Stripe onboarding.
+
+	They go to Stripe, who collect the identity documents and the bank details
+	and own the compliance that comes with both. We never see or hold either —
+	which is the point of using Connect rather than asking for an IBAN in a form.
+	"""
+	affiliate = current_affiliate(request)
+	if not stripe_api.configured():
+		raise HTTPException(
+			503, "Automatic payouts are not switched on yet — you will be paid by hand instead."
+		)
+	try:
+		return _stripe_onboarding(affiliate, (body.get("country") or "").strip())
+	except stripe_api.StripeError as exc:
+		# Stripe's wording is the useful wording. "Country not supported" is
+		# exactly what this person needs to read, and it is the cue to pick being
+		# paid by hand instead.
+		raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/affiliate/logout")
+def affiliate_logout():
+	res = JSONResponse({"ok": True})
+	res.delete_cookie(SESSION_COOKIE, path="/")
+	return res
+
+
+_PORTAL_PAGE = pathlib.Path(__file__).with_name("affiliate.html")
+
+
+@app.get("/affiliate", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/affiliate/verify", include_in_schema=False)
+@app.get("/affiliate/session", include_in_schema=False)
+def affiliate_portal(request: Request, t: str = ""):
+	"""The affiliate's dashboard, and the two links that land on it.
+
+	`/affiliate/verify` and `/affiliate/session` are here rather than under /api
+	because they are pasted into emails and read by people — a link that says
+	`/api/` in it looks like something that was not meant for them. They hand
+	straight off to the endpoints that do the work.
+	"""
+	if request.url.path.endswith("/verify"):
+		return affiliate_verify(t)
+	if request.url.path.endswith("/session"):
+		return affiliate_session(t)
+	return HTMLResponse(_PORTAL_PAGE.read_text(encoding="utf-8"))
 
 
 # ── site settings ────────────────────────────────────────────────────────────
@@ -674,8 +1187,19 @@ def _setting_warnings(s: dict) -> list[str]:
 		)
 	elif latest and not version.get("announce", True):
 		out.append(f"Version {latest} is set but not announced — installed apps are told nothing.")
-	if not s["affiliates"]["enabled"]:
+	aff = s["affiliates"]
+	if not aff["enabled"]:
 		out.append("The affiliate programme is closed. New referrals earn nothing; existing commission is still owed.")
+	elif not aff.get("selfSignup", True):
+		out.append(
+			"Self sign-up is off, so the affiliate page shows 'email us' instead of a form. "
+			"Anyone already signed up is unaffected."
+		)
+	elif not aff.get("autoApprove", True):
+		out.append(
+			"New affiliates wait for your approval. They confirm their email, then sit on the "
+			"Affiliates tab until you approve or reject them — nobody earns until you do."
+		)
 	return out
 
 

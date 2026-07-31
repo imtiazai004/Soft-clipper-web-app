@@ -91,6 +91,24 @@ DEFAULTS: dict = {
 		"enabled": True,
 		"ratePct": 30,
 		"holdDays": 30,
+		# Whether people can sign themselves up, from anywhere, without being
+		# added by hand. On, because a programme that needs the owner to type
+		# every affiliate in is a programme with as many affiliates as the owner
+		# has evenings.
+		#
+		# Turning it off closes the form and puts the "email us" wording back on
+		# the affiliate page. It never touches anyone who has already signed up.
+		"selfSignup": True,
+		# Whether a confirmed email address is enough to start earning.
+		#
+		# On by default because the whole point is that nobody has to do anything.
+		# The thing to know before leaving it on: an open programme attracts
+		# coupon sites, people who bid on the brand name in ads, and self-referral
+		# — none of which cost anything until a sale, all of which the owner can
+		# stop afterwards by disabling the code. Turning this off puts every new
+		# application in a queue on the dashboard instead, which is safer and is
+		# work.
+		"autoApprove": True,
 	},
 	"notice": {
 		"enabled": False,
@@ -286,6 +304,15 @@ def public() -> dict:
 			"macUrl": downloads["macUrl"],
 			"macSize": downloads["macSize"],
 		},
-		"affiliates": {"enabled": bool(aff["enabled"]), "ratePct": aff["ratePct"], "holdDays": aff["holdDays"]},
+		"affiliates": {
+			"enabled": bool(aff["enabled"]),
+			"ratePct": aff["ratePct"],
+			"holdDays": aff["holdDays"],
+			# The site reads this to decide whether the affiliate page shows a
+			# sign-up form or the old "email us" paragraph. It is published rather
+			# than assumed, because a form that posts to a closed endpoint is worse
+			# than no form: it takes somebody's details and then refuses them.
+			"selfSignup": bool(aff["enabled"]) and bool(aff.get("selfSignup", True)),
+		},
 		"notice": notice if notice.get("enabled") else {"enabled": False, "text": "", "tone": "info"},
 	}

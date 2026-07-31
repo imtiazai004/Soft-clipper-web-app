@@ -36,6 +36,38 @@ and `/api/site-config` (what the marketing site reads at build time).
   the update-check rework) the app version the desktop apps get told about —
   see the desktop repo's CLAUDE.md § Release process for the full flow.
 
+## The affiliate programme
+
+Runs entirely out of `licence/` plus the marketing site — nothing in `core/`,
+so nothing to port to the desktop repo.
+
+- **Anyone can sign themselves up**, from any country, at
+  `softclipper.pro/affiliates/`. The form posts cross-origin to
+  `POST /api/affiliates/apply`; `SITE_ORIGIN` is the CORS allow-list and is the
+  single thing whose absence breaks the form while every test still passes.
+- **Nothing earns until an email is confirmed.** Statuses are
+  `pending → review → active`, plus `disabled`/`rejected`. `_credit_affiliate`
+  only ever pays `active`, so every unfinished state is safe by default.
+  `autoApprove` (dashboard) decides whether `review` is skipped.
+- **No passwords anywhere.** Sign-in is a signed, scoped, expiring token
+  (`crypto.make_scoped`/`read_scoped`) emailed as a link, exchanged for an
+  HttpOnly session cookie. The **scope** is what stops a sign-in link being
+  replayed as a confirmation link or a month-long session — never drop it.
+- **The affiliate's own dashboard** is `licence/affiliate.html`, served at
+  `/affiliate`, same pattern as `/admin`. It never shows a buyer's email.
+- **Clicks** are counted per code per day (`clicks` table), pinged by
+  `ReferralTag.astro` with `sendBeacon` *only* when the URL carried a fresh
+  tag. In `affiliate_summary()` clicks must stay a scalar subquery — a second
+  LEFT JOIN multiplies the referral rows and silently inflates every money
+  column.
+- **Payouts are unchanged**: the affiliate picks Stripe Connect (self-serve
+  onboarding, ~50 countries) or manual (Wise/PayPal, everywhere else, which is
+  the path Pakistan/Bangladesh/Nigeria need). Money still only moves when the
+  owner presses a button on the admin page.
+- **Deploy needs the Caddyfile**: `/api/affiliates/*`, `/api/affiliate/*` and
+  `/affiliate*` must be in the `@licence` matcher or every emailed sign-in link
+  lands on the video app's 404.
+
 ## Status
 
 Product has not launched — the Stripe Payment Link in the dashboard's price

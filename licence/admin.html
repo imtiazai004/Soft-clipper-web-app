@@ -194,6 +194,35 @@
 <div id="viewAffiliates" hidden>
 	<div id="mixedCurrency" class="warnbar" hidden></div>
 
+	<!--
+	  People who signed themselves up and are waiting on you. Above everything
+	  else because it is the only thing on this tab with somebody at the other end
+	  of it wondering whether they have been forgotten.
+	-->
+	<div id="applications" class="card" hidden>
+		<div class="row" style="margin-bottom:14px">
+			<h2 style="margin:0">Waiting for you</h2>
+			<span class="spacer"></span>
+			<span id="appCount" class="hint" style="margin:0"></span>
+		</div>
+		<div class="wrapscroll">
+			<table>
+				<thead>
+					<tr>
+						<th>Code</th><th>Who</th><th>Country</th><th>Where they will promote</th>
+						<th>Applied</th><th></th>
+					</tr>
+				</thead>
+				<tbody id="appRows"></tbody>
+			</table>
+		</div>
+		<p class="hint">
+			They have already confirmed their email — that address is real and theirs. Approving
+			emails them their link; rejecting tells them so, because an applicant who hears
+			nothing signs up again from a different address.
+		</p>
+	</div>
+
 	<div class="card">
 		<h2>Add an affiliate</h2>
 		<div class="row">
@@ -219,7 +248,8 @@
 			<table>
 				<thead>
 					<tr>
-						<th>Code</th><th>Who</th><th>Rate</th><th>Sales</th>
+						<th>Code</th><th>Who</th><th>Rate</th>
+						<th class="num">Clicks</th><th>Sales</th>
 						<th class="num">Owed now</th><th class="num">Still held</th>
 						<th class="num">Paid</th><th>Pay to</th><th></th>
 					</tr>
@@ -370,6 +400,15 @@
 			<input id="setAffEnabled" type="checkbox">
 			<span>Open — new referrals earn commission</span>
 		</label>
+		<label class="check" style="margin-top:10px">
+			<input id="setAffSignup" type="checkbox">
+			<span>Let people sign themselves up — shows a form on the affiliates page</span>
+		</label>
+		<label class="check" style="margin-top:10px">
+			<input id="setAffAuto" type="checkbox">
+			<span>Approve them automatically once they confirm their email</span>
+		</label>
+		<p class="hint" id="signupHint"></p>
 		<div class="row" style="margin-top:12px">
 			<label class="field" style="max-width:170px">
 				<span>Default commission %</span>
@@ -381,8 +420,15 @@
 			</label>
 		</div>
 		<p class="hint">
-			Closing the programme stops new sales earning. It never touches commission already
-			recorded — that is still owed, and the affiliates page says so.
+			Closing the programme stops new sales earning — and closes the sign-up form with it.
+			It never touches commission already recorded: that is still owed, and the affiliates
+			page says so.
+		</p>
+		<p class="hint">
+			Changing any of this needs <strong>Save &amp; publish</strong> to reach the public
+			affiliates page — it is static HTML like the rest of the site. The sign-up endpoint
+			itself obeys the setting the moment you save, so a form that slips through on a
+			cached page is still refused.
 		</p>
 	</div>
 
@@ -653,21 +699,86 @@ async function loadAffiliates() {
 	try {
 		const d = await api("/affiliates");
 		affiliates = d.affiliates || [];
-		defaults = { rate_pct: d.rate_pct, hold_days: d.hold_days, stripe: d.stripe_payouts };
+		defaults = {
+			rate_pct: d.rate_pct, hold_days: d.hold_days, stripe: d.stripe_payouts,
+			self_signup: d.self_signup, auto_approve: d.auto_approve,
+		};
 		$("count").textContent = affiliates.length + (affiliates.length === 1 ? " affiliate" : " affiliates");
 		$("afRate").placeholder = defaults.rate_pct + "%";
 		$("afHint").textContent =
 			`Default ${defaults.rate_pct}% commission, held ${defaults.hold_days} days after the sale so a refund can still cancel it. ` +
+			(defaults.self_signup
+				? "People can also sign themselves up from the affiliates page" +
+				  (defaults.auto_approve ? " and start earning as soon as they confirm their email." : ", and land in the queue above.")
+				: "Self sign-up is off (Site tab), so this form is the only way in.") +
 			(defaults.stripe
-				? "Stripe payouts are on: affiliates in a supported country can be paid automatically."
-				: "Stripe payouts are off — everyone is paid by hand until STRIPE_SECRET_KEY is set on the server.");
+				? " Stripe payouts are on: affiliates in a supported country can be paid automatically."
+				: " Stripe payouts are off — everyone is paid by hand until STRIPE_SECRET_KEY is set on the server.");
 		renderAffiliates();
 	} catch (e) {
 		say(e.message, false);
 	}
 }
 
+/** Applications that came through the public form and are waiting on a decision.
+ *
+ * `pending` is deliberately not here. Those people have not clicked the link in
+ * their email yet, which is the check the whole open form rests on — putting
+ * them in front of the owner would invite approving somebody who has not proved
+ * they own the address the money is going to.
+ */
+function renderApplications() {
+	const waiting = affiliates.filter((a) => a.status === "review");
+	$("applications").hidden = waiting.length === 0;
+	if (!waiting.length) return;
+
+	$("appCount").textContent = waiting.length === 1 ? "1 application" : waiting.length + " applications";
+	$("appRows").innerHTML = waiting.map((a) => `<tr>
+		<td class="key">${esc(a.code)}</td>
+		<td>${esc(a.name)}<br><span class="email" style="font-size:.8rem">${esc(a.email)}</span></td>
+		<td>${esc(a.country || "—")}</td>
+		<td style="color:var(--muted);max-width:320px">${esc(a.promo || "—")}</td>
+		<td style="color:var(--muted)">${ago(a.applied_at || a.created_at)}</td>
+		<td><div class="acts">
+			<button class="primary" onclick="decide('${esc(a.code)}', true)">Approve</button>
+			<button class="danger" onclick="decide('${esc(a.code)}', false)">Reject</button>
+		</div></td>
+	</tr>`).join("");
+}
+
+async function decide(code, approve) {
+	let reason = "";
+	if (!approve) {
+		reason = prompt(
+			`Reject ${code}?\n\nThey are emailed this, so write it as something a person reads. ` +
+			"Leave it blank to say nothing beyond the decision:",
+			"",
+		);
+		if (reason === null) return;
+	}
+	try {
+		await api(`/affiliates/${code}/decide`, {
+			method: "POST",
+			body: JSON.stringify({ approve, reason }),
+		});
+		say(approve ? `${code} approved and emailed their link.` : `${code} rejected and told.`, true);
+		loadAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+// How a code that is not simply "active" is described in the table. Everything
+// but `active` is a reason somebody is not earning, and the row has to say which.
+const STATUS_PILL = {
+	pending: ['<span class="pill unused">email not confirmed</span>', "Signed up but has not clicked the link we emailed them."],
+	review: ['<span class="pill holding">waiting for you</span>', "Confirmed their email; waiting on your approval above."],
+	disabled: ['<span class="pill void">disabled</span>', "Switched off — new sales earn nothing."],
+	rejected: ['<span class="pill void">rejected</span>', "Application declined."],
+};
+
 function renderAffiliates() {
+	renderApplications();
 	$("afEmpty").hidden = affiliates.length > 0;
 
 	const mixed = affiliates.filter((a) => a.currencies > 1);
@@ -684,7 +795,8 @@ function renderAffiliates() {
 
 	$("afRows").innerHTML = affiliates.map((a) => {
 		const link = `${SITE}/?ref=${encodeURIComponent(a.code)}`;
-		const disabled = a.status !== "active";
+		const live = a.status === "active";
+		const [pill, why] = STATUS_PILL[a.status] || ["", ""];
 
 		let pay;
 		if (a.payout_method === "stripe") {
@@ -701,11 +813,23 @@ function renderAffiliates() {
 		// switched on, this affiliate verified, and something genuinely due.
 		const canAutoPay = defaults.stripe && a.payout_method === "stripe" && a.stripe_ready && a.due > 0;
 
-		return `<tr${disabled ? ' style="opacity:.5"' : ""}>
-			<td class="key">${esc(a.code)}</td>
-			<td>${esc(a.name)}<br><span class="email" style="font-size:.8rem">${esc(a.email)}</span></td>
+		// Enable/Disable is only offered for a code that has been decided on.
+		// An application still waiting is approved above, through the endpoint
+		// that also emails the applicant their link — flipping it to active from
+		// here would leave somebody live and never told.
+		const toggle = (live || a.status === "disabled")
+			? `<button class="danger" onclick="toggleAffiliate('${esc(a.code)}', ${!live})">${live ? "Disable" : "Enable"}</button>`
+			: "";
+		// Conversion, for the two seconds anyone spends looking at a row. Not
+		// shown below 25 clicks, where one sale reads as a 50% conversion rate.
+		const conv = a.clicks >= 25 ? ` <span style="color:var(--dim)">(${((a.sales / a.clicks) * 100).toFixed(1)}%)</span>` : "";
+
+		return `<tr${live ? "" : ' style="opacity:.55"'}>
+			<td class="key">${esc(a.code)}${pill ? `<br>${pill}` : ""}</td>
+			<td title="${esc(why)}">${esc(a.name)}<br><span class="email" style="font-size:.8rem">${esc(a.email)}</span></td>
 			<td>${a.rate_pct}%</td>
-			<td>${a.sales || 0}</td>
+			<td class="num ${a.clicks ? "" : "zero"}">${(a.clicks || 0).toLocaleString("en-GB")}</td>
+			<td>${a.sales || 0}${conv}</td>
 			<td class="num ${a.due ? "due" : "zero"}">${money(a.due, a.currency)}</td>
 			<td class="num ${a.holding ? "" : "zero"}">${money(a.holding, a.currency)}</td>
 			<td class="num zero">${money(a.paid, a.currency)}</td>
@@ -717,7 +841,7 @@ function renderAffiliates() {
 					? `<button onclick="stripeOnboard('${esc(a.code)}')">${a.stripe_account ? "Onboarding link" : "Set up Stripe"}</button>`
 					: ""}
 				${canAutoPay ? `<button class="primary" onclick="payViaStripe('${esc(a.code)}')">Pay ${money(a.due, a.currency)}</button>` : ""}
-				<button class="danger" onclick="toggleAffiliate('${esc(a.code)}', ${disabled})">${disabled ? "Enable" : "Disable"}</button>
+				${toggle}
 			</div></td>
 		</tr>`;
 	}).join("");
@@ -949,6 +1073,12 @@ function fillSettings(s) {
 	$("setVerLatest").value = ver.latest || "";
 	$("setVerNotes").value = ver.notes || "";
 	$("setAffEnabled").checked = !!s.affiliates.enabled;
+	// Read with `!== false`, like `version.announce` above and for the same
+	// reason: a settings row saved before self sign-up existed has neither key,
+	// and defaulting them to off would silently close a form the server has
+	// already decided is open.
+	$("setAffSignup").checked = s.affiliates.selfSignup !== false;
+	$("setAffAuto").checked = s.affiliates.autoApprove !== false;
 	$("setAffRate").value = s.affiliates.ratePct;
 	$("setAffHold").value = s.affiliates.holdDays;
 	$("setNoticeOn").checked = !!s.notice.enabled;
@@ -956,6 +1086,7 @@ function fillSettings(s) {
 	$("setNoticeTone").value = s.notice.tone || "info";
 	priceHint();
 	versionHint();
+	signupHint();
 }
 
 /** Say plainly what an installed app will be told, before it is told it. */
@@ -981,6 +1112,21 @@ function versionHint() {
 }
 ["setVerLatest", "setVerNotes"].forEach((id) => $(id).addEventListener("input", versionHint));
 ["setVerAnnounce", "setDlEnabled"].forEach((id) => $(id).addEventListener("change", versionHint));
+
+/** Say what the two sign-up switches actually mean, in the order they apply. */
+function signupHint() {
+	const open = $("setAffEnabled").checked;
+	const signup = $("setAffSignup").checked;
+	const auto = $("setAffAuto").checked;
+	$("signupHint").textContent = !open
+		? "The programme is closed, so nobody can sign up whatever these say."
+		: !signup
+			? "The affiliates page shows 'email us' instead of a form, and you add people by hand on the Affiliates tab."
+			: auto
+				? "Anyone can sign up from anywhere. They confirm their email and start earning straight away — you are emailed each time, and you can disable a code afterwards."
+				: "People sign up, confirm their email, and then wait on the Affiliates tab until you approve them. Nobody earns until you do.";
+}
+["setAffEnabled", "setAffSignup", "setAffAuto"].forEach((id) => $(id).addEventListener("change", signupHint));
 
 function priceHint() {
 	const now = Number($("setAmount").value) || 0;
@@ -1021,6 +1167,8 @@ function collectSettings() {
 		},
 		affiliates: {
 			enabled: $("setAffEnabled").checked,
+			selfSignup: $("setAffSignup").checked,
+			autoApprove: $("setAffAuto").checked,
 			ratePct: Number($("setAffRate").value),
 			holdDays: Number($("setAffHold").value),
 		},

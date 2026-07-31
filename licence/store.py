@@ -46,6 +46,11 @@ CREATE INDEX IF NOT EXISTS events_key ON events(key);
 -- that only knew how to pay through Stripe could not pay the people most likely
 -- to be promoting this first. `payout_method` is per affiliate, and the two
 -- paths meet again at the same referral rows and the same totals.
+--
+-- Rows arrive two ways and the table cannot tell them apart afterwards, so
+-- `source` records which: 'admin' for one the owner typed in, 'signup' for one
+-- that came through the public form. Everything else about them is identical —
+-- the same link, the same commission, the same payout paths.
 CREATE TABLE IF NOT EXISTS affiliates (
     code           TEXT PRIMARY KEY,                 -- what goes in ?ref=, lowercase
     name           TEXT NOT NULL,
@@ -56,9 +61,37 @@ CREATE TABLE IF NOT EXISTS affiliates (
     payout_to      TEXT,                             -- manual: Wise/PayPal/bank, as given
     stripe_account TEXT,                             -- stripe: acct_… once onboarded
     stripe_ready   INTEGER NOT NULL DEFAULT 0,       -- Stripe says payouts are enabled
-    status         TEXT NOT NULL DEFAULT 'active',   -- active | disabled
+    -- pending  applied, has not clicked the link in their email yet
+    -- review   email confirmed, waiting for the owner to approve
+    -- active   earning; the only status a sale is ever credited to
+    -- disabled turned off by the owner
+    -- rejected application declined
+    status         TEXT NOT NULL DEFAULT 'active',
     created_at     INTEGER NOT NULL,
-    note           TEXT
+    note           TEXT,
+    country        TEXT,                             -- two letters; decides Stripe eligibility
+    promo          TEXT,                             -- where they said they would promote
+    source         TEXT,                             -- admin | signup
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    applied_at     INTEGER,
+    decided_at     INTEGER,                          -- when it was approved or rejected
+    decided_note   TEXT,
+    last_seen_at   INTEGER                           -- last sign-in to their own dashboard
+);
+CREATE INDEX IF NOT EXISTS affiliates_email ON affiliates(email);
+
+-- Link clicks, counted per day rather than one row per visitor.
+--
+-- Aggregated on the way in because the only question anyone asks of this is
+-- "how many, and is it converting" — and a row per click would grow without
+-- limit for a number nobody reads at that resolution. Nothing identifying is
+-- kept: no IP, no user agent, no visitor id, so this stays out of the way of
+-- consent rules that would otherwise apply to it.
+CREATE TABLE IF NOT EXISTS clicks (
+    code TEXT NOT NULL,
+    day  TEXT NOT NULL,                              -- YYYY-MM-DD, UTC
+    n    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (code, day)
 );
 
 -- One row per sale that carried a ref tag. This is the money record, so amounts
@@ -103,6 +136,21 @@ CREATE TABLE IF NOT EXISTS settings (
 # the step that gets forgotten and takes the service down on restart.
 _ADDED_COLUMNS = {
 	"licences": [("ref", "TEXT")],  # the affiliate code that sold it, if any
+	# Everything self-signup needed. The live database already holds affiliates
+	# the owner added by hand, and they must keep working untouched: every column
+	# here is nullable or defaults to the value those rows already behave as, so
+	# an existing 'active' affiliate is still active, still earning, still paid
+	# the same way after this runs.
+	"affiliates": [
+		("country", "TEXT"),
+		("promo", "TEXT"),
+		("source", "TEXT"),
+		("email_verified", "INTEGER NOT NULL DEFAULT 0"),
+		("applied_at", "INTEGER"),
+		("decided_at", "INTEGER"),
+		("decided_note", "TEXT"),
+		("last_seen_at", "INTEGER"),
+	],
 }
 
 
@@ -220,6 +268,36 @@ def normalise_code(code: str) -> str:
 	return "".join(c for c in (code or "").strip().lower() if c.isalnum() or c in "-_")[:40]
 
 
+# Codes nobody may take for themselves.
+#
+# A referral code is read out loud and typed into a URL beside our own name, so
+# `?ref=softclipper-official` is a person passing themselves off as us — the one
+# form of affiliate abuse that damages the brand rather than just costing a
+# commission. The rest are paths and words that would be confusing next to the
+# product's own.
+_RESERVED = {
+	"admin", "api", "app", "www", "support", "help", "info", "sales", "billing",
+	"soft", "clipper", "softclipper", "official", "team", "staff", "test", "null",
+}
+
+
+def code_problem(code: str) -> str:
+	"""Why this code cannot be used, or "" if it can.
+
+	One function so the public sign-up form, the admin form and the tests all
+	refuse exactly the same things — a code accepted in one place and rejected in
+	another is a person who has already put the link in a video description.
+	"""
+	cleaned = normalise_code(code)
+	if len(cleaned) < 3:
+		return "Pick at least 3 letters or numbers."
+	if cleaned in _RESERVED or "softclip" in cleaned:
+		return "That one is reserved. Pick something that is clearly yours — your name or channel works well."
+	if cleaned.isdigit():
+		return "An all-numbers code reads like an order number. Use some letters."
+	return ""
+
+
 def add_affiliate(
 	code: str,
 	name: str,
@@ -228,17 +306,130 @@ def add_affiliate(
 	payout_method: str = "manual",
 	payout_to: str = "",
 	note: str = "",
+	status: str = "active",
+	source: str = "admin",
+	country: str = "",
+	promo: str = "",
 ) -> dict:
+	"""Create an affiliate.
+
+	The defaults are the behaviour this function had before self-sign-up existed:
+	call it with the original six arguments and you get an active affiliate the
+	owner added by hand, exactly as before. The public form passes the rest.
+	"""
 	code = normalise_code(code)
+	now = int(time.time())
 	with db() as conn:
 		conn.execute(
 			"INSERT INTO affiliates (code, name, email, rate_pct, payout_method, payout_to,"
-			" created_at, note) VALUES (?,?,?,?,?,?,?,?)",
+			" created_at, note, status, source, country, promo, applied_at)"
+			" VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
 			(code, name.strip(), email.lower().strip(), int(rate_pct), payout_method,
-			 payout_to.strip(), int(time.time()), note.strip()),
+			 payout_to.strip(), now, note.strip(), status, source,
+			 (country or "").strip().upper()[:2], (promo or "").strip()[:500], now),
 		)
-		log(conn, None, "affiliate_added", f"{code} at {rate_pct}% via {payout_method}")
+		log(conn, None, "affiliate_added", f"{code} at {rate_pct}% via {payout_method} ({source}, {status})")
 	return get_affiliate(code)
+
+
+def affiliate_by_email(email: str) -> dict | None:
+	"""The one account for an address.
+
+	Sign-up refuses a second application from an address that already has one, and
+	signing in finds the account this way — so one person cannot quietly end up
+	with three codes and wonder why their totals are split across them.
+	"""
+	with db() as conn:
+		row = conn.execute(
+			"SELECT * FROM affiliates WHERE email = ? ORDER BY created_at LIMIT 1",
+			((email or "").lower().strip(),),
+		).fetchone()
+		return dict(row) if row else None
+
+
+def verify_affiliate_email(code: str, status: str) -> dict | None:
+	"""Mark the address confirmed and move the application on.
+
+	`status` is decided by the caller from the owner's settings — straight to
+	active when applications are approved automatically, to `review` when they are
+	not. Confirming twice is harmless and lands in the same place, which matters
+	because people click the link in an email more than once.
+	"""
+	code = normalise_code(code)
+	with db() as conn:
+		conn.execute(
+			"UPDATE affiliates SET email_verified = 1, status = ?"
+			" WHERE code = ? AND status = 'pending'",
+			(status, code),
+		)
+		log(conn, None, "affiliate_verified", f"{code} -> {status}")
+	return get_affiliate(code)
+
+
+def set_affiliate_payout(code: str, method: str, payout_to: str) -> dict | None:
+	"""How this affiliate wants to be paid, as they set it themselves.
+
+	Deliberately does not touch `stripe_account` or `stripe_ready`. Someone who
+	switches to being paid by hand and later switches back should not have to go
+	through Stripe's identity checks a second time for an account that still
+	exists and is still verified.
+	"""
+	code = normalise_code(code)
+	with db() as conn:
+		conn.execute(
+			"UPDATE affiliates SET payout_method = ?, payout_to = ? WHERE code = ?",
+			(method, (payout_to or "").strip()[:300], code),
+		)
+		log(conn, None, "affiliate_payout", f"{code} via {method}")
+	return get_affiliate(code)
+
+
+def touch_affiliate(code: str):
+	with db() as conn:
+		conn.execute(
+			"UPDATE affiliates SET last_seen_at = ? WHERE code = ?",
+			(int(time.time()), normalise_code(code)),
+		)
+
+
+def record_click(code: str) -> bool:
+	"""Count one visit through a referral link.
+
+	Only counted for a code that exists, so a bot walking `?ref=aaa`, `?ref=aab`
+	cannot fill the table with rows for affiliates who do not exist. Returns
+	whether it counted, which is only used by the tests — the endpoint itself
+	answers the same way either way, because telling a caller which codes are real
+	is a list of our affiliates for anyone who asks for it.
+	"""
+	code = normalise_code(code)
+	if not code:
+		return False
+	day = time.strftime("%Y-%m-%d", time.gmtime())
+	with db() as conn:
+		exists = conn.execute("SELECT 1 FROM affiliates WHERE code = ?", (code,)).fetchone()
+		if not exists:
+			return False
+		conn.execute(
+			"INSERT INTO clicks (code, day, n) VALUES (?,?,1)"
+			" ON CONFLICT(code, day) DO UPDATE SET n = n + 1",
+			(code, day),
+		)
+	return True
+
+
+def clicks_for(code: str, days: int = 30) -> dict:
+	"""Total clicks, and the recent ones, for one affiliate's own dashboard."""
+	code = normalise_code(code)
+	since = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+	with db() as conn:
+		total = conn.execute(
+			"SELECT COALESCE(SUM(n), 0) AS n FROM clicks WHERE code = ?", (code,)
+		).fetchone()["n"]
+		recent = conn.execute(
+			"SELECT COALESCE(SUM(n), 0) AS n FROM clicks WHERE code = ? AND day >= ?",
+			(code, since),
+		).fetchone()["n"]
+		return {"total": int(total), "recent": int(recent), "days": days}
 
 
 def set_affiliate_stripe(code: str, account: str, ready: bool):
@@ -273,12 +464,18 @@ def get_affiliate(code: str) -> dict | None:
 		return dict(row) if row else None
 
 
-def set_affiliate_status(code: str, status: str):
+def set_affiliate_status(code: str, status: str, note: str = ""):
+	"""Approve, reject, disable or re-enable.
+
+	`note` is why, and it is kept because the answer to "you turned me off, what
+	did I do" is otherwise whatever anyone remembers three months later.
+	"""
 	with db() as conn:
 		conn.execute(
-			"UPDATE affiliates SET status = ? WHERE code = ?", (status, normalise_code(code))
+			"UPDATE affiliates SET status = ?, decided_at = ?, decided_note = ? WHERE code = ?",
+			(status, int(time.time()), (note or "").strip()[:300] or None, normalise_code(code)),
 		)
-		log(conn, None, "affiliate_" + status, normalise_code(code))
+		log(conn, None, "affiliate_" + status, f"{normalise_code(code)} {note}".strip())
 
 
 def record_referral(
@@ -383,6 +580,10 @@ def affiliate_summary() -> list[dict]:
 		rows = conn.execute(
 			"""
 			SELECT a.*,
+			  -- A scalar subquery, not a second LEFT JOIN. Joining clicks as well
+			  -- as referrals would multiply the rows of one by the other and every
+			  -- money column below would come out wrong — silently, and too high.
+			  (SELECT COALESCE(SUM(c.n), 0) FROM clicks c WHERE c.code = a.code)  AS clicks,
 			  COUNT(r.id)                                                        AS sales,
 			  -- Totals only mean something in one currency. Today every sale is
 			  -- USD, so rather than build multi-currency accounting for a case

@@ -91,6 +91,45 @@ def make_token(key: str, machine: str, days: int) -> str:
 	)
 
 
+def verify_own(token: str) -> dict | None:
+	"""Check a token *this* server signed, against our own public half.
+
+	The desktop app verifies with a copy of the public key baked into it. Here
+	there is nothing to copy — the same private key that signed it is one env var
+	away — so there is no second place for the two halves to drift apart.
+	"""
+	return verify_token(token, public_key_b64())
+
+
+def make_scoped(scope: str, subject: str, minutes: int) -> str:
+	"""A short-lived, signed "you are this person" note — an email confirmation
+	link, a sign-in link, a portal session.
+
+	Signed rather than stored, so there is no table of live tokens to keep, expire
+	or leak. What that costs is revocation: a token stays valid until it expires.
+	Every route that reads one therefore re-reads the affiliate's current status
+	from the database, which is the thing that actually needs to be revocable.
+	"""
+	now = int(time.time())
+	return sign_token({"scope": scope, "sub": subject, "iat": now, "exp": now + minutes * 60, "v": 1})
+
+
+def read_scoped(token: str, scope: str) -> str:
+	"""The subject a scoped token names, or "" if it does not hold up.
+
+	The scope check is not decoration. Without it, a thirty-day portal session
+	token could be handed to the email-confirmation route, and a sign-in link
+	could be replayed as one — the signature is valid in every case, and only the
+	scope says what the holder was actually given permission to do.
+	"""
+	payload = verify_own(token)
+	if not payload or payload.get("scope") != scope:
+		return ""
+	if int(payload.get("exp") or 0) < time.time():
+		return ""
+	return str(payload.get("sub") or "")
+
+
 if __name__ == "__main__":
 	import sys
 

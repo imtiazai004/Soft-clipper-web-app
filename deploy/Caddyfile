@@ -10,7 +10,13 @@
 	# form listed them individually, and adding an admin endpoint without also
 	# editing this line sends it to the video app, which answers 404 for a route
 	# that exists and works. Every admin endpoint checks its own token.
-	@licence path /api/licence/* /api/admin/* /api/site-config /webhooks/stripe /admin
+	#
+	# `/api/affiliates/*` is the public sign-up surface and `/api/affiliate/*` is
+	# an affiliate's own dashboard — both are open to the internet by design and
+	# do their own throttling and signature checks. `/affiliate*` is the page
+	# itself, which is what the links inside our emails point at: miss it here and
+	# every sign-in link a customer clicks lands on the video app's 404.
+	@licence path /api/licence/* /api/admin/* /api/affiliate/* /api/affiliates/* /api/site-config /webhooks/stripe /admin /affiliate /affiliate/*
 	handle @licence {
 		reverse_proxy licence:8600
 	}

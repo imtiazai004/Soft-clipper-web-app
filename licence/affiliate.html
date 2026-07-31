@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Not indexed. This page is a private dashboard reached from a link in an email;
+  it has nothing on it a search engine should hold, and an affiliate finding
+  their own earnings page in Google results would be right to worry.
+-->
+<meta name="robots" content="noindex, nofollow">
+<title>Soft Clipper — affiliate dashboard</title>
+<style>
+	/* Deliberately the same palette as the admin page. Two dashboards on one
+	   host that look like different products is how somebody decides one of them
+	   is a phishing page. */
+	:root {
+		--bg: #0f0e1e; --panel: #17152e; --panel-2: #1e1c3a;
+		--line: rgba(255,255,255,.11); --line-2: rgba(255,255,255,.2);
+		--text: #eeecf8; --muted: #a8a3c8; --dim: #918cb2;
+		--violet: #a78bfa; --cyan: #22d3ee; --ok: #34d399; --warn: #fbbf24; --bad: #f87171;
+		--mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+	}
+	* { box-sizing: border-box; margin: 0; padding: 0; }
+	body {
+		background: var(--bg); color: var(--text); min-height: 100vh;
+		font: 15px/1.55 "Inter", "Segoe UI", system-ui, sans-serif;
+		padding: 22px clamp(14px, 4vw, 40px) 70px;
+	}
+	h1 { font-size: 1.35rem; letter-spacing: -.02em; }
+	.head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+	.sub { color: var(--dim); font-size: .88rem; }
+	.spacer { margin-left: auto; }
+	.wrap { max-width: 1000px; margin: 0 auto; }
+
+	button, input, select, textarea {
+		font: inherit; color: inherit; border-radius: 9px; border: 1px solid var(--line);
+		background: var(--panel); padding: 9px 12px;
+	}
+	input:focus, button:focus-visible, select:focus, textarea:focus { outline: 2px solid var(--violet); outline-offset: 1px; }
+	button { cursor: pointer; transition: border-color .15s, background .15s; }
+	button:hover { border-color: var(--line-2); background: var(--panel-2); }
+	button.primary { background: linear-gradient(135deg,#7c3aed,#5b53f0 55%,#0d7f9c); border-color: transparent; font-weight: 600; }
+	button:disabled { opacity: .5; cursor: not-allowed; }
+
+	.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 18px; }
+	.card h2 { font-size: .74rem; letter-spacing: .13em; text-transform: uppercase; color: var(--dim); margin-bottom: 14px; }
+	.row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+	.grow { flex: 1; min-width: 200px; }
+	.hint { color: var(--dim); font-size: .84rem; margin-top: 10px; }
+	.empty { color: var(--dim); padding: 26px 10px; text-align: center; }
+
+	.msg { padding: 11px 14px; border-radius: 10px; margin-bottom: 16px; font-size: .9rem; display: none; }
+	.msg.show { display: block; }
+	.msg.good { background: rgba(52,211,153,.12); border: 1px solid var(--ok); }
+	.msg.bad { background: rgba(248,113,113,.12); border: 1px solid var(--bad); }
+
+	.gate { max-width: 440px; margin: 10vh auto; }
+
+	/* The four numbers this page exists for. Big, because an affiliate opens
+	   this to read one of them and then close it again. */
+	.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
+	.stat { background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+	.stat b { display: block; font-size: 1.55rem; font-weight: 800; letter-spacing: -.02em; line-height: 1.15; }
+	.stat span { display: block; color: var(--dim); font-size: .78rem; margin-top: 3px; }
+	.stat.due b { color: var(--ok); }
+	.stat.hold b { color: var(--warn); }
+
+	.linkbox { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+	.linkbox code {
+		flex: 1; min-width: 220px; font-family: var(--mono); font-size: .9rem;
+		background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px;
+		padding: 11px 13px; overflow-x: auto; white-space: nowrap;
+	}
+
+	table { width: 100%; border-collapse: collapse; font-size: .88rem; }
+	th { text-align: left; font-size: .7rem; letter-spacing: .1em; text-transform: uppercase; color: var(--dim); font-weight: 700; padding: 0 10px 10px; }
+	td { padding: 11px 10px; border-top: 1px solid var(--line); }
+	.num { font-family: var(--mono); text-align: right; white-space: nowrap; }
+	.wrapscroll { overflow-x: auto; }
+
+	.pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .72rem; font-weight: 700; }
+	.pill.active { background: rgba(52,211,153,.15); color: var(--ok); }
+	.pill.holding { background: rgba(251,191,36,.15); color: var(--warn); }
+	.pill.paid { background: rgba(167,139,250,.16); color: var(--violet); }
+	.pill.void { background: rgba(248,113,113,.15); color: var(--bad); }
+	.warnbar { border: 1px solid var(--warn); background: rgba(251,191,36,.1); border-radius: 10px; padding: 11px 14px; font-size: .88rem; margin-bottom: 16px; }
+	.field { display: flex; flex-direction: column; gap: 5px; min-width: 160px; }
+	.field > span { font-size: .74rem; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); font-weight: 700; }
+	.field.grow { flex: 1; min-width: 240px; }
+	.choice { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; padding: 12px 14px; border: 1px solid var(--line); border-radius: 11px; margin-bottom: 10px; }
+	.choice:has(input:checked) { border-color: var(--violet); background: var(--panel-2); }
+	.choice input { width: 17px; height: 17px; padding: 0; margin-top: 2px; flex: none; }
+	.choice p { color: var(--muted); font-size: .85rem; margin-top: 3px; }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+<!-- Sign in. No password field anywhere on this page, by design. -->
+<div id="gate" class="gate card" hidden>
+	<h2>Affiliate dashboard</h2>
+	<p style="margin-bottom:14px">
+		Enter the email address you signed up with and we will send you a link. There is
+		no password to remember or lose.
+	</p>
+	<div class="row">
+		<input id="email" class="grow" type="email" placeholder="you@example.com" autocomplete="email">
+		<button class="primary" onclick="requestLink()">Email me a link</button>
+	</div>
+	<div id="gateMsg" class="msg" style="margin:14px 0 0"></div>
+	<p class="hint">
+		Not signed up yet? <a href="https://softclipper.pro/affiliates/" style="color:var(--violet)">Join the programme</a> —
+		it takes a minute and there is nothing to install.
+	</p>
+</div>
+
+<div id="app" hidden>
+	<div class="head">
+		<h1>Your affiliate dashboard</h1>
+		<span class="spacer"></span>
+		<button onclick="load()">Refresh</button>
+		<button onclick="signOut()">Sign out</button>
+	</div>
+	<p class="sub" id="who" style="margin-bottom:20px"></p>
+
+	<div id="msg" class="msg"></div>
+	<div id="statusBar"></div>
+
+	<div class="card">
+		<h2>Your link</h2>
+		<div class="linkbox">
+			<code id="link"></code>
+			<button class="primary" onclick="copyLink()">Copy</button>
+		</div>
+		<p class="hint" id="linkHint"></p>
+	</div>
+
+	<div class="card">
+		<h2>How it is going</h2>
+		<div class="stats">
+			<div class="stat"><b id="stClicks">0</b><span>clicks</span></div>
+			<div class="stat"><b id="stSales">0</b><span id="stSalesSub">sales</span></div>
+			<div class="stat due"><b id="stDue">—</b><span>ready to be paid</span></div>
+			<div class="stat hold"><b id="stHold">—</b><span id="stHoldSub">still held</span></div>
+			<div class="stat"><b id="stPaid">—</b><span>paid to you</span></div>
+		</div>
+		<p class="hint" id="statsHint"></p>
+	</div>
+
+	<div class="card">
+		<h2>Getting paid</h2>
+		<div id="payoutChoices"></div>
+		<div id="manualBox" hidden>
+			<label class="field grow">
+				<span>Where to send it</span>
+				<input id="payoutTo" placeholder="Wise or PayPal email, or your account details">
+			</label>
+			<p class="hint">
+				Whatever you write here is what we read when we send the money, so write it the
+				way your bank or wallet expects it.
+			</p>
+		</div>
+		<div id="stripeBox" hidden>
+			<p class="hint" style="margin-top:0" id="stripeState"></p>
+			<button id="stripeBtn" onclick="connectStripe()">Set up Stripe payouts</button>
+		</div>
+		<div class="row" style="margin-top:14px">
+			<button class="primary" onclick="savePayout()">Save</button>
+		</div>
+	</div>
+
+	<div class="card">
+		<h2>Your sales</h2>
+		<div class="wrapscroll">
+			<table>
+				<thead>
+					<tr>
+						<th>When</th><th class="num">Sale</th><th class="num">Your commission</th><th>State</th>
+					</tr>
+				</thead>
+				<tbody id="salesRows"></tbody>
+			</table>
+		</div>
+		<div id="salesEmpty" class="empty" hidden>
+			No sales yet. Put your link somewhere people who edit video will see it — a video
+			description, a pinned comment, a newsletter.
+		</div>
+	</div>
+</div>
+
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let me = null;
+
+/** Names and payout details are free text a human typed. Into innerHTML they go. */
+const esc = (s) =>
+	String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+		({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/** Cents to "$12.34". Money is integers everywhere behind this page. */
+const money = (cents, currency) => {
+	const n = (Number(cents) || 0) / 100;
+	try {
+		return n.toLocaleString("en-GB", { style: "currency", currency: (currency || "usd").toUpperCase() });
+	} catch {
+		return n.toFixed(2) + " " + String(currency || "").toUpperCase();
+	}
+};
+
+function ago(unix) {
+	if (!unix) return "—";
+	const s = Math.max(0, Math.floor(Date.now() / 1000 - unix));
+	if (s < 90) return "just now";
+	const m = Math.floor(s / 60);
+	if (m < 60) return m + "m ago";
+	const h = Math.floor(m / 60);
+	if (h < 48) return h + "h ago";
+	return Math.floor(h / 24) + "d ago";
+}
+
+let sayTimer = null;
+function say(text, good, where = "msg") {
+	const m = $(where);
+	m.textContent = text;
+	m.className = "msg show " + (good ? "good" : "bad");
+	clearTimeout(sayTimer);
+	if (good) sayTimer = setTimeout(() => (m.className = "msg"), 7000);
+}
+
+async function api(path, options = {}) {
+	const res = await fetch(path, {
+		...options,
+		// The session lives in an HttpOnly cookie, so it is never in a variable on
+		// this page and script that got in here could not read it out.
+		credentials: "same-origin",
+		headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+	});
+	const body = await res.json().catch(() => ({}));
+	if (!res.ok) {
+		const err = new Error(body.error || body.detail || `HTTP ${res.status}`);
+		err.status = res.status;
+		throw err;
+	}
+	return body;
+}
+
+// ── signing in ───────────────────────────────────────────────────────────────
+
+async function requestLink() {
+	const email = $("email").value.trim();
+	if (!email) return say("Enter the email address you signed up with.", false, "gateMsg");
+	try {
+		await api("/api/affiliates/login", { method: "POST", body: JSON.stringify({ email }) });
+		// The same words whether or not that address has an account. The server
+		// answers identically too — this page must not become the place where the
+		// difference leaks out.
+		say(
+			"If that address has an affiliate account, a sign-in link is on its way. It works " +
+			"once and expires in 30 minutes.",
+			true,
+			"gateMsg",
+		);
+	} catch (e) {
+		say(e.message, false, "gateMsg");
+	}
+}
+
+async function signOut() {
+	try { await api("/api/affiliate/logout", { method: "POST" }); } catch { /* going anyway */ }
+	location.href = location.pathname;
+}
+
+// ── the dashboard ────────────────────────────────────────────────────────────
+
+async function load() {
+	try {
+		me = await api("/api/affiliate/me");
+		$("gate").hidden = true;
+		$("app").hidden = false;
+		render();
+	} catch (e) {
+		if (e.status === 401) {
+			$("app").hidden = true;
+			$("gate").hidden = false;
+			// A link that has expired or been used lands here with ?problem=link.
+			// Saying so is the difference between "try again" and "this is broken".
+			if (new URLSearchParams(location.search).get("problem") === "link") {
+				say("That link has expired or has already been used. Ask for a fresh one below.", false, "gateMsg");
+			}
+			return;
+		}
+		say(e.message, false);
+	}
+}
+
+function render() {
+	const a = me.affiliate;
+	const t = me.totals;
+	$("who").textContent = `${a.name} · ${a.code} · ${a.rate_pct}% of every sale`;
+
+	// What the affiliate needs told before anything else on the page: whether
+	// they are actually earning right now.
+	const bars = [];
+	if (a.status === "review") {
+		bars.push(
+			"Your application is with us. Your link works, but sales will not earn commission " +
+			"until it is approved — usually the same day. We will email you.",
+		);
+	} else if (a.status === "disabled") {
+		bars.push(
+			"Your account is switched off, so new sales do not earn. Anything already recorded " +
+			"below is still owed to you and still gets paid. Reply to our email if this is a surprise.",
+		);
+	} else if (a.status === "rejected") {
+		bars.push("This application was not accepted." + (a.decided_note ? " " + a.decided_note : ""));
+	} else if (!me.programme.open) {
+		bars.push(
+			"The programme is closed to new referrals at the moment. Commission you have already " +
+			"earned is unaffected and still gets paid.",
+		);
+	}
+	$("statusBar").innerHTML = bars.map((b) => `<div class="warnbar">${esc(b)}</div>`).join("");
+
+	$("link").textContent = me.link;
+	$("linkHint").textContent =
+		`Anyone who follows this and buys within 60 days earns you ${a.rate_pct}% of what they pay. ` +
+		"It costs them nothing extra. Put it in a video description, a pinned comment, a newsletter — " +
+		"it works from any page on the site, so you can link to a blog post rather than the home page.";
+
+	$("stClicks").textContent = me.clicks.total.toLocaleString("en-GB");
+	$("stSales").textContent = t.sales;
+	// Conversion is the number that tells an affiliate whether to keep going, and
+	// it is meaningless on four clicks — so it is only shown once there are enough
+	// of them for the answer not to be noise.
+	$("stSalesSub").textContent =
+		me.clicks.total >= 25 ? `sales · ${((t.sales / me.clicks.total) * 100).toFixed(1)}% of clicks` : "sales";
+	$("stDue").textContent = money(t.due, t.currency);
+	$("stHold").textContent = money(t.holding, t.currency);
+	$("stHoldSub").textContent = `held ${me.programme.hold_days} days`;
+	$("stPaid").textContent = money(t.paid, t.currency);
+	$("statsHint").textContent =
+		`Commission is held for ${me.programme.hold_days} days after each sale, so a refund can still ` +
+		"cancel it. What this page says you have earned is money you get to keep. Payouts go out on " +
+		"request or monthly, whichever comes first.";
+
+	renderPayout();
+	renderSales();
+}
+
+function renderPayout() {
+	const a = me.affiliate;
+	const stripeOn = me.programme.stripe_payouts;
+
+	// Only offered when it can actually work. A radio button that leads to "not
+	// switched on" is worse than not showing it: it reads as the good option
+	// being withheld from this particular person.
+	$("payoutChoices").innerHTML = `
+		<label class="choice">
+			<input type="radio" name="pm" value="manual" ${a.payout_method !== "stripe" ? "checked" : ""} onchange="payoutChanged()">
+			<span><strong>Paid by hand — Wise, PayPal or bank transfer</strong>
+			<p>Works from anywhere in the world. We send it ourselves on the same schedule.</p></span>
+		</label>
+		${stripeOn ? `
+		<label class="choice">
+			<input type="radio" name="pm" value="stripe" ${a.payout_method === "stripe" ? "checked" : ""} onchange="payoutChanged()">
+			<span><strong>Automatically, through Stripe</strong>
+			<p>Stripe collects your details and pays you directly. Available in around fifty
+			countries — not Pakistan, Bangladesh or Nigeria, among others. If yours is not one,
+			pick the option above; the commission is identical.</p></span>
+		</label>` : `
+		<p class="hint" style="margin-top:0">
+			Automatic Stripe payouts are not switched on yet, so everyone is paid by hand for
+			now. Same commission, same schedule.
+		</p>`}
+	`;
+	$("payoutTo").value = a.payout_to || "";
+	payoutChanged();
+}
+
+function payoutChanged() {
+	const picked = document.querySelector('input[name="pm"]:checked');
+	const stripe = picked && picked.value === "stripe";
+	$("manualBox").hidden = stripe;
+	$("stripeBox").hidden = !stripe;
+	if (!stripe) return;
+
+	const a = me.affiliate;
+	$("stripeState").textContent = a.stripe_ready
+		? "Stripe has verified you — payouts arrive on their own."
+		: a.stripe_account
+			? "Stripe has your account but has not finished checking it. Carry on where you left off."
+			: "You will be handed over to Stripe, who collect your identity and bank details. We never see either.";
+	$("stripeBtn").textContent = a.stripe_account ? "Continue with Stripe" : "Set up Stripe payouts";
+	$("stripeBtn").hidden = !!a.stripe_ready;
+}
+
+async function savePayout() {
+	const picked = document.querySelector('input[name="pm"]:checked');
+	const method = picked ? picked.value : "manual";
+	try {
+		await api("/api/affiliate/payout", {
+			method: "POST",
+			body: JSON.stringify({ payout_method: method, payout_to: $("payoutTo").value.trim() }),
+		});
+		say("Saved. That is where your commission goes from now on.", true);
+		load();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function connectStripe() {
+	let country = me.affiliate.country;
+	if (!country) {
+		country = prompt("Which country are you in? Two letters — GB, DE, US, and so on.");
+		if (!country) return;
+	}
+	try {
+		const d = await api("/api/affiliate/stripe", {
+			method: "POST",
+			body: JSON.stringify({ country: country.trim() }),
+		});
+		// Straight there rather than showing the URL. These links are single-use
+		// and short-lived, so one that sits on screen while somebody reads it is a
+		// link that has expired by the time they click it.
+		location.href = d.url;
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+function renderSales() {
+	const rows = me.sales || [];
+	$("salesEmpty").hidden = rows.length > 0;
+	$("salesRows").innerHTML = rows.map((r) => {
+		const state = r.status === "paid"
+			? '<span class="pill paid">paid</span>'
+			: r.status === "void"
+				? '<span class="pill void">refunded — cancelled</span>'
+				: r.payable
+					? '<span class="pill active">ready to be paid</span>'
+					: `<span class="pill holding">held until ${new Date(r.due_at * 1000).toLocaleDateString("en-GB")}</span>`;
+		return `<tr>
+			<td style="color:var(--muted)">${ago(r.created_at)}</td>
+			<td class="num" style="color:var(--dim)">${money(r.gross, r.currency)}</td>
+			<td class="num">${money(r.commission, r.currency)}</td>
+			<td>${state}</td>
+		</tr>`;
+	}).join("");
+}
+
+$("email").addEventListener("keydown", (e) => { if (e.key === "Enter") requestLink(); });
+load();
+</script>
+</body>
+</html>
