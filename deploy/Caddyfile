@@ -1,3 +1,28 @@
+# HTTP/1.1 and HTTP/2 only — no HTTP/3.
+#
+# Caddy serves h3 by default and advertises it with an `Alt-Svc` header, which
+# tells the browser to use QUIC over **UDP** 443 for everything after the first
+# request. That is normally faster and invisible. It is not invisible on a
+# network that drops UDP 443, and plenty do — mobile carriers, corporate
+# firewalls, and ISPs in a number of countries.
+#
+# What that looks like from the outside is deeply misleading: the first page
+# loads over TCP and renders perfectly, then every `fetch` the page makes fails
+# at the network layer. The browser reports it to JavaScript as a bare "Failed
+# to fetch" — no status, no body, nothing naming a cause — while the server is
+# healthy and answers `curl` from anywhere else without complaint. It cost a
+# long hunt through CORS, certificates and endpoint names, none of which were
+# ever wrong.
+#
+# The gain from h3 here is a few milliseconds on a dashboard nobody has open
+# for long. The cost is a customer who cannot sign up and a message that points
+# nowhere. Not a close call.
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
 # DOMAIN comes from the environment (see docker-compose.yml).
 #   DOMAIN=:80                 -> plain HTTP on the server's IP, for testing
 #   DOMAIN=clips.example.com   -> automatic HTTPS via Let's Encrypt

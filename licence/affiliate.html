@@ -248,6 +248,42 @@ async function api(path, options = {}) {
 	return body;
 }
 
+/**
+ * Turn "Failed to fetch" into something a person can act on.
+ *
+ * A request that never reaches the server gives JavaScript one string and
+ * nothing else — no status, no body, no reason. It is the same string whether
+ * the network dropped it, an extension cancelled it, or the whole host is
+ * unreachable, and from inside the page those look identical.
+ *
+ * So this asks a second question. `/admin` is on this same host, is plain HTML,
+ * and has nothing in its URL any blocklist matches. If that answers while the
+ * dashboard call did not, the network is fine and something is picking requests
+ * off by their address. If it does not answer either, nothing from this page is
+ * getting out at all.
+ *
+ * It exists because the alternative is guessing, and guessing cost two rounds
+ * of shipping the wrong fix.
+ */
+async function whyDidThatFail() {
+	try {
+		await fetch("/admin", { cache: "no-store" });
+		return (
+			"The dashboard could not be loaded, but this server is reachable — so " +
+			"something on your side is cancelling that one request. An ad blocker or " +
+			"privacy extension is much the most likely. Try a private window, or " +
+			"switch the blocker off for this site."
+		);
+	} catch {
+		return (
+			"Nothing from this page can reach the server, although the page itself " +
+			"loaded. That is usually the network rather than the site: a VPN, a " +
+			"company or school firewall, or an internet provider blocking it. Try " +
+			"mobile data or a VPN — if it works there, that is the answer."
+		);
+	}
+}
+
 // ── signing in ───────────────────────────────────────────────────────────────
 
 async function requestLink() {
@@ -291,6 +327,16 @@ async function load() {
 			if (new URLSearchParams(location.search).get("problem") === "link") {
 				say("That link has expired or has already been used. Ask for a fresh one below.", false, "gateMsg");
 			}
+			return;
+		}
+		// No status means the request never got an answer at all. Showing the
+		// browser's own words for that — "Failed to fetch" — tells nobody anything,
+		// so work out which kind of nothing it was first. The sign-in box is shown
+		// underneath either way, so the page is not just an error.
+		if (e.status === undefined) {
+			$("app").hidden = true;
+			$("gate").hidden = false;
+			say(await whyDidThatFail(), false, "gateMsg");
 			return;
 		}
 		say(e.message, false);

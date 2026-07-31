@@ -71,6 +71,16 @@ so nothing to port to the desktop repo.
   onboarding, ~50 countries) or manual (Wise/PayPal, everywhere else, which is
   the path Pakistan/Bangladesh/Nigeria need). Money still only moves when the
   owner presses a button on the admin page.
+- **HTTP/3 is off in the Caddyfile, deliberately.** Caddy advertises h3 via
+  `Alt-Svc` and browsers then use QUIC over UDP 443 for everything after the
+  first request. On a network that drops UDP 443 — carriers, corporate
+  firewalls, several countries' ISPs — the page loads over TCP and then every
+  `fetch` it makes dies, reported to JS as a bare `Failed to fetch` while the
+  server answers `curl` from anywhere else. Do not turn it back on.
+- **Reload Caddy, do not recreate it.** `docker compose exec caddy caddy reload
+  --config /etc/caddy/Caddyfile` validates first and keeps the old config if
+  the new one is bad. `--force-recreate` with a broken Caddyfile takes the
+  whole host down, app and licence together.
 - **Deploy needs the Caddyfile**: `/api/partner/*` and `/partner*` (plus the
   kept `/api/affiliate*` aliases) must be in the `@licence` matcher, or every
   emailed sign-in link lands on the video app's 404. Caddy does **not** pick up
