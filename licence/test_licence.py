@@ -16,6 +16,8 @@ import os
 import tempfile
 import time
 
+import pathlib
+
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -38,7 +40,7 @@ os.environ["STRIPE_WEBHOOK_SECRET"] = "whsec_test"
 # back to the test server: a Secure cookie is never sent over http, and an
 # absolute redirect to the real host would send TestClient to the internet.
 os.environ["AFFILIATE_COOKIE_SECURE"] = "0"
-os.environ["AFFILIATE_PORTAL_URL"] = "http://testserver/affiliate"
+os.environ["AFFILIATE_PORTAL_URL"] = "http://testserver/partner"
 
 from licence import app as licence_app  # noqa: E402
 from licence import crypto, mail, store  # noqa: E402
@@ -761,7 +763,7 @@ def _apply(code: str, email: str = "", **extra):
 		"country": "PK",
 		"promo": "YouTube channel about video editing",
 	}
-	return client.post("/api/affiliates/apply", json={**body, **extra})
+	return client.post("/api/partner/join", json={**body, **extra})
 
 
 def _verify_url(sent: list[dict]) -> str:
@@ -772,7 +774,7 @@ def _verify_url(sent: list[dict]) -> str:
 	a URL pointing at a path nothing serves both look fine from the inside.
 	"""
 	body = next(m["body"] for m in reversed(sent) if m["what"] == "affiliate verification")
-	return next(line.strip() for line in body.splitlines() if "/verify?t=" in line)
+	return next(line.strip() for line in body.splitlines() if "/confirm?t=" in line)
 
 
 def test_a_sign_up_earns_nothing_until_the_email_is_confirmed(mailbox):
@@ -915,8 +917,8 @@ def test_signing_in_says_the_same_thing_whether_or_not_the_account_exists(mailbo
 	client.get(_verify_url(mailbox))
 	mailbox.clear()
 
-	real = client.post("/api/affiliates/login", json={"email": "known@applicant.test"})
-	fake = client.post("/api/affiliates/login", json={"email": "nobody@nowhere.test"})
+	real = client.post("/api/partner/signin", json={"email": "known@applicant.test"})
+	fake = client.post("/api/partner/signin", json={"email": "nobody@nowhere.test"})
 	assert real.status_code == fake.status_code == 200
 	assert real.json() == fake.json()
 	# One link went out, and only to the address that has an account.
@@ -934,14 +936,44 @@ def test_a_sign_in_link_cannot_be_used_as_a_confirmation_link_or_a_session():
 	assert crypto.read_scoped(crypto.make_scoped("aff-login", "x", -1), "aff-login") == ""
 
 
+def test_the_old_affiliate_paths_still_answer():
+	"""They were renamed because ad blockers cancel a request with "affiliate" in
+	the URL. Anything already sent to somebody — a confirmation link sitting in an
+	inbox, a bookmark — has to keep working, so both names reach one handler."""
+	assert client.get("/affiliate").status_code == 200
+	assert client.get("/partner").status_code == 200
+	# Unauthenticated, but answering. A 404 here would mean the route was dropped.
+	assert client.get("/api/affiliate/me").status_code == 401
+	assert client.get("/api/partner/me").status_code == 401
+	assert client.post("/api/affiliates/click?code=whoever").status_code == 200
+	assert client.post("/api/partner/visit?code=whoever").status_code == 200
+
+
+def test_no_endpoint_a_browser_calls_carries_a_blocker_keyword():
+	"""The paths the *site* and the portal call are the ones that have to survive
+	a tracker blocker. The sign-up fetch was being cancelled before it left the
+	browser, and all JavaScript is told is "Failed to fetch" — no status, no body,
+	nothing pointing at a cause. The old names stay reachable; nothing reaches for
+	them."""
+	from licence import app as mod
+
+	routes = {r.path for r in mod.app.routes}
+	for path in ("/api/partner/join", "/api/partner/visit", "/api/partner/signin"):
+		assert path in routes, path
+		assert "affiliate" not in path and "click" not in path
+
+	page = pathlib.Path(mod.__file__).with_name("affiliate.html").read_text(encoding="utf-8")
+	assert "/api/affiliate/" not in page and "/api/affiliates/" not in page
+
+
 def test_the_portal_page_is_served_and_is_not_indexed():
 	"""The page every link in every affiliate email points at. It is one file next
 	to the API, so the way this breaks is the file not shipping — which nothing
 	else here would notice."""
-	r = client.get("/affiliate")
+	r = client.get("/partner")
 	assert r.status_code == 200
 	assert "noindex" in r.text
-	assert "/api/affiliate/me" in r.text
+	assert "/api/partner/me" in r.text
 
 
 def test_the_marketing_site_may_post_the_sign_up_form_and_nobody_else():
@@ -949,14 +981,14 @@ def test_the_marketing_site_may_post_the_sign_up_form_and_nobody_else():
 	it work. Nothing in the tests above would fail if it were missing — the sign-up
 	endpoint answers perfectly well, and every browser throws the answer away."""
 	allowed = client.post(
-		"/api/affiliates/apply",
+		"/api/partner/join",
 		json={"name": "X", "email": "cors@applicant.test", "code": "corsone"},
 		headers={"Origin": "https://softclipper.pro"},
 	)
 	assert allowed.headers.get("access-control-allow-origin") == "https://softclipper.pro"
 
 	stranger = client.post(
-		"/api/affiliates/apply",
+		"/api/partner/join",
 		json={"name": "X", "email": "cors2@applicant.test", "code": "corstwo"},
 		headers={"Origin": "https://not-us.example"},
 	)
@@ -968,18 +1000,18 @@ def test_the_marketing_site_may_post_the_sign_up_form_and_nobody_else():
 
 
 def test_a_broken_link_lands_on_the_portal_saying_so():
-	r = client.get("/affiliate/verify?t=rubbish", follow_redirects=False)
+	r = client.get("/partner/confirm?t=rubbish", follow_redirects=False)
 	assert r.status_code == 303 and "problem=link" in r.headers["location"]
 
 
 def test_the_dashboard_needs_a_session_and_then_shows_their_own_numbers(mailbox):
-	assert client.get("/api/affiliate/me").status_code == 401
+	assert client.get("/api/partner/me").status_code == 401
 
 	_apply("dash")
 	client.get(_verify_url(mailbox))  # signs them in and sets the cookie
 	_stripe_post(_sale("cs_signup_5", "b5@example.com", ref="dash"))
 
-	me = client.get("/api/affiliate/me").json()
+	me = client.get("/api/partner/me").json()
 	assert me["affiliate"]["code"] == "dash"
 	assert me["link"].endswith("?ref=dash")
 	assert me["totals"]["sales"] == 1
@@ -988,8 +1020,8 @@ def test_the_dashboard_needs_a_session_and_then_shows_their_own_numbers(mailbox)
 	# The affiliate is owed the sale and the money, not the buyer's identity.
 	assert "b5@example.com" not in json.dumps(me)
 
-	client.post("/api/affiliate/logout")
-	assert client.get("/api/affiliate/me").status_code == 401
+	client.post("/api/partner/signout")
+	assert client.get("/api/partner/me").status_code == 401
 
 
 def test_an_affiliate_sets_their_own_payout_details(mailbox):
@@ -999,11 +1031,11 @@ def test_an_affiliate_sets_their_own_payout_details(mailbox):
 	# Being paid by hand is the path that works from anywhere, and it needs to
 	# know where to send it.
 	assert client.post(
-		"/api/affiliate/payout", json={"payout_method": "manual", "payout_to": ""}
+		"/api/partner/payout", json={"payout_method": "manual", "payout_to": ""}
 	).status_code == 400
 
 	r = client.post(
-		"/api/affiliate/payout",
+		"/api/partner/payout",
 		json={"payout_method": "manual", "payout_to": "wise: payme@applicant.test"},
 	)
 	assert r.status_code == 200
@@ -1011,7 +1043,7 @@ def test_an_affiliate_sets_their_own_payout_details(mailbox):
 
 	# Stripe is not configured in tests, and the answer says so rather than
 	# offering a route that can only fail.
-	r = client.post("/api/affiliate/payout", json={"payout_method": "stripe"})
+	r = client.post("/api/partner/payout", json={"payout_method": "stripe"})
 	assert r.status_code == 503 and "by hand" in r.json()["error"]
 
 
@@ -1023,7 +1055,7 @@ def test_a_disabled_affiliate_can_still_see_what_they_are_owed(mailbox):
 	_stripe_post(_sale("cs_signup_6", "b6@example.com", ref="offnow"))
 	store.set_affiliate_status("offnow", "disabled", "testing")
 
-	me = client.get("/api/affiliate/me").json()
+	me = client.get("/api/partner/me").json()
 	assert me["affiliate"]["status"] == "disabled"
 	assert me["totals"]["holding"] == 1170
 
@@ -1033,10 +1065,10 @@ def test_clicks_are_counted_only_for_codes_that_exist(mailbox):
 	client.get(_verify_url(mailbox))
 
 	for _ in range(3):
-		assert client.post("/api/affiliates/click?code=clicky").status_code == 200
+		assert client.post("/api/partner/visit?code=clicky").status_code == 200
 	# An unknown code is accepted and counted for nobody. Answering differently
 	# would let anyone walk the alphabet and list our affiliates.
-	assert client.post("/api/affiliates/click?code=nosuchaffiliate").json() == {"ok": True}
+	assert client.post("/api/partner/visit?code=nosuchaffiliate").json() == {"ok": True}
 
 	assert store.clicks_for("clicky")["total"] == 3
 	assert store.clicks_for("nosuchaffiliate")["total"] == 0

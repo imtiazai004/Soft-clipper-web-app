@@ -254,7 +254,7 @@ async function requestLink() {
 	const email = $("email").value.trim();
 	if (!email) return say("Enter the email address you signed up with.", false, "gateMsg");
 	try {
-		await api("/api/affiliates/login", { method: "POST", body: JSON.stringify({ email }) });
+		await api("/api/partner/signin", { method: "POST", body: JSON.stringify({ email }) });
 		// The same words whether or not that address has an account. The server
 		// answers identically too — this page must not become the place where the
 		// difference leaks out.
@@ -270,7 +270,7 @@ async function requestLink() {
 }
 
 async function signOut() {
-	try { await api("/api/affiliate/logout", { method: "POST" }); } catch { /* going anyway */ }
+	try { await api("/api/partner/signout", { method: "POST" }); } catch { /* going anyway */ }
 	location.href = location.pathname;
 }
 
@@ -278,7 +278,7 @@ async function signOut() {
 
 async function load() {
 	try {
-		me = await api("/api/affiliate/me");
+		me = await api("/api/partner/me");
 		$("gate").hidden = true;
 		$("app").hidden = false;
 		render();
@@ -402,7 +402,7 @@ async function savePayout() {
 	const picked = document.querySelector('input[name="pm"]:checked');
 	const method = picked ? picked.value : "manual";
 	try {
-		await api("/api/affiliate/payout", {
+		await api("/api/partner/payout", {
 			method: "POST",
 			body: JSON.stringify({ payout_method: method, payout_to: $("payoutTo").value.trim() }),
 		});
@@ -420,7 +420,7 @@ async function connectStripe() {
 		if (!country) return;
 	}
 	try {
-		const d = await api("/api/affiliate/stripe", {
+		const d = await api("/api/partner/stripe", {
 			method: "POST",
 			body: JSON.stringify({ country: country.trim() }),
 		});

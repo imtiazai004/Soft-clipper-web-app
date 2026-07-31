@@ -16,7 +16,13 @@
 	# do their own throttling and signature checks. `/affiliate*` is the page
 	# itself, which is what the links inside our emails point at: miss it here and
 	# every sign-in link a customer clicks lands on the video app's 404.
-	@licence path /api/licence/* /api/admin/* /api/affiliate/* /api/affiliates/* /api/site-config /webhooks/stripe /admin /affiliate /affiliate/*
+	#
+	# `/api/partner/*` and `/partner*` are the names everything uses now. The
+	# `/affiliate` pair is kept because links already emailed to people point at
+	# it — the rename happened because ad and tracker blockers match "affiliate"
+	# in a URL and cancel the request, which the sign-up form could only report
+	# as "Failed to fetch".
+	@licence path /api/licence/* /api/admin/* /api/partner/* /api/affiliate/* /api/affiliates/* /api/site-config /webhooks/stripe /admin /partner /partner/* /affiliate /affiliate/*
 	handle @licence {
 		reverse_proxy licence:8600
 	}

@@ -57,7 +57,15 @@ SITE_ORIGINS = [
 # Where the affiliate's own dashboard lives, for the links inside emails. Served
 # by this service, on this host — an affiliate signing in has to reach a server,
 # and the static site is not one.
-PORTAL_URL = os.environ.get("AFFILIATE_PORTAL_URL", "https://app.softclipper.pro/affiliate")
+#
+# `/partner`, not `/affiliate`, and every endpoint below has the same pair of
+# names. The reason is not taste: ad and tracker blockers match request URLs
+# against keyword lists, and "affiliate" is on them — the sign-up form's fetch
+# was cancelled by the browser before it left, which reaches JavaScript as a
+# bare "Failed to fetch" with nothing in it to diagnose. Nothing is wrong with
+# the server in that state, which is what makes it expensive to find. The old
+# paths still answer, so a link already sent to somebody keeps working.
+PORTAL_URL = os.environ.get("AFFILIATE_PORTAL_URL", "https://app.softclipper.pro/partner")
 ADMIN_URL = os.environ.get("ADMIN_URL", "https://app.softclipper.pro/admin")
 # Where an affiliate's link points. The shop, not this API.
 SHOP_URL = os.environ.get("SHOP_URL", SITE_ORIGINS[0] if SITE_ORIGINS else "https://softclipper.pro")
@@ -766,6 +774,7 @@ def _looks_like_email(value: str) -> bool:
 	return "@" in value[1:-1] and "." in value.rsplit("@", 1)[-1] and len(value) <= 200
 
 
+@app.post("/api/partner/join")
 @app.post("/api/affiliates/apply")
 def affiliate_apply(request: Request, body: dict = Body(...)):
 	"""The public sign-up form.
@@ -835,12 +844,13 @@ def affiliate_apply(request: Request, body: dict = Body(...)):
 	mail.send_affiliate_verify(
 		email,
 		name,
-		f"{PORTAL_URL}/verify?t={crypto.make_scoped('aff-verify', code, VERIFY_LINK_MINUTES)}",
+		f"{PORTAL_URL}/confirm?t={crypto.make_scoped('aff-verify', code, VERIFY_LINK_MINUTES)}",
 	)
 	log.info("affiliate %s applied (%s, %s)", code, email, country or "no country")
 	return {"ok": True, "status": "pending", "code": affiliate["code"], "email": email}
 
 
+@app.get("/api/partner/confirm")
 @app.get("/api/affiliates/verify")
 def affiliate_verify(t: str = ""):
 	"""The link in the confirmation email.
@@ -871,6 +881,7 @@ def affiliate_verify(t: str = ""):
 	return _sign_in(code)
 
 
+@app.post("/api/partner/signin")
 @app.post("/api/affiliates/login")
 def affiliate_login(request: Request, body: dict = Body(...)):
 	"""Ask for a sign-in link.
@@ -893,17 +904,18 @@ def affiliate_login(request: Request, body: dict = Body(...)):
 			# than a sign-in link, which would skip the one check that matters.
 			mail.send_affiliate_verify(
 				affiliate["email"], affiliate["name"],
-				f"{PORTAL_URL}/verify?t={crypto.make_scoped('aff-verify', affiliate['code'], VERIFY_LINK_MINUTES)}",
+				f"{PORTAL_URL}/confirm?t={crypto.make_scoped('aff-verify', affiliate['code'], VERIFY_LINK_MINUTES)}",
 			)
 		else:
 			mail.send_affiliate_login(
 				affiliate["email"],
-				f"{PORTAL_URL}/session?t={crypto.make_scoped('aff-login', affiliate['code'], LOGIN_LINK_MINUTES)}",
+				f"{PORTAL_URL}/enter?t={crypto.make_scoped('aff-login', affiliate['code'], LOGIN_LINK_MINUTES)}",
 			)
 
 	return {"ok": True, "sent": True}
 
 
+@app.get("/api/partner/enter")
 @app.get("/api/affiliates/session")
 def affiliate_session(t: str = ""):
 	code = crypto.read_scoped(t, "aff-login")
@@ -912,6 +924,7 @@ def affiliate_session(t: str = ""):
 	return _sign_in(code)
 
 
+@app.post("/api/partner/visit")
 @app.post("/api/affiliates/click")
 def affiliate_click(request: Request, code: str = ""):
 	"""A visit through somebody's referral link.
@@ -949,6 +962,7 @@ def current_affiliate(request: Request) -> dict:
 	return affiliate
 
 
+@app.get("/api/partner/me")
 @app.get("/api/affiliate/me")
 def affiliate_me(request: Request):
 	"""Everything an affiliate's own dashboard shows.
@@ -1019,6 +1033,7 @@ def affiliate_me(request: Request):
 	}
 
 
+@app.post("/api/partner/payout")
 @app.post("/api/affiliate/payout")
 def affiliate_set_payout(request: Request, body: dict = Body(...)):
 	"""Where the affiliate wants their money sent.
@@ -1066,6 +1081,7 @@ def _stripe_onboarding(affiliate: dict, country: str) -> dict:
 	return {"ok": True, "account": account_id, "url": stripe_api.onboarding_link(account_id)}
 
 
+@app.post("/api/partner/stripe")
 @app.post("/api/affiliate/stripe")
 def affiliate_stripe(request: Request, body: dict = Body(default={})):
 	"""The affiliate starts their own Stripe onboarding.
@@ -1088,6 +1104,7 @@ def affiliate_stripe(request: Request, body: dict = Body(default={})):
 		raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/api/partner/signout")
 @app.post("/api/affiliate/logout")
 def affiliate_logout():
 	res = JSONResponse({"ok": True})
@@ -1098,20 +1115,23 @@ def affiliate_logout():
 _PORTAL_PAGE = pathlib.Path(__file__).with_name("affiliate.html")
 
 
+@app.get("/partner", response_class=HTMLResponse, include_in_schema=False)
+@app.get("/partner/confirm", include_in_schema=False)
+@app.get("/partner/enter", include_in_schema=False)
 @app.get("/affiliate", response_class=HTMLResponse, include_in_schema=False)
 @app.get("/affiliate/verify", include_in_schema=False)
 @app.get("/affiliate/session", include_in_schema=False)
 def affiliate_portal(request: Request, t: str = ""):
 	"""The affiliate's dashboard, and the two links that land on it.
 
-	`/affiliate/verify` and `/affiliate/session` are here rather than under /api
-	because they are pasted into emails and read by people — a link that says
-	`/api/` in it looks like something that was not meant for them. They hand
-	straight off to the endpoints that do the work.
+	These are under `/partner` rather than `/api` because they are pasted into
+	emails and read by people — a link with `/api/` in it looks like something
+	that was not meant for them. They hand straight off to the endpoints that do
+	the work.
 	"""
-	if request.url.path.endswith("/verify"):
+	if request.url.path.endswith(("/verify", "/confirm")):
 		return affiliate_verify(t)
-	if request.url.path.endswith("/session"):
+	if request.url.path.endswith(("/session", "/enter")):
 		return affiliate_session(t)
 	return HTMLResponse(_PORTAL_PAGE.read_text(encoding="utf-8"))
 

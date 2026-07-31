@@ -43,8 +43,15 @@ so nothing to port to the desktop repo.
 
 - **Anyone can sign themselves up**, from any country, at
   `softclipper.pro/affiliates/`. The form posts cross-origin to
-  `POST /api/affiliates/apply`; `SITE_ORIGIN` is the CORS allow-list and is the
+  `POST /api/partner/join`; `SITE_ORIGIN` is the CORS allow-list and is the
   single thing whose absence breaks the form while every test still passes.
+- **Never put "affiliate", "click", "track" or "referral" in a path a browser
+  requests.** Ad and tracker blockers match request URLs against keyword lists
+  and cancel the request; JavaScript is told only `Failed to fetch` — no status,
+  no body, nothing pointing at a cause, and the server looks perfectly healthy
+  from every angle. That is what `/api/affiliates/apply` did on a real machine.
+  Everything the browser calls lives under `/api/partner/*` and `/partner*` now;
+  the old paths are kept as aliases so links already emailed keep working.
 - **Nothing earns until an email is confirmed.** Statuses are
   `pending → review → active`, plus `disabled`/`rejected`. `_credit_affiliate`
   only ever pays `active`, so every unfinished state is safe by default.
@@ -64,9 +71,11 @@ so nothing to port to the desktop repo.
   onboarding, ~50 countries) or manual (Wise/PayPal, everywhere else, which is
   the path Pakistan/Bangladesh/Nigeria need). Money still only moves when the
   owner presses a button on the admin page.
-- **Deploy needs the Caddyfile**: `/api/affiliates/*`, `/api/affiliate/*` and
-  `/affiliate*` must be in the `@licence` matcher or every emailed sign-in link
-  lands on the video app's 404.
+- **Deploy needs the Caddyfile**: `/api/partner/*` and `/partner*` (plus the
+  kept `/api/affiliate*` aliases) must be in the `@licence` matcher, or every
+  emailed sign-in link lands on the video app's 404. Caddy does **not** pick up
+  a Caddyfile change on `docker compose up -d --build` — its container is left
+  running; it needs `--force-recreate caddy`.
 
 ## Status
 
