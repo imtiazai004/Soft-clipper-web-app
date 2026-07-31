@@ -312,7 +312,43 @@ async function signOut() {
 
 // ── the dashboard ────────────────────────────────────────────────────────────
 
+/**
+ * What the sign-up form's redirect landed here to say.
+ *
+ * The form on the marketing site is a plain HTML post — it submits itself, the
+ * server answers with a redirect, and the outcome arrives in the query string.
+ * No request is made from this page to show it, which is the entire point: the
+ * whole sign-up path is now navigations, and there is nothing in it for a
+ * blocker or a firewall to filter out.
+ *
+ * Returns true when it handled the page, so `load` leaves it alone.
+ */
+function showSignupOutcome() {
+	const q = new URLSearchParams(location.search);
+	const joined = q.get("joined");
+	const problem = q.get("problem");
+	if (!joined && !problem) return false;
+
+	$("app").hidden = true;
+	$("gate").hidden = false;
+	if (joined) {
+		// `say` writes with textContent, so the address goes in as text — it came
+		// off the URL, and the URL is whatever anybody typed.
+		say(
+			"Almost there. We have emailed " + joined + " a link to confirm the address — " +
+			"click it and your affiliate link is live straight away. If it is not there in a " +
+			"couple of minutes, look in spam.",
+			true,
+			"gateMsg",
+		);
+	} else {
+		say(problem, false, "gateMsg");
+	}
+	return true;
+}
+
 async function load() {
+	if (showSignupOutcome()) return;
 	try {
 		me = await api("/api/partner/me");
 		$("gate").hidden = true;

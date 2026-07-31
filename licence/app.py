@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 
 import pathlib
 
@@ -780,18 +781,21 @@ def _looks_like_email(value: str) -> bool:
 	return "@" in value[1:-1] and "." in value.rsplit("@", 1)[-1] and len(value) <= 200
 
 
-@app.post("/api/partner/join")
-@app.post("/api/affiliates/apply")
-def affiliate_apply(request: Request, body: dict = Body(...)):
-	"""The public sign-up form.
+def _register_affiliate(fields: dict, ip: str) -> dict:
+	"""Take one application, whatever carried it here.
+
+	The rules live here, once, because there are two front doors: a plain HTML
+	form that submits itself, and a JSON endpoint. They must accept and refuse
+	exactly the same things — a code allowed at one door and refused at the other
+	is somebody who has already put their link in a video description.
 
 	Creates the affiliate straight away, but as `pending`: the row is real, the
-	code is reserved so nobody else can take it while they read their email, and
+	code is reserved so nobody else takes it while they read their email, and
 	`_credit_affiliate` will not pay a penny to anything that is not `active`.
 	"""
 	# Its own bucket, and a much tighter one than the licence endpoints: five
 	# sign-ups from one address in ten minutes is either a mistake or a script.
-	_throttle(f"apply:{_client_ip(request)}", limit=5, window=600)
+	_throttle(f"apply:{ip}", limit=5, window=600)
 
 	config = _affiliate_settings()
 	if not config["enabled"] or not config.get("selfSignup", True):
@@ -803,15 +807,15 @@ def affiliate_apply(request: Request, body: dict = Body(...)):
 	# A field a person never sees and never fills in. A bot fills in everything.
 	# Answered with success rather than an error, because an error is feedback a
 	# script can use to work out what it got wrong.
-	if (body.get("website") or "").strip():
-		log.info("affiliate sign-up honeypot tripped from %s", _client_ip(request))
-		return {"ok": True, "status": "pending"}
+	if (fields.get("website") or "").strip():
+		log.info("affiliate sign-up honeypot tripped from %s", ip)
+		return {"ok": True, "status": "pending", "code": "", "email": ""}
 
-	name = (body.get("name") or "").strip()[:120]
-	email = (body.get("email") or "").strip().lower()[:200]
-	code = store.normalise_code(body.get("code", ""))
-	country = (body.get("country") or "").strip().upper()[:2]
-	promo = (body.get("promo") or "").strip()[:500]
+	name = (fields.get("name") or "").strip()[:120]
+	email = (fields.get("email") or "").strip().lower()[:200]
+	code = store.normalise_code(fields.get("code", ""))
+	country = (fields.get("country") or "").strip().upper()[:2]
+	promo = (fields.get("promo") or "").strip()[:500]
 
 	if not name:
 		raise HTTPException(400, "Your name is required.")
@@ -854,6 +858,59 @@ def affiliate_apply(request: Request, body: dict = Body(...)):
 	)
 	log.info("affiliate %s applied (%s, %s)", code, email, country or "no country")
 	return {"ok": True, "status": "pending", "code": affiliate["code"], "email": email}
+
+
+@app.post("/partner/join", include_in_schema=False)
+async def affiliate_join_form(request: Request):
+	"""The sign-up form, submitted by the browser itself.
+
+	This is the front door, and it is a plain HTML form post — no JavaScript, no
+	`fetch`, no CORS. That is not nostalgia. A form the page submits with
+	`fetch` is an XHR, and ad blockers, privacy extensions, company firewalls and
+	antivirus proxies all filter XHR by URL while leaving ordinary navigation
+	alone. When one of them decides against the request, the browser hands
+	JavaScript a bare "Failed to fetch" — no status, no reason — while the server
+	sits there healthy, answering everyone else. That happened here, and it cost
+	most of a day to find, because every layer looked innocent from the inside.
+
+	A form submission is a navigation. There is nothing in it for any of those
+	things to match on, it works with JavaScript switched off, and it works in a
+	browser older than any of this. The reply is a redirect to a page that says
+	what happened.
+
+	The body is parsed by hand rather than with `Form(...)`, which would pull in
+	python-multipart for one endpoint — the same trade already made in
+	stripe_api.py, where four form posts were written out instead of taking the
+	SDK.
+	"""
+	raw = (await request.body()).decode("utf-8", "replace")
+	fields = {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+
+	try:
+		result = _register_affiliate(fields, _client_ip(request))
+	except HTTPException as exc:
+		# Back to the page that said it, with the reason. A form post that ends on
+		# a bare error page is one somebody has to retype from memory.
+		return RedirectResponse(
+			f"{PORTAL_URL}?problem={urllib.parse.quote(str(exc.detail))}", status_code=303
+		)
+
+	# 303 and not 307: the browser must follow this with a GET, or the back
+	# button and a refresh re-submit the application.
+	return RedirectResponse(
+		f"{PORTAL_URL}?joined={urllib.parse.quote(result['email'])}", status_code=303
+	)
+
+
+@app.post("/api/partner/join")
+@app.post("/api/affiliates/apply")
+def affiliate_apply(request: Request, body: dict = Body(...)):
+	"""The same sign-up, as JSON.
+
+	Kept because it is what shipped and something may still be calling it. The
+	form above is the path the site uses.
+	"""
+	return _register_affiliate(body, _client_ip(request))
 
 
 @app.get("/api/partner/confirm")

@@ -966,6 +966,69 @@ def test_no_endpoint_a_browser_calls_carries_a_blocker_keyword():
 	assert "/api/affiliate/" not in page and "/api/affiliates/" not in page
 
 
+def test_the_sign_up_form_posts_itself_with_no_javascript(mailbox):
+	"""The path the site actually uses.
+
+	It is a plain form post, not a `fetch`, because a cross-host XHR is the one
+	kind of request ad blockers, privacy extensions, company firewalls and
+	antivirus proxies filter — and when one drops it the browser reports a bare
+	"Failed to fetch" while the server has no record it was ever asked. That
+	happened to a real person here. A navigation has nothing for any of them to
+	match on, and works with JavaScript switched off.
+	"""
+	r = client.post(
+		"/partner/join",
+		content="name=Sara+Khan&email=formpost%40applicant.test&code=formpost&country=PK&promo=YouTube",
+		headers={"Content-Type": "application/x-www-form-urlencoded"},
+		follow_redirects=False,
+	)
+	# 303 and not 307: the browser must follow with a GET, or refreshing the page
+	# re-submits the application.
+	assert r.status_code == 303, r.text
+	assert "joined=formpost%40applicant.test" in r.headers["location"]
+
+	affiliate = store.get_affiliate("formpost")
+	assert affiliate["status"] == "pending" and affiliate["source"] == "signup"
+	assert any(m["what"] == "affiliate verification" for m in mailbox)
+
+	# And it goes live the same way a JSON sign-up does.
+	assert client.get(_verify_url(mailbox)).status_code == 200
+	assert store.get_affiliate("formpost")["status"] == "active"
+
+
+def test_a_refused_form_post_comes_back_as_a_page_saying_why(mailbox):
+	"""Not a bare error page. Somebody who has just typed six fields should be
+	told what was wrong, somewhere they can read it."""
+	_apply("taken")
+	r = client.post(
+		"/partner/join",
+		content="name=X&email=other%40applicant.test&code=taken",
+		headers={"Content-Type": "application/x-www-form-urlencoded"},
+		follow_redirects=False,
+	)
+	assert r.status_code == 303
+	assert "problem=" in r.headers["location"]
+	assert "taken" in r.headers["location"]
+
+
+def test_the_form_and_the_json_endpoint_refuse_the_same_things(mailbox):
+	"""Two front doors, one set of rules. A code allowed at one and refused at the
+	other is somebody who has already put their link in a video description."""
+	form = client.post(
+		"/partner/join",
+		content="name=X&email=res%40applicant.test&code=softclipper",
+		headers={"Content-Type": "application/x-www-form-urlencoded"},
+		follow_redirects=False,
+	)
+	api = client.post(
+		"/api/partner/join",
+		json={"name": "X", "email": "res2@applicant.test", "code": "softclipper"},
+	)
+	assert form.status_code == 303 and "problem=" in form.headers["location"]
+	assert api.status_code == 400
+	assert store.get_affiliate("softclipper") is None
+
+
 def test_the_portal_page_is_served_and_is_not_indexed():
 	"""The page every link in every affiliate email points at. It is one file next
 	to the API, so the way this breaks is the file not shipping — which nothing
