@@ -71,6 +71,17 @@ so nothing to port to the desktop repo.
   onboarding, ~50 countries) or manual (Wise/PayPal, everywhere else, which is
   the path Pakistan/Bangladesh/Nigeria need). Money still only moves when the
   owner presses a button on the admin page.
+- **Two hostnames, and the difference matters.** `app.softclipper.pro` is this
+  server's bare IP and carries the video app, including gigabyte uploads.
+  `api.softclipper.pro` is the *same server behind Cloudflare* and carries the
+  licence and affiliate API only. A bare IP is blocked wholesale in a number of
+  countries — the symptom is the marketing site loading perfectly (it is on
+  Cloudflare) and then every request the page makes dying with a browser error
+  that names no cause. Cloudflare's free plan caps a request body at 100 MB,
+  which is why the video app cannot simply move there too.
+  Needs `API_DOMAIN=api.softclipper.pro` in `deploy/.env`, a **proxied** (orange
+  cloud) A record, and the zone's SSL mode on **Full (strict)** — Flexible makes
+  Cloudflare talk HTTP to Caddy, which redirects to HTTPS, which loops forever.
 - **HTTP/3 is off in the Caddyfile, deliberately.** Caddy advertises h3 via
   `Alt-Svc` and browsers then use QUIC over UDP 443 for everything after the
   first request. On a network that drops UDP 443 — carriers, corporate

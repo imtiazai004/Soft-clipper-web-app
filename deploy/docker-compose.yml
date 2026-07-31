@@ -46,6 +46,17 @@ services:
       - "443:443"
     environment:
       DOMAIN: ${DOMAIN:-:80}
+      # A second hostname for the licence and affiliate API only, meant to sit
+      # behind Cloudflare. `DOMAIN` points straight at this server's bare IP,
+      # and a bare IP is exactly what gets blocked wholesale in a number of
+      # countries — leaving a paying customer unable to activate and nobody able
+      # to sign up as an affiliate, with the site itself loading perfectly
+      # because it is on Cloudflare already.
+      #
+      # Defaults to localhost so an unconfigured or local deployment does not
+      # start asking Let's Encrypt for a certificate it cannot prove it owns.
+      # Set API_DOMAIN in deploy/.env to switch it on.
+      API_DOMAIN: ${API_DOMAIN:-localhost}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data        # stored certificates — keep so renewals persist

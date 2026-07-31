@@ -61,3 +61,20 @@
 	}
 	encode gzip
 }
+
+# The licence and affiliate API, on a hostname meant to be proxied by
+# Cloudflare (orange cloud). See API_DOMAIN in docker-compose.yml.
+#
+# Why a second hostname rather than proxying the one above. Cloudflare's free
+# plan caps a request body at 100 MB, and this server accepts video uploads
+# measured in gigabytes — putting the whole site behind it would trade one
+# broken thing for another. So the video app keeps the direct hostname, and the
+# small-payload API gets one that rides a network nobody blocks.
+#
+# **Only the licence service is reachable here**, deliberately. A hostname whose
+# whole point is that it is small and always reachable should not also be a way
+# to post five gigabytes at the video app.
+{$API_DOMAIN} {
+	reverse_proxy licence:8600
+	encode gzip
+}

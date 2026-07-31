@@ -65,8 +65,14 @@ SITE_ORIGINS = [
 # bare "Failed to fetch" with nothing in it to diagnose. Nothing is wrong with
 # the server in that state, which is what makes it expensive to find. The old
 # paths still answer, so a link already sent to somebody keeps working.
-PORTAL_URL = os.environ.get("AFFILIATE_PORTAL_URL", "https://app.softclipper.pro/partner")
-ADMIN_URL = os.environ.get("ADMIN_URL", "https://app.softclipper.pro/admin")
+#
+# On `api.` rather than `app.`, and that is the more important half. `app.` is
+# this server's bare IP, and a bare IP is what gets blocked wholesale in a
+# number of countries — the marketing site loads fine, because it is behind
+# Cloudflare, and then every request the page makes to `app.` dies. `api.` is
+# the same server reached through Cloudflare, which nobody blocks.
+PORTAL_URL = os.environ.get("AFFILIATE_PORTAL_URL", "https://api.softclipper.pro/partner")
+ADMIN_URL = os.environ.get("ADMIN_URL", "https://api.softclipper.pro/admin")
 # Where an affiliate's link points. The shop, not this API.
 SHOP_URL = os.environ.get("SHOP_URL", SITE_ORIGINS[0] if SITE_ORIGINS else "https://softclipper.pro")
 
