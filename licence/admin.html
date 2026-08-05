@@ -832,6 +832,7 @@ async function loadAffiliates() {
 		affiliates = d.affiliates || [];
 		defaults = {
 			rate_pct: d.rate_pct, hold_days: d.hold_days, stripe: d.stripe_payouts,
+			rails: d.rails || { stripe: d.stripe_payouts },
 			self_signup: d.self_signup, auto_approve: d.auto_approve,
 		};
 		$("count").textContent = affiliates.length + (affiliates.length === 1 ? " affiliate" : " affiliates");
@@ -842,13 +843,39 @@ async function loadAffiliates() {
 				? "People can also sign themselves up from the affiliates page" +
 				  (defaults.auto_approve ? " and start earning as soon as they confirm their email." : ", and land in the queue above.")
 				: "Self sign-up is off (Site tab), so this form is the only way in.") +
-			(defaults.stripe
-				? " Stripe payouts are on: affiliates in a supported country can be paid automatically."
-				: " Stripe payouts are off — everyone is paid by hand until STRIPE_SECRET_KEY is set on the server.");
+			railsSentence();
 		renderAffiliates();
 	} catch (e) {
 		say(e.message, false);
 	}
+}
+
+/** Which automatic rails this server can use, and the one thing that goes wrong.
+ *
+ * Named individually rather than as "automatic payouts are on", because they
+ * reach different countries and the answer to "why can I not pay this person
+ * automatically" is nearly always that their rail in particular is off.
+ */
+function railsSentence() {
+	const r = defaults.rails || {};
+	const on = ["wise", "paypal", "stripe"].filter((k) => r[k]);
+	if (!on.length) {
+		return " Automatic payouts are all off — everyone is paid by hand until a provider's keys " +
+			"are set on the server.";
+	}
+	// A Wise token without a signing key gets as far as creating the transfer and
+	// then stops, leaving money in Wise waiting for someone to press a button
+	// there. Worth saying before payday rather than during it.
+	const halfWise = r.wise && !r.wise_can_fund
+		? " Wise transfers will be created but not funded until WISE_PRIVATE_KEY is set — they wait in Wise for you to approve."
+		: "";
+	// Worth stating, because it is the answer to "why is this affiliate on manual
+	// when Wise is switched on" — Wise opens accounts in far fewer countries than
+	// it can send to, so Wise-to-Wise reaches fewer people than Wise does.
+	const wiseOnly = r.wise && r.wise_only
+		? " Wise is set to pay Wise accounts only, so affiliates who cannot open one are on manual."
+		: "";
+	return ` Automatic payouts on: ${on.join(", ")}. Anyone else is paid by hand.` + halfWise + wiseOnly;
 }
 
 /** Applications that came through the public form and are waiting on a decision.
@@ -922,27 +949,50 @@ function renderAffiliates() {
 	}
 
 	const owed = affiliates.reduce((sum, a) => sum + (a.due || 0), 0);
-	$("dueTotal").textContent = owed ? "Payable right now: " + money(owed, "usd") : "Nothing due right now";
+	// Whoever has actually asked to be paid is the line that gets acted on, so it
+	// goes first and names them. "Payable right now" is a number people look at;
+	// "two people are waiting" is a number people do something about.
+	const asked = affiliates.filter((a) => a.payout_requested_at);
+	$("dueTotal").textContent =
+		(asked.length
+			? `${asked.length} waiting to be paid (${asked.map((a) => a.code).join(", ")}) · `
+			: "") +
+		(owed ? "Payable right now: " + money(owed, "usd") : "Nothing due right now");
 
 	$("afRows").innerHTML = affiliates.map((a) => {
 		const link = `${SITE}/?ref=${encodeURIComponent(a.code)}`;
 		const live = a.status === "active";
 		const [pill, why] = STATUS_PILL[a.status] || ["", ""];
 
+		// Is this affiliate set up on the rail they picked? Each one answers it
+		// differently — Stripe has its own verdict, the other two are simply
+		// whether we have a destination — and the same three questions decide the
+		// Pay button below, so they are answered once here.
+		const railOn = (defaults.rails || {})[a.payout_method];
+		const ready = a.payout_method === "stripe"
+			? !!a.stripe_ready
+			: a.payout_method === "paypal"
+				? !!a.paypal_email
+				: a.payout_method === "wise"
+					? !!a.wise_recipient
+					: false;
+
 		let pay;
-		if (a.payout_method === "stripe") {
-			pay = a.stripe_ready
-				? '<span class="pill active">Stripe ready</span>'
-				: a.stripe_account
-					? '<span class="pill holding">Stripe pending</span>'
-					: '<span class="pill unused">not started</span>';
-		} else {
+		if (a.payout_method === "manual") {
 			pay = `<span class="reflink">${esc(a.payout_to || "—")}</span>`;
+		} else if (ready) {
+			pay = `<span class="pill active">${esc(a.payout_method)} ready</span>` +
+				(a.payout_method === "manual" ? "" : `<br><span class="reflink" style="font-size:.75rem">${esc(a.payout_to || "")}</span>`);
+		} else {
+			pay = a.payout_method === "stripe" && a.stripe_account
+				? '<span class="pill holding">Stripe pending</span>'
+				: `<span class="pill unused">${esc(a.payout_method)} not finished</span>`;
 		}
 
-		// Automatic payout is offered only when it can actually work: Stripe
-		// switched on, this affiliate verified, and something genuinely due.
-		const canAutoPay = defaults.stripe && a.payout_method === "stripe" && a.stripe_ready && a.due > 0;
+		// Automatic payout is offered only when it can actually work: the rail
+		// switched on for this server, this affiliate set up on it, and something
+		// genuinely due.
+		const canAutoPay = !!railOn && ready && a.due > 0;
 
 		// Enable/Disable is only offered for a code that has been decided on.
 		// An application still waiting is approved above, through the endpoint
@@ -955,23 +1005,31 @@ function renderAffiliates() {
 		// shown below 25 clicks, where one sale reads as a 50% conversion rate.
 		const conv = a.clicks >= 25 ? ` <span style="color:var(--dim)">(${((a.sales / a.clicks) * 100).toFixed(1)}%)</span>` : "";
 
+		// They pressed the button. Shown against the amount rather than the name,
+		// because the question it raises is "pay this?" and the answer is the
+		// figure next to it.
+		const asked = a.payout_requested_at
+			? `<br><span class="pill holding" title="Asked on ${new Date(a.payout_requested_at * 1000).toLocaleDateString("en-GB")}">asked to be paid</span>`
+			: "";
+
 		return `<tr${live ? "" : ' style="opacity:.55"'}>
 			<td class="key">${esc(a.code)}${pill ? `<br>${pill}` : ""}</td>
 			<td title="${esc(why)}">${esc(a.name)}<br><span class="email" style="font-size:.8rem">${esc(a.email)}</span></td>
 			<td>${a.rate_pct}%</td>
 			<td class="num ${a.clicks ? "" : "zero"}">${(a.clicks || 0).toLocaleString("en-GB")}</td>
 			<td>${a.sales || 0}${conv}</td>
-			<td class="num ${a.due ? "due" : "zero"}">${money(a.due, a.currency)}</td>
+			<td class="num ${a.due ? "due" : "zero"}">${money(a.due, a.currency)}${asked}</td>
 			<td class="num ${a.holding ? "" : "zero"}">${money(a.holding, a.currency)}</td>
 			<td class="num zero">${money(a.paid, a.currency)}</td>
 			<td>${pay}</td>
 			<td><div class="acts">
 				<button onclick="copyLink('${esc(a.code)}')" title="${esc(link)}">Copy link</button>
 				<button onclick="openSales('${esc(a.code)}')">Sales</button>
-				${defaults.stripe && a.payout_method === "stripe"
+				${railOn && a.payout_method === "stripe"
 					? `<button onclick="stripeOnboard('${esc(a.code)}')">${a.stripe_account ? "Onboarding link" : "Set up Stripe"}</button>`
 					: ""}
-				${canAutoPay ? `<button class="primary" onclick="payViaStripe('${esc(a.code)}')">Pay ${money(a.due, a.currency)}</button>` : ""}
+				${canAutoPay ? `<button class="primary" onclick="payAutomatically('${esc(a.code)}')">Pay ${money(a.due, a.currency)}</button>` : ""}
+				${a.payout_requested_at ? `<button onclick="dismissRequest('${esc(a.code)}')" title="Clears the flag only. Nothing about what is owed changes.">Dismiss ask</button>` : ""}
 				${toggle}
 			</div></td>
 		</tr>`;
@@ -1056,15 +1114,31 @@ async function stripeOnboard(code) {
 	}
 }
 
-async function payViaStripe(code) {
+async function payAutomatically(code) {
 	const a = affiliates.find((x) => x.code === code);
+	// The rail is named in the confirmation because it decides which balance the
+	// money comes out of. Three providers means three balances, and "do I have
+	// the funds" has a different answer in each.
 	if (!confirm(
-		`Send ${money(a.due, a.currency)} to ${a.name} now?\n\n` +
-		"This moves real money out of the Stripe balance and cannot be undone from here."
+		`Send ${money(a.due, a.currency)} to ${a.name} via ${a.payout_method} now?\n\n` +
+		`This moves real money out of the ${a.payout_method} balance and cannot be undone from here.`
 	)) return;
 	try {
 		const d = await api(`/affiliates/${code}/pay`, { method: "POST" });
-		say(`Sent ${money(d.amount, a.currency)} to ${a.name} — ${d.rows} sale(s), transfer ${d.transfer}.`, true);
+		say(`Sent ${money(d.amount, a.currency)} to ${a.name} — ${d.rows} sale(s), ${d.how} ${d.transfer}.`, true);
+		loadAffiliates();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+async function dismissRequest(code) {
+	// No confirmation: it takes a flag off a row and the affiliate can press the
+	// button again. Paying clears it on its own — this is for the requests that
+	// ended some other way.
+	try {
+		await api(`/affiliates/${code}/payout-request`, { method: "POST" });
+		say(`Cleared ${code}'s request. What they are owed is unchanged.`, true);
 		loadAffiliates();
 	} catch (e) {
 		say(e.message, false);

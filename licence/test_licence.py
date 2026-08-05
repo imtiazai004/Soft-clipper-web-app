@@ -600,6 +600,7 @@ def test_affiliate_endpoints_need_the_admin_token():
 		"/api/admin/affiliates/x/stripe",
 		"/api/admin/affiliates/x/status",
 		"/api/admin/affiliates/x/refresh",
+		"/api/admin/affiliates/x/payout-request",
 	]:
 		assert client.post(path, json={}).status_code == 401, path
 
@@ -621,6 +622,251 @@ def test_automatic_payout_refuses_when_stripe_is_not_set_up():
 	r = client.post("/api/admin/affiliates/byhand/pay", headers=ADMIN)
 	assert r.status_code == 400
 	assert "by hand" in r.json()["error"]
+
+
+# ── the automatic payout rails ───────────────────────────────────────────────
+#
+# Three providers move money, and none of them is called here. What is worth
+# testing is not that httpx works — it is the part we own and the part that costs
+# real money when it is wrong:
+#
+#   · a rail that is switched off is refused before anything is attempted;
+#   · the reference every provider turns into its idempotency key is derived from
+#     what is being paid, so a retry is the same payment and a later payout is
+#     not;
+#   · a provider that fails leaves every row still payable, because a row wrongly
+#     closed is an affiliate who is never paid and cannot tell.
+
+
+@pytest.fixture
+def rails(monkeypatch):
+	"""Switch all three rails on and record what they were asked to send.
+
+	Patching the modules' `configured()` rather than setting environment
+	variables, because each module reads its key at import time — which is the
+	right thing for a server and the wrong thing for a test that wants it back
+	afterwards.
+	"""
+	from licence import paypal_api, payouts, stripe_api, wise_api
+
+	sent: list[dict] = []
+
+	monkeypatch.setattr(stripe_api, "configured", lambda: True)
+	monkeypatch.setattr(paypal_api, "configured", lambda: True)
+	monkeypatch.setattr(wise_api, "configured", lambda: True)
+	monkeypatch.setattr(wise_api, "can_fund", lambda: True)
+	monkeypatch.setattr(payouts, "available", lambda: {
+		"stripe": True, "paypal": True, "wise": True, "wise_can_fund": True,
+	})
+
+	monkeypatch.setattr(stripe_api, "create_transfer", lambda account, amount, currency, idempotency_key, description="": (
+		sent.append({"rail": "stripe", "to": account, "amount": amount, "key": idempotency_key})
+		or {"id": "tr_fake", "currency": currency}
+	))
+	monkeypatch.setattr(paypal_api, "create_payout", lambda reference, email, amount, currency, note="": (
+		sent.append({"rail": "paypal", "to": email, "amount": amount, "key": reference})
+		or {"id": "batch_fake", "status": "PENDING"}
+	))
+	monkeypatch.setattr(wise_api, "quote", lambda currency, amount: {"id": "quote_fake"})
+	monkeypatch.setattr(wise_api, "create_transfer", lambda recipient, quote_id, reference: (
+		sent.append({"rail": "wise", "to": recipient, "key": reference})
+		or {"id": 4242}
+	))
+	monkeypatch.setattr(wise_api, "fund_transfer", lambda transfer_id: {"status": "COMPLETED"})
+	return sent
+
+
+def _payable_affiliate(code: str, session: str, **payout) -> list[dict]:
+	"""An affiliate with one sale whose hold has already passed."""
+	_affiliate(code, **payout)
+	_stripe_post(_sale(session, f"buyer-{code}@example.com", ref=code))
+	_make_payable(code)
+	return store.payable(code)
+
+
+def test_each_rail_is_handed_the_money_and_the_rows_close(rails):
+	for code, session, extra in [
+		("railst", "cs_rail_1", {"payout_method": "stripe"}),
+		("railpp", "cs_rail_2", {"payout_method": "paypal"}),
+		("railwi", "cs_rail_3", {"payout_method": "wise"}),
+	]:
+		_payable_affiliate(code, session, **extra)
+
+	# Each rail's own idea of "we have somewhere to send it".
+	store.set_affiliate_stripe("railst", "acct_fake", ready=True)
+	store.set_affiliate_payout("railpp", "paypal", "PayPal: pp@x.test", paypal_email="pp@x.test")
+	store.set_affiliate_payout(
+		"railwi", "wise", "Wise: PKR ····4321", wise_recipient="9001", wise_currency="PKR"
+	)
+
+	for code in ("railst", "railpp", "railwi"):
+		r = client.post(f"/api/admin/affiliates/{code}/pay", headers=ADMIN)
+		assert r.status_code == 200, f"{code}: {r.text}"
+		assert r.json()["amount"] == 1170
+		# Nothing is left payable, and the row records which rail carried it.
+		assert store.payable(code) == []
+		assert store.referrals(code)[0]["paid_how"] == r.json()["how"]
+
+	assert [s["rail"] for s in rails] == ["stripe", "paypal", "wise"]
+	assert {s["to"] for s in rails} == {"acct_fake", "pp@x.test", "9001"}
+
+
+def test_the_idempotency_reference_is_the_payment_not_the_moment():
+	"""Every rail turns this into its own key — Stripe's header, PayPal's batch
+	id, Wise's transaction UUID. If it were a timestamp or a random token, a retry
+	after a timeout would be a second payment."""
+	from licence import payouts
+
+	first = payouts.reference("bob", [4, 5, 6], 2500)
+	assert first == payouts.reference("bob", [6, 5, 4], 2500)  # order cannot matter
+	assert first != payouts.reference("bob", [4, 5, 7], 2500)  # different rows
+	assert first != payouts.reference("bob", [4, 5, 6], 2600)  # different amount
+	assert first != payouts.reference("bo", [4, 5, 6], 2500)   # different person
+
+	# PayPal caps its batch id at 30 characters, so ours is hashed into that
+	# space — and the hash has to keep the property the reference had.
+	from licence import paypal_api
+
+	assert len(paypal_api.batch_id(first)) <= 30
+	assert paypal_api.batch_id(first) == paypal_api.batch_id(first)
+	assert paypal_api.batch_id(first) != paypal_api.batch_id(payouts.reference("bob", [4, 5, 7], 2500))
+
+
+def test_a_rail_that_is_switched_off_is_refused_before_anything_is_attempted():
+	_payable_affiliate("offrail", "cs_rail_4", payout_method="paypal")
+	store.set_affiliate_payout("offrail", "paypal", "PayPal: x@y.test", paypal_email="x@y.test")
+
+	r = client.post("/api/admin/affiliates/offrail/pay", headers=ADMIN)
+	assert r.status_code == 400 and "not switched on" in r.json()["error"]
+	# And nothing was closed on the way to finding that out.
+	assert len(store.payable("offrail")) == 1
+
+
+def test_a_provider_failure_leaves_every_row_payable(rails, monkeypatch):
+	"""A row wrongly left open is a second attempt. A row wrongly closed is an
+	affiliate who is never paid and has no way of knowing which it was."""
+	from licence import paypal_api
+
+	_payable_affiliate("failpp", "cs_rail_5", payout_method="paypal")
+	store.set_affiliate_payout("failpp", "paypal", "PayPal: f@y.test", paypal_email="f@y.test")
+
+	def boom(*args, **kwargs):
+		raise paypal_api.PayPalError("Receiver is unregistered")
+
+	monkeypatch.setattr(paypal_api, "create_payout", boom)
+	r = client.post("/api/admin/affiliates/failpp/pay", headers=ADMIN)
+
+	# The provider's own words, unedited — it is what tells an admin what to do.
+	assert r.status_code == 400 and r.json()["error"] == "Receiver is unregistered"
+	assert len(store.payable("failpp")) == 1
+	assert store.referrals("failpp")[0]["status"] == "pending"
+
+
+def test_an_affiliate_picks_paypal_and_wise_for_themselves(mailbox, rails, monkeypatch):
+	from licence import wise_api
+
+	_apply("picky")
+	client.get(_verify_url(mailbox))
+
+	# PayPal needs nothing but an address, and a typo in it is caught here.
+	assert client.post(
+		"/api/partner/payout", json={"payout_method": "paypal", "paypal_email": "not-an-address"}
+	).status_code == 400
+	assert client.post(
+		"/api/partner/payout", json={"payout_method": "paypal", "paypal_email": "me@paypal.test"}
+	).status_code == 200
+	assert store.get_affiliate("picky")["paypal_email"] == "me@paypal.test"
+
+	# Wise creates the account at Wise while they are looking at the form, so a
+	# bad IBAN is refused in Wise's words rather than by a transfer that fails
+	# next week.
+	monkeypatch.setattr(wise_api, "create_recipient", lambda *a, **k: {"id": 7777})
+	r = client.post("/api/partner/payout", json={
+		"payout_method": "wise",
+		"wise_currency": "pkr",
+		"wise_type": "pakistan",
+		"wise_holder": "Picky Person",
+		"wise_details": {"iban": "PK36SCBL0000001123456702"},
+	})
+	assert r.status_code == 200, r.text
+	saved = store.get_affiliate("picky")
+	assert saved["wise_recipient"] == "7777" and saved["wise_currency"] == "PKR"
+	# The line the admin table reads shows enough to tell two accounts apart and
+	# no more.
+	assert saved["payout_to"] == "Wise: PKR ····6702"
+
+	# Switching away does not throw the other rails' details away: coming back
+	# must not mean typing an IBAN Wise has already validated a second time.
+	client.post("/api/partner/payout", json={"payout_method": "manual", "payout_to": "Payoneer: p@x.test"})
+	kept = store.get_affiliate("picky")
+	assert kept["payout_method"] == "manual"
+	assert kept["wise_recipient"] == "7777" and kept["paypal_email"] == "me@paypal.test"
+
+
+def test_wise_to_wise_only_takes_an_email_and_refuses_bank_details(mailbox, rails, monkeypatch):
+	"""The owner's choice: pay Wise accounts, not bank accounts. Enforced on the
+	server and not only in the form — the form is what an honest browser sends,
+	and this is what decides where money goes."""
+	from licence import wise_api
+
+	monkeypatch.setattr(wise_api, "WISE_ONLY", True)
+	monkeypatch.setattr(wise_api, "create_recipient", lambda *a, **k: {"id": 8888})
+
+	_apply("wiseonly")
+	client.get(_verify_url(mailbox))
+
+	# The form is one box, and it is not fetched from Wise: an email recipient
+	# takes an email address in every currency, so there is nothing to ask.
+	fields = client.get("/api/partner/wise/fields?currency=EUR").json()
+	assert [t["type"] for t in fields["types"]] == ["email"]
+	assert [f["key"] for f in fields["types"][0]["fields"]] == ["email"]
+
+	# Bank details are refused even though Wise itself would have accepted them.
+	r = client.post("/api/partner/payout", json={
+		"payout_method": "wise",
+		"wise_currency": "EUR",
+		"wise_type": "iban",
+		"wise_holder": "Wise Only",
+		"wise_details": {"iban": "DE89370400440532013000"},
+	})
+	assert r.status_code == 400 and "Wise accounts only" in r.json()["error"]
+	assert not store.get_affiliate("wiseonly")["wise_recipient"]
+
+	r = client.post("/api/partner/payout", json={
+		"payout_method": "wise",
+		"wise_currency": "EUR",
+		"wise_type": "email",
+		"wise_holder": "Wise Only",
+		"wise_details": {"email": "them@wise.test"},
+	})
+	assert r.status_code == 200, r.text
+	saved = store.get_affiliate("wiseonly")
+	assert saved["wise_recipient"] == "8888"
+	# Shown whole, not masked: it is the same kind of thing as the PayPal line
+	# beside it, and half of it would be useless to whoever checks before paying.
+	assert saved["payout_to"] == "Wise: EUR → them@wise.test"
+
+
+def test_wise_refuses_an_account_in_wises_own_words(mailbox, rails, monkeypatch):
+	from licence import wise_api
+
+	_apply("badiban")
+	client.get(_verify_url(mailbox))
+
+	def refuse(*args, **kwargs):
+		raise wise_api.WiseError("iban: Please enter a valid IBAN")
+
+	monkeypatch.setattr(wise_api, "create_recipient", refuse)
+	r = client.post("/api/partner/payout", json={
+		"payout_method": "wise",
+		"wise_currency": "EUR",
+		"wise_type": "iban",
+		"wise_holder": "Bad Iban",
+		"wise_details": {"iban": "nonsense"},
+	})
+	assert r.status_code == 400 and r.json()["error"] == "iban: Please enter a valid IBAN"
+	# Nothing was saved, so the page still shows what they had before.
+	assert not store.get_affiliate("badiban")["wise_recipient"]
 
 
 # ── site settings ────────────────────────────────────────────────────────────
@@ -1249,6 +1495,116 @@ def test_an_affiliate_sets_their_own_payout_details(mailbox):
 	# offering a route that can only fail.
 	r = client.post("/api/partner/payout", json={"payout_method": "stripe"})
 	assert r.status_code == 503 and "by hand" in r.json()["error"]
+
+
+def _make_payable(code: str) -> int:
+	"""Push everything this code is holding past the refund window.
+
+	The hold is thirty days and no test is going to wait for it. Moving `due_at`
+	backwards is exactly what the clock does to it, and `payable()` cannot tell
+	the difference — which is the point: the behaviour under test is the one that
+	runs a month from now.
+	"""
+	with store.db() as conn:
+		conn.execute(
+			"UPDATE referrals SET due_at = ? WHERE code = ? AND status = 'pending'",
+			(int(time.time()) - 60, code),
+		)
+	return sum(r["commission"] for r in store.payable(code))
+
+
+def test_an_affiliate_asks_to_be_paid_and_the_owner_hears_about_it(mailbox):
+	"""The flag is only half of it. An affiliate presses the button because they
+	think they have been forgotten, and a flag nobody sees until the next time the
+	owner opens the dashboard proves them right."""
+	_apply("askme")
+	client.get(_verify_url(mailbox))
+	_stripe_post(_sale("cs_ask_1", "buyer-ask@example.com", ref="askme"))
+	client.post("/api/partner/payout", json={"payout_method": "manual", "payout_to": "wise: ask@x.test"})
+	assert _make_payable("askme") == 1170
+
+	mailbox.clear()
+	r = client.post("/api/partner/payout/request", json={"note": "rent is due"})
+	assert r.status_code == 200, r.text
+	assert r.json()["amount"] == 1170 and r.json()["already"] is False
+	assert store.get_affiliate("askme")["payout_requested_at"]
+
+	notice = mailbox[-1]
+	assert "askme" in notice["subject"] and "11.70" in notice["subject"]
+	# Where to send it is in the message. Nearly every payout is a Wise transfer
+	# made from a phone, and having to open the dashboard to find the address is
+	# the difference between paying somebody now and at the weekend.
+	assert "wise: ask@x.test" in notice["body"]
+
+	# Their own page tells them it was received, and the admin list puts them at
+	# the top — both sides of "we have your request".
+	assert client.get("/api/partner/me").json()["affiliate"]["payout_requested_at"]
+	assert store.affiliate_summary()[0]["code"] == "askme"
+
+	# Asking again is not an error and does not send a second notice. The answer
+	# to "did that work?" is the date they already asked.
+	mailbox.clear()
+	again = client.post("/api/partner/payout/request", json={})
+	assert again.status_code == 200 and again.json()["already"] is True
+	assert mailbox == []
+
+
+def test_asking_is_refused_when_there_is_nothing_to_pay_or_nowhere_to_send_it(mailbox):
+	"""Both refusals name the fix. A request the owner cannot act on gets ignored,
+	and being ignored is what the affiliate already suspects."""
+	_apply("nowt")
+	client.get(_verify_url(mailbox))
+
+	# Nothing earned at all.
+	r = client.post("/api/partner/payout/request", json={})
+	assert r.status_code == 400 and "held" in r.json()["error"]
+
+	# Earned, past the hold, but no payout address on file.
+	_stripe_post(_sale("cs_ask_2", "buyer-nowt@example.com", ref="nowt"))
+	_make_payable("nowt")
+	r = client.post("/api/partner/payout/request", json={})
+	assert r.status_code == 400 and "where to send it" in r.json()["error"]
+	assert not store.get_affiliate("nowt")["payout_requested_at"]
+
+
+def test_paying_answers_the_request_and_part_paying_does_not(mailbox):
+	"""Clearing the flag is the money arriving, in the same transaction that
+	records it — not an admin remembering afterwards."""
+	_apply("clearme")
+	client.get(_verify_url(mailbox))
+	client.post("/api/partner/payout", json={"payout_method": "manual", "payout_to": "wise: c@x.test"})
+	_stripe_post(_sale("cs_ask_3", "b-one@example.com", ref="clearme"))
+	_stripe_post(_sale("cs_ask_4", "b-two@example.com", ref="clearme"))
+	_make_payable("clearme")
+	assert client.post("/api/partner/payout/request", json={}).status_code == 200
+
+	rows = store.payable("clearme")
+	assert len(rows) == 2
+
+	# Half the money is not an answer to "please pay me", so the ask stands.
+	store.mark_referrals_paid([rows[0]["id"]], how="manual")
+	assert store.get_affiliate("clearme")["payout_requested_at"]
+
+	store.mark_referrals_paid([rows[1]["id"]], how="manual")
+	assert not store.get_affiliate("clearme")["payout_requested_at"]
+
+
+def test_an_owner_can_clear_a_request_without_paying_anything(mailbox):
+	"""For the requests that ended some other way. It takes a flag off a row and
+	must not touch a penny of what is owed."""
+	_apply("dismissme")
+	client.get(_verify_url(mailbox))
+	client.post("/api/partner/payout", json={"payout_method": "manual", "payout_to": "wise: d@x.test"})
+	_stripe_post(_sale("cs_ask_5", "b-three@example.com", ref="dismissme"))
+	due = _make_payable("dismissme")
+	client.post("/api/partner/payout/request", json={})
+
+	assert client.post("/api/admin/affiliates/dismissme/payout-request", headers=ADMIN).status_code == 200
+	assert not store.get_affiliate("dismissme")["payout_requested_at"]
+	assert sum(r["commission"] for r in store.payable("dismissme")) == due
+
+	# And they can ask again — nothing about the refusal is permanent.
+	assert client.post("/api/partner/payout/request", json={}).status_code == 200
 
 
 def test_a_disabled_affiliate_can_still_see_what_they_are_owed(mailbox):

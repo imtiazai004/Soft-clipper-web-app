@@ -67,10 +67,29 @@ so nothing to port to the desktop repo.
   tag. In `affiliate_summary()` clicks must stay a scalar subquery — a second
   LEFT JOIN multiplies the referral rows and silently inflates every money
   column.
-- **Payouts are unchanged**: the affiliate picks Stripe Connect (self-serve
-  onboarding, ~50 countries) or manual (Wise/PayPal, everywhere else, which is
-  the path Pakistan/Bangladesh/Nigeria need). Money still only moves when the
-  owner presses a button on the admin page.
+- **Payouts: four methods, one dispatcher.** The affiliate picks Stripe Connect
+  (~50 countries), PayPal (an email address; no Pakistan), Wise (their *bank
+  account*, ~160 countries — this is the rail that reaches PK/BD/NG), or manual.
+  Manual must always stay: no set of providers covers everybody.
+  - Every rail lives in its own module shaped like `stripe_api.py`, and
+    `payouts.send()` is the only thing that knows which to use. The admin Pay
+    button, "what is owed", and marking rows paid are one implementation — a
+    second endpoint per rail is how two rails start disagreeing about what has
+    been paid.
+  - **Money still only moves when the owner presses a button.** The affiliate can
+    ask (`payout_requested_at`), which emails the owner and flags the row; that
+    flag clears itself inside `mark_referrals_paid` when nothing payable is left.
+  - `payouts.reference()` is derived from the code, the row ids and the amount —
+    never a timestamp. Each rail turns it into its own idempotency key (Stripe
+    header, PayPal `sender_batch_id` hashed to 30 chars, Wise transaction UUID).
+    A retry after a timeout must be the same payment, not a second one.
+  - Rows are marked paid **only after** the rail returns. A row wrongly left open
+    is a retry; a row wrongly closed is an affiliate who is never paid.
+  - Wise's account fields are fetched from Wise (`account-requirements`) and
+    rendered as-is — never hard-code a per-currency field list, it is wrong for
+    every country nobody here has tested. Funding a Wise transfer needs an
+    RSA-signed challenge (`WISE_PRIVATE_KEY`); without it transfers are created
+    and left unfunded, and that is reported rather than recorded as sent.
 - **Two hostnames, and the difference matters.** `app.softclipper.pro` is this
   server's bare IP and carries the video app, including gigabyte uploads.
   `api.softclipper.pro` is the *same server behind Cloudflare* and carries the

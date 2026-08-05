@@ -32,10 +32,18 @@ log = logging.getLogger("licence.stripe")
 
 API = "https://api.stripe.com/v1"
 SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
-# Where Stripe sends the affiliate after onboarding. Both are pages on the
-# marketing site; neither needs to exist for the transfer path to work.
-RETURN_URL = os.environ.get("AFFILIATE_RETURN_URL", "https://softclipper.pro/affiliates/thanks/")
-REFRESH_URL = os.environ.get("AFFILIATE_REFRESH_URL", "https://softclipper.pro/affiliates/")
+# Where Stripe sends the affiliate when onboarding ends, and where it sends them
+# if the link had expired before they clicked it.
+#
+# Both default to the affiliate's own dashboard rather than a page on the
+# marketing site. Two reasons, and the first is the important one: a return URL
+# has to exist, and a "thanks" page that was never built is a 404 at the end of
+# somebody handing Stripe their passport. The second is that the dashboard is
+# where the answer is — it shows whether Stripe has verified them yet, and has
+# the button that asks Stripe again if the webhook has not landed.
+_PORTAL = os.environ.get("AFFILIATE_PORTAL_URL", "https://api.softclipper.pro/partner")
+RETURN_URL = os.environ.get("AFFILIATE_RETURN_URL", _PORTAL)
+REFRESH_URL = os.environ.get("AFFILIATE_REFRESH_URL", _PORTAL)
 
 
 class StripeError(RuntimeError):

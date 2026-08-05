@@ -59,10 +59,23 @@ CREATE TABLE IF NOT EXISTS affiliates (
     email          TEXT NOT NULL,
     rate_pct       INTEGER NOT NULL,                 -- their cut, per affiliate: a big
                                                      -- partner can be worth more than 30%
-    payout_method  TEXT NOT NULL DEFAULT 'manual',   -- manual | stripe
-    payout_to      TEXT,                             -- manual: Wise/PayPal/bank, as given
+    payout_method  TEXT NOT NULL DEFAULT 'manual',   -- manual | stripe | paypal | wise
+    -- Where the money goes, in words, for every method including the automatic
+    -- ones. The rails keep their real destination in their own columns below;
+    -- this is the human line the admin table shows and the payout email quotes,
+    -- and having one of those rather than four is why adding a rail did not mean
+    -- touching either dashboard's table.
+    payout_to      TEXT,
     stripe_account TEXT,                             -- stripe: acct_… once onboarded
     stripe_ready   INTEGER NOT NULL DEFAULT 0,       -- Stripe says payouts are enabled
+    paypal_email   TEXT,                             -- paypal: where the payout is sent
+    -- wise: the recipient id Wise gave us when the account was created, and the
+    -- currency it is held in. The account details themselves are Wise's copy;
+    -- ours is kept only so a deleted recipient can be recreated without asking
+    -- the affiliate to type their IBAN a second time.
+    wise_recipient TEXT,
+    wise_currency  TEXT,
+    wise_details   TEXT,
     -- pending  applied, has not clicked the link in their email yet
     -- review   email confirmed, waiting for the owner to approve
     -- active   earning; the only status a sale is ever credited to
@@ -78,7 +91,16 @@ CREATE TABLE IF NOT EXISTS affiliates (
     applied_at     INTEGER,
     decided_at     INTEGER,                          -- when it was approved or rejected
     decided_note   TEXT,
-    last_seen_at   INTEGER                           -- last sign-in to their own dashboard
+    last_seen_at   INTEGER,                          -- last sign-in to their own dashboard
+    -- "Please send me what I have earned." A flag, not a queue: it moves no
+    -- money and never could — paying is still the owner pressing a button. It
+    -- exists because without it an affiliate with commission sitting past its
+    -- hold had no way of saying so except email, and silence reads as being
+    -- forgotten. Cleared automatically once nothing payable is left, so the
+    -- answer to the request is the money arriving rather than an admin
+    -- remembering to tidy up afterwards.
+    payout_requested_at INTEGER,
+    payout_request_note TEXT
 );
 CREATE INDEX IF NOT EXISTS affiliates_email ON affiliates(email);
 
@@ -193,6 +215,12 @@ _ADDED_COLUMNS = {
 		("decided_at", "INTEGER"),
 		("decided_note", "TEXT"),
 		("last_seen_at", "INTEGER"),
+		("payout_requested_at", "INTEGER"),
+		("payout_request_note", "TEXT"),
+		("paypal_email", "TEXT"),
+		("wise_recipient", "TEXT"),
+		("wise_currency", "TEXT"),
+		("wise_details", "TEXT"),
 	],
 }
 
@@ -602,20 +630,28 @@ def verify_affiliate_email(code: str, status: str) -> dict | None:
 	return get_affiliate(code)
 
 
-def set_affiliate_payout(code: str, method: str, payout_to: str) -> dict | None:
+def set_affiliate_payout(code: str, method: str, payout_to: str, **rail) -> dict | None:
 	"""How this affiliate wants to be paid, as they set it themselves.
 
-	Deliberately does not touch `stripe_account` or `stripe_ready`. Someone who
-	switches to being paid by hand and later switches back should not have to go
-	through Stripe's identity checks a second time for an account that still
-	exists and is still verified.
+	Deliberately does not clear the other rails' details. Someone who switches to
+	being paid by hand and later switches back should not have to go through
+	Stripe's identity checks — or retype an IBAN Wise has already validated — for
+	a destination that still exists and still works. Only `payout_method` decides
+	which one is used; the rest sit there costing nothing.
+
+	`rail` carries whichever of `paypal_email`, `wise_recipient`, `wise_currency`
+	and `wise_details` this particular save is setting. Passing none of them, as
+	the manual and Stripe paths do, leaves all four exactly as they were.
 	"""
 	code = normalise_code(code)
+	allowed = ("paypal_email", "wise_recipient", "wise_currency", "wise_details")
+	extra = {k: v for k, v in rail.items() if k in allowed and v is not None}
+
+	sets = "payout_method = ?, payout_to = ?" + "".join(f", {k} = ?" for k in extra)
+	values = [method, (payout_to or "").strip()[:300], *extra.values(), code]
+
 	with db() as conn:
-		conn.execute(
-			"UPDATE affiliates SET payout_method = ?, payout_to = ? WHERE code = ?",
-			(method, (payout_to or "").strip()[:300], code),
-		)
+		conn.execute(f"UPDATE affiliates SET {sets} WHERE code = ?", values)
 		log(conn, None, "affiliate_payout", f"{code} via {method}")
 	return get_affiliate(code)
 
@@ -777,6 +813,15 @@ def mark_referrals_paid(
 	paying the same commission twice."""
 	with db() as conn:
 		now = int(time.time())
+		codes = {
+			r["code"]
+			for r in conn.execute(
+				"SELECT DISTINCT code FROM referrals WHERE id IN (%s)"
+				% ",".join("?" * len(ids)),
+				[int(i) for i in ids],
+			)
+		} if ids else set()
+
 		marked = 0
 		for rid in ids:
 			cur = conn.execute(
@@ -787,7 +832,61 @@ def mark_referrals_paid(
 			marked += cur.rowcount
 		if marked:
 			log(conn, None, "referrals_paid", f"{marked} rows via {how} {detail}".strip())
+
+		# An outstanding "please pay me" is answered by the money, in the same
+		# transaction that records it — an admin who has just paid somebody should
+		# not also have to remember to clear a flag. Only when nothing payable is
+		# left: settling part of what was asked for leaves the ask standing, which
+		# is the honest state of it.
+		for code in codes:
+			left = conn.execute(
+				"SELECT COUNT(*) AS n FROM referrals"
+				" WHERE code = ? AND status = 'pending' AND due_at <= ?",
+				(code, now),
+			).fetchone()["n"]
+			if not left:
+				conn.execute(
+					"UPDATE affiliates SET payout_requested_at = NULL, payout_request_note = NULL"
+					" WHERE code = ? AND payout_requested_at IS NOT NULL",
+					(code,),
+				)
 		return marked
+
+
+def request_payout(code: str, note: str = "") -> dict | None:
+	"""Record that an affiliate has asked to be paid.
+
+	The first ask wins. Pressing the button again while one is still open keeps
+	the original timestamp, so the admin list stays ordered by who has been
+	waiting longest rather than by who pressed it most recently — otherwise the
+	most impatient person is always at the top and the one waiting three weeks is
+	always at the bottom.
+	"""
+	code = normalise_code(code)
+	with db() as conn:
+		cur = conn.execute(
+			"UPDATE affiliates SET payout_requested_at = COALESCE(payout_requested_at, ?),"
+			" payout_request_note = COALESCE(NULLIF(payout_request_note, ''), ?)"
+			" WHERE code = ?",
+			(int(time.time()), (note or "").strip()[:300], code),
+		)
+		if not cur.rowcount:
+			return None
+		log(conn, None, "payout_requested", f"{code} {note}".strip())
+	return get_affiliate(code)
+
+
+def clear_payout_request(code: str) -> None:
+	"""Drop the flag without paying anything — for a request the owner has dealt
+	with some other way. It touches no referral row, so nothing about what is owed
+	changes."""
+	with db() as conn:
+		conn.execute(
+			"UPDATE affiliates SET payout_requested_at = NULL, payout_request_note = NULL"
+			" WHERE code = ?",
+			(normalise_code(code),),
+		)
+		log(conn, None, "payout_request_cleared", code)
 
 
 def payable(code: str) -> list[dict]:
@@ -836,7 +935,11 @@ def affiliate_summary() -> list[dict]:
 			FROM affiliates a
 			LEFT JOIN referrals r ON r.code = a.code
 			GROUP BY a.code
-			ORDER BY due DESC, sales DESC, a.created_at DESC
+			-- Anyone who has actually asked to be paid comes first. The button
+			-- exists so the owner notices; sorting it into the middle of the table
+			-- by amount is how it goes unnoticed.
+			ORDER BY (a.payout_requested_at IS NOT NULL) DESC, a.payout_requested_at ASC,
+			         due DESC, sales DESC, a.created_at DESC
 			""",
 			{"now": now},
 		).fetchall()

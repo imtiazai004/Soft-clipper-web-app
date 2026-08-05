@@ -26,7 +26,7 @@ from fastapi import Body, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
-from . import bank_payments, crypto, mail, settings, store, stripe_api
+from . import bank_payments, crypto, mail, payouts, settings, store, stripe_api, wise_api
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("licence")
@@ -708,8 +708,11 @@ def admin_affiliates(x_admin_token: str = Header("")):
 		"hold_days": config["holdDays"],
 		"programme_open": config["enabled"],
 		# The page hides the automatic-payout controls when this is false rather
-		# than offering a button that can only fail.
+		# than offering a button that can only fail. Kept alongside `rails` rather
+		# than replaced by it: an admin page cached in somebody's browser from
+		# before this existed still reads it.
 		"stripe_payouts": stripe_api.configured(),
+		"rails": payouts.available(),
 		# So the page can say why nobody is signing up, when the reason is that
 		# the form is switched off.
 		"self_signup": bool(config["enabled"]) and bool(config.get("selfSignup", True)),
@@ -737,8 +740,8 @@ def admin_add_affiliate(body: dict = Body(...), x_admin_token: str = Header(""))
 		raise HTTPException(400, "rate_pct must be between 0 and 100")
 
 	method = body.get("payout_method", "manual")
-	if method not in ("manual", "stripe"):
-		raise HTTPException(400, "payout_method must be 'manual' or 'stripe'")
+	if method not in payouts.METHODS:
+		raise HTTPException(400, "payout_method must be one of " + ", ".join(payouts.METHODS))
 
 	return {
 		"ok": True,
@@ -810,20 +813,25 @@ def admin_affiliate_refresh(code: str, x_admin_token: str = Header("")):
 
 @app.post("/api/admin/affiliates/{code}/pay")
 def admin_pay_affiliate(code: str, x_admin_token: str = Header("")):
-	"""Send everything owed to a Stripe-connected affiliate, in one transfer.
+	"""Send everything owed to an affiliate, by whichever rail they chose.
 
-	Only for `payout_method = 'stripe'`. Manual affiliates go through
-	`/referrals/paid`, which records a payment made elsewhere rather than making
-	one — the money for those leaves Wise or PayPal, not this endpoint.
+	One endpoint for all three automatic rails rather than one each. What is owed,
+	which rows, and marking them afterwards is identical whoever moves the money —
+	only the provider differs, and that difference lives in `payouts.send`. Two
+	endpoints would be two copies of the part that must never disagree.
+
+	Manual affiliates go through `/referrals/paid`, which records a payment made
+	elsewhere rather than making one.
 	"""
 	_require_admin(x_admin_token)
 	affiliate = store.get_affiliate(code)
 	if not affiliate:
 		raise HTTPException(404, "Unknown affiliate")
-	if affiliate["payout_method"] != "stripe" or not affiliate["stripe_account"]:
+	# Asked before "is anything due", and in that order deliberately: pressing Pay
+	# on somebody who is paid by hand is a misunderstanding about *them*, and
+	# answering it with "nothing is due" would be true and useless.
+	if affiliate["payout_method"] not in payouts.AUTOMATIC:
 		raise HTTPException(400, "This affiliate is paid by hand — send the money, then mark it paid.")
-	if not affiliate["stripe_ready"]:
-		raise HTTPException(400, "Stripe has not finished verifying this affiliate yet.")
 
 	rows = store.payable(code)
 	if not rows:
@@ -835,30 +843,36 @@ def admin_pay_affiliate(code: str, x_admin_token: str = Header("")):
 
 	amount = sum(r["commission"] for r in rows)
 	ids = [r["id"] for r in rows]
-	# The key is derived from exactly what is being paid. A retry after a timeout
-	# sends the identical request and Stripe returns the original transfer
-	# instead of making a second one; a later payout covers different rows, so it
-	# gets a different key and goes through.
-	idem = f"sc-payout-{code}-{min(ids)}-{max(ids)}-{amount}"
 
 	try:
-		transfer = stripe_api.create_transfer(
-			affiliate["stripe_account"],
-			amount,
-			currencies.pop(),
-			idempotency_key=idem,
-			description=f"Soft Clipper commission — {len(ids)} sale(s)",
-		)
-	except stripe_api.StripeError as exc:
+		sent = payouts.send(dict(affiliate), amount, currencies.pop(), ids)
+	except payouts.PayoutError as exc:
 		# Nothing is marked paid. The rows stay payable and the admin can retry,
 		# which is the right way round: a row wrongly left open is a second
 		# payment attempt, a row wrongly closed is an affiliate who never gets
-		# paid and has no way of knowing.
+		# paid and has no way of knowing. Retrying is safe because every rail is
+		# handed the same reference and turns it into its own idempotency key.
 		raise HTTPException(400, str(exc)) from exc
 
-	marked = store.mark_referrals_paid(ids, how="stripe", transfer_id=transfer.get("id", ""))
-	log.info("paid %s %s to %s via %s", amount, transfer.get("currency"), code, transfer.get("id"))
-	return {"ok": True, "amount": amount, "rows": marked, "transfer": transfer.get("id")}
+	marked = store.mark_referrals_paid(ids, how=sent["how"], transfer_id=sent["id"])
+	log.info("paid %s to %s via %s %s", amount, code, sent["how"], sent["id"])
+	return {"ok": True, "amount": amount, "rows": marked, "how": sent["how"], "transfer": sent["id"]}
+
+
+@app.post("/api/admin/affiliates/{code}/payout-request")
+def admin_clear_payout_request(code: str, x_admin_token: str = Header("")):
+	"""Take the "asked to be paid" flag off a row.
+
+	Paying clears it on its own, so this is for the other endings: money sent
+	outside this service, or an affiliate told why not yet. It touches no referral
+	row — nothing about what is owed changes, only whether the dashboard is still
+	asking the owner to look.
+	"""
+	_require_admin(x_admin_token)
+	if not store.get_affiliate(code):
+		raise HTTPException(404, "Unknown affiliate")
+	store.clear_payout_request(code)
+	return {"ok": True}
 
 
 @app.post("/api/admin/affiliates/{code}/status")
@@ -1283,7 +1297,20 @@ def affiliate_me(request: Request):
 			"payout_to": affiliate["payout_to"] or "",
 			"stripe_account": bool(affiliate["stripe_account"]),
 			"stripe_ready": bool(affiliate["stripe_ready"]),
+			"paypal_email": affiliate["paypal_email"] or "",
+			"wise_currency": affiliate["wise_currency"] or "",
+			# Whether there is a Wise account on file, not which one. The page only
+			# needs to know if it has to ask again.
+			"wise_ready": bool(affiliate["wise_recipient"]),
+			# One answer to "would pressing Pay work", worked out by the same
+			# function the admin page's button uses, so the two screens cannot tell
+			# the two people in the conversation different things.
+			"payout_ready": payouts.ready_for(dict(affiliate)),
 			"decided_note": affiliate["decided_note"] or "",
+			# 0 when they have not asked. The page shows the date back to them,
+			# because "we have your request" is the entire point of the button —
+			# one that forgets it was pressed is a button people press again.
+			"payout_requested_at": affiliate["payout_requested_at"] or 0,
 		},
 		"link": _ref_link(code),
 		"clicks": clicks,
@@ -1312,7 +1339,9 @@ def affiliate_me(request: Request):
 		"programme": {
 			"open": bool(config["enabled"]),
 			"hold_days": int(config["holdDays"]),
+			# Kept for a page cached from before there was more than one rail.
 			"stripe_payouts": stripe_api.configured(),
+			"rails": payouts.available(),
 		},
 	}
 
@@ -1322,30 +1351,205 @@ def affiliate_me(request: Request):
 def affiliate_set_payout(request: Request, body: dict = Body(...)):
 	"""Where the affiliate wants their money sent.
 
-	This is the part of the programme that has to work from anywhere. Stripe
-	pays out to around fifty countries and to nobody else, so an affiliate in
-	Pakistan, Bangladesh or Nigeria picks `manual` and writes down a Wise or
-	PayPal address — the same commission, on the same schedule, sent by hand.
+	This is the part of the programme that has to work from anywhere, and the
+	four methods exist because no one provider does:
+
+	  stripe   automatic, but only where Stripe will open an account — about
+	           fifty countries, and not Pakistan, Bangladesh or Nigeria.
+	  paypal   automatic, and needs nothing from them but an email address.
+	  wise     automatic, into an ordinary **bank account** in around 160
+	           countries. They do not need a Wise account of their own; this is
+	           the rail that reaches the people the other two refuse.
+	  manual   we send it ourselves. Always available, and it has to be: there is
+	           no set of providers that covers everybody, and an affiliate we
+	           cannot pay is an affiliate we should not have signed up.
+
+	Only what this save is setting is written. Switching to being paid by hand
+	does not throw away a verified Stripe account or a validated Wise recipient,
+	so switching back later is one click rather than the identity checks again.
 	"""
 	affiliate = current_affiliate(request)
 	method = (body.get("payout_method") or "").strip().lower()
-	if method not in ("manual", "stripe"):
-		raise HTTPException(400, "Choose either automatic Stripe payouts or being paid by hand.")
+	if method not in payouts.METHODS:
+		raise HTTPException(400, "Pick one of the payout methods on the page.")
 
-	payout_to = (body.get("payout_to") or "").strip()
-	if method == "manual" and not payout_to:
-		raise HTTPException(
-			400, "Tell us where to send it — a Wise or PayPal email, or account details."
-		)
-	if method == "stripe" and not stripe_api.configured():
+	rails = payouts.available()
+	if method in payouts.AUTOMATIC and not rails.get(method):
 		raise HTTPException(
 			503,
-			"Automatic Stripe payouts are not switched on yet. Choose paying by hand for now — "
-			"you will be paid exactly the same, we just send it ourselves.",
+			f"Automatic {method.title()} payouts are not switched on yet. Choose paying by hand for "
+			"now — you will be paid exactly the same, we just send it ourselves.",
 		)
 
-	store.set_affiliate_payout(affiliate["code"], method, payout_to if method == "manual" else "")
+	if method == "manual":
+		payout_to = (body.get("payout_to") or "").strip()
+		if not payout_to:
+			raise HTTPException(
+				400, "Tell us where to send it — a Wise or PayPal email, or account details."
+			)
+		store.set_affiliate_payout(affiliate["code"], method, payout_to)
+		return {"ok": True}
+
+	if method == "stripe":
+		# The destination is the connected account, which onboarding creates. The
+		# line here is only what the admin table reads.
+		store.set_affiliate_payout(affiliate["code"], method, "Stripe (connected account)")
+		return {"ok": True}
+
+	if method == "paypal":
+		email = (body.get("paypal_email") or "").strip().lower()[:200]
+		if not _looks_like_email(email):
+			raise HTTPException(400, "That does not look like a PayPal email address.")
+		store.set_affiliate_payout(
+			affiliate["code"], method, f"PayPal: {email}", paypal_email=email
+		)
+		return {"ok": True}
+
+	# Wise. The account is created at Wise **now**, while the affiliate is looking
+	# at the form, so a wrong IBAN is refused in Wise's own words naming the field.
+	# Left until payout time it would surface days later as a failed transfer, to
+	# the one person who cannot fix it.
+	currency = (body.get("wise_currency") or "").strip().upper()[:3]
+	account_type = (body.get("wise_type") or "").strip()
+	holder = (body.get("wise_holder") or "").strip()[:120]
+	details = body.get("wise_details") or {}
+	if not currency or not account_type or not isinstance(details, dict) or not details:
+		raise HTTPException(400, "Choose a currency and fill in the account details.")
+	if not holder:
+		raise HTTPException(400, "The account holder's full name is required, as the bank has it.")
+
+	# Wise-to-Wise only, when the owner has set it that way. Enforced here and not
+	# only in the form: the form is what an honest browser sends, and this is what
+	# decides where money goes.
+	if wise_api.WISE_ONLY:
+		if account_type != "email" or not _looks_like_email(str(details.get("email") or "")):
+			raise HTTPException(
+				400,
+				"We pay Wise accounts only, so this needs the email address on your Wise account. "
+				"If you do not have one, choose being paid by hand instead — same commission.",
+			)
+
+	try:
+		account = wise_api.create_recipient(currency, account_type, holder, details)
+	except wise_api.WiseError as exc:
+		# Wise's own message names the field it did not like. That is the whole
+		# value of validating here instead of in a regex of our own.
+		raise HTTPException(400, str(exc)) from exc
+
+	store.set_affiliate_payout(
+		affiliate["code"],
+		method,
+		wise_api.describe(currency, details),
+		wise_recipient=str(account.get("id", "")),
+		wise_currency=currency,
+		wise_details=wise_api.redact(details),
+	)
 	return {"ok": True}
+
+
+@app.get("/api/partner/wise/fields")
+@app.get("/api/affiliate/wise/fields")
+def affiliate_wise_fields(request: Request, currency: str = ""):
+	"""What Wise needs to know about a bank account in this currency.
+
+	Asked of Wise and handed to the browser to render, rather than kept as a table
+	in this repository. A bank account is a different shape in every country —
+	IBAN here, sort code and account number there, routing number and a postal
+	address somewhere else — and a table of our own would be a guess that is
+	quietly wrong for the currencies nobody here has tested. Wise supplies the
+	field names, the allowed values and even the validation pattern, so the form
+	is defined by the people who will reject the account.
+	"""
+	current_affiliate(request)
+	currency = (currency or "").strip().upper()[:3]
+	if len(currency) != 3:
+		raise HTTPException(400, "Pick a currency first.")
+	if not wise_api.configured():
+		raise HTTPException(503, "Wise payouts are not switched on.")
+
+	# Wise-to-Wise takes an email address in every currency, so there is nothing to
+	# ask Wise — and asking anyway would spend a quote to be told what we already
+	# know.
+	if wise_api.WISE_ONLY:
+		return {"currency": currency, "types": wise_api.email_requirement()}
+
+	try:
+		# Requirements are quote-scoped at Wise's end, so one has to exist first.
+		# A small nominal amount: this quote is never funded, it is only asked what
+		# it would need, and the answer does not depend on the size.
+		quoted = wise_api.quote(currency, 10000)
+		return {"currency": currency, "types": wise_api.account_requirements(quoted.get("id", ""))}
+	except wise_api.WiseError as exc:
+		raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/partner/payout/request")
+@app.post("/api/affiliate/payout/request")
+def affiliate_request_payout(request: Request, body: dict = Body(default={})):
+	""""Please send me what I have earned."
+
+	Moves no money, and is not meant to. Paying is still the owner pressing a
+	button — see the note at the top of the sign-up section, which this does not
+	weaken. What it changes is who has to start the conversation: before it, an
+	affiliate with commission sitting past its hold could only email and hope, and
+	waiting with no way to ask reads as having been forgotten.
+
+	Refused when there is nothing payable, and when there is nowhere to send it.
+	Both refusals say which, because a request the owner cannot act on gets
+	ignored, and being ignored is exactly what the affiliate already suspects.
+	"""
+	affiliate = current_affiliate(request)
+	code = affiliate["code"]
+	# Generous, and per affiliate rather than per IP: this is somebody signed in
+	# asking for their own money, and the only thing being protected against is a
+	# button held down, which would otherwise be a mailbox full of the same notice.
+	_throttle(f"payout:{code}", limit=6, window=3600)
+
+	rows = store.payable(code)
+	amount = sum(r["commission"] for r in rows)
+	if not amount:
+		config = _affiliate_settings()
+		raise HTTPException(
+			400,
+			f"Nothing is payable yet. Commission is held for {int(config['holdDays'])} days after "
+			"each sale so a refund can still cancel it — your dashboard shows the date each one "
+			"clears.",
+		)
+
+	if affiliate["payout_method"] in payouts.AUTOMATIC:
+		if not payouts.ready_for(dict(affiliate)):
+			raise HTTPException(
+				400,
+				"Finish setting up your payout method first, or switch to being paid by hand — we "
+				"cannot send anything until one of the two is in place.",
+			)
+	elif not (affiliate["payout_to"] or "").strip():
+		raise HTTPException(
+			400,
+			"Tell us where to send it first — a Wise or PayPal email, or your account details, "
+			"in the box above.",
+		)
+
+	note = (body.get("note") or "").strip()[:300]
+	# Idempotent on purpose. Asking twice is not an error and must not read as one:
+	# the answer to "did that work?" is the date they already asked, not a refusal.
+	already = bool(affiliate["payout_requested_at"])
+	updated = store.request_payout(code, note) or affiliate
+	currency = rows[0]["currency"] if rows else "usd"
+
+	if not already:
+		mail.notify_owner_payout_request(
+			updated, amount, currency, note, ADMIN_URL, int(_affiliate_settings()["holdDays"])
+		)
+		log.info("affiliate %s asked to be paid %s %s", code, amount, currency)
+
+	return {
+		"ok": True,
+		"requested_at": updated["payout_requested_at"],
+		"already": already,
+		"amount": amount,
+		"currency": currency,
+	}
 
 
 def _stripe_onboarding(affiliate: dict, country: str) -> dict:
@@ -1386,6 +1590,36 @@ def affiliate_stripe(request: Request, body: dict = Body(default={})):
 		# exactly what this person needs to read, and it is the cue to pick being
 		# paid by hand instead.
 		raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/partner/stripe/refresh")
+@app.post("/api/affiliate/stripe/refresh")
+def affiliate_stripe_refresh(request: Request):
+	"""Ask Stripe whether this affiliate is verified yet, on their behalf.
+
+	`account.updated` normally answers this without anyone asking. This exists for
+	the two cases where it does not: the webhook was never registered for Connect
+	events, or one was missed — and in both, the affiliate is looking at a page
+	that says Stripe has not finished checking them when Stripe finished an hour
+	ago. Reading an account is a safe call; it moves nothing.
+	"""
+	affiliate = current_affiliate(request)
+	if not affiliate["stripe_account"]:
+		raise HTTPException(400, "You have not started Stripe onboarding yet.")
+	try:
+		acct = stripe_api.account(affiliate["stripe_account"])
+	except stripe_api.StripeError as exc:
+		raise HTTPException(400, str(exc)) from exc
+
+	ready = stripe_api.payouts_enabled(acct)
+	store.set_affiliate_stripe(affiliate["code"], affiliate["stripe_account"], ready)
+	return {
+		"ok": True,
+		"ready": ready,
+		# Stripe's own list of what it is still waiting for, in its own words. It
+		# names the document, which is the only thing that gets somebody unstuck.
+		"needs": (acct.get("requirements") or {}).get("currently_due", []),
+	}
 
 
 @app.post("/api/partner/signout")

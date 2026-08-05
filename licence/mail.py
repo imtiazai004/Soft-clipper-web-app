@@ -329,3 +329,45 @@ Dashboard: {admin_url}
 """,
 		what="affiliate signup notice",
 	)
+
+
+def notify_owner_payout_request(
+	affiliate: dict, amount: int, currency: str, note: str, admin_url: str, hold_days: int = 30
+) -> bool:
+	"""Tell the owner somebody has asked to be paid.
+
+	The dashboard shows the same thing, but only to whoever opens it. This is the
+	half of the feature that makes it work: the affiliate's whole reason for
+	pressing the button is that they think they have been forgotten, and a flag
+	nobody sees until next time they log in proves them right.
+
+	Where to send it is in the message. Nearly every payout is a Wise transfer
+	made from a phone, and having to open the dashboard to find the address is the
+	difference between paying somebody now and paying them at the weekend.
+	"""
+	method = affiliate.get("payout_method") or "manual"
+	how = (
+		f"{method.title()} — press Pay on the dashboard"
+		if method != "manual"
+		else f"By hand, to: {affiliate.get('payout_to') or 'NOTHING ON FILE'}"
+	)
+	return _send(
+		OWNER_EMAIL,
+		f"{affiliate.get('code', '')} asked to be paid "
+		f"({amount / 100:.2f} {(currency or 'usd').upper()})",
+		f"""{affiliate.get("name", "")} <{affiliate.get("email", "")}> has asked for their commission.
+
+  Code     {affiliate.get("code", "")}
+  Payable  {amount / 100:.2f} {(currency or "usd").upper()}
+  Send it  {how}
+  They say {note or "nothing in particular"}
+
+This is only what has come through the {hold_days}-day hold — anything newer
+than that is not in the figure above and is not owed yet.
+
+Dashboard: {admin_url}
+
+— Soft Clipper
+""",
+		what="payout request notice",
+	)

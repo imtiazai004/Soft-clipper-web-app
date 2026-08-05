@@ -309,9 +309,35 @@
 					<div id="stripeBox" hidden>
 						<p class="hint" style="margin-top:0" id="stripeState"></p>
 						<button id="stripeBtn" onclick="connectStripe()">Set up Stripe payouts</button>
+						<button id="stripeCheck" onclick="checkStripe()" hidden>Check again</button>
+					</div>
+					<div id="paypalBox" hidden>
+						<label class="field grow">
+							<span>Your PayPal email</span>
+							<input id="paypalEmail" type="email" placeholder="you@example.com">
+						</label>
+						<p class="hint">
+							The address on your PayPal account. If it is not one PayPal knows, the money
+							waits there for thirty days for you to claim it and then comes back to us —
+							so it is worth getting right.
+						</p>
+					</div>
+					<div id="wiseBox" hidden>
+						<label class="field grow">
+							<span>Which currency do you want to be paid in?</span>
+							<input id="wiseCurrency" placeholder="PKR, EUR, GBP, INR…" maxlength="3"
+								oninput="this.value = this.value.toUpperCase()" onchange="loadWiseFields()">
+						</label>
+						<p class="hint" id="wiseHint"></p>
+						<div id="wiseFields"></div>
 					</div>
 					<div class="row" style="margin-top:14px">
 						<button class="primary" onclick="savePayout()">Save</button>
+					</div>
+
+					<div id="askBox" style="margin-top:18px;border-top:1px solid var(--line);padding-top:16px">
+						<button id="askBtn" onclick="requestPayout()">Ask to be paid</button>
+						<p class="hint" id="askHint"></p>
 					</div>
 				</section>
 
@@ -593,42 +619,142 @@ function render() {
 	renderSales();
 }
 
+/** What each automatic rail is, in the words of somebody deciding between them.
+ *
+ * Written from the reader's side rather than ours: what they need, where it
+ * reaches, and — for the two that do not reach everywhere — which countries are
+ * out, said plainly. Somebody in Pakistan finding that out after filling in a
+ * form is somebody who thinks we wasted their time.
+ */
+const RAILS = {
+	wise: {
+		title: "Automatically, through Wise",
+		blurb: "",  // filled in below: it says something different in each mode
+	},
+	paypal: {
+		title: "Automatically, to your PayPal",
+		blurb: "Just your PayPal email address, nothing else to set up. PayPal reaches most of " +
+			"the world, though not everywhere — Pakistan among the nots.",
+	},
+	stripe: {
+		title: "Automatically, through Stripe",
+		blurb: "Stripe collects your details and pays you directly. Available in around fifty " +
+			"countries — not Pakistan, Bangladesh or Nigeria, among others.",
+	},
+};
+
 function renderPayout() {
 	const a = me.affiliate;
-	const stripeOn = me.programme.stripe_payouts;
+	const rails = me.programme.rails || { stripe: me.programme.stripe_payouts };
 
-	// Only offered when it can actually work. A radio button that leads to "not
+	// The Wise rail is two different offers depending on how the owner set it up,
+	// and the difference decides whether this person can use it at all. Saying it
+	// here, in the option itself, is the difference between reading one sentence
+	// and filling in a form that is then refused.
+	RAILS.wise.title = rails.wise_only
+		? "Automatically, to your Wise account"
+		: "Automatically, into your bank account (Wise)";
+	RAILS.wise.blurb = rails.wise_only
+		? "Wise to Wise: instant, and the money is in your Wise balance rather than waiting on a " +
+			"bank transfer. You need a Wise account of your own — Wise opens those in fewer " +
+			"countries than it sends to, so if you cannot have one, pick being paid by hand below."
+		: "Straight to your own bank, in your own currency, in around 160 countries — including " +
+			"the ones Stripe and PayPal do not reach. You do not need a Wise account; we send it, " +
+			"your bank receives it.";
+
+	// Only what can actually work is offered. A radio button that leads to "not
 	// switched on" is worse than not showing it: it reads as the good option
 	// being withheld from this particular person.
-	$("payoutChoices").innerHTML = `
+	//
+	// Order is deliberate — the widest-reaching rail first, being paid by hand
+	// last. Most people take the first thing that fits.
+	const on = ["wise", "paypal", "stripe"].filter((r) => rails[r]);
+	$("payoutChoices").innerHTML =
+		on.map((r) => `
 		<label class="choice">
-			<input type="radio" name="pm" value="manual" ${a.payout_method !== "stripe" ? "checked" : ""} onchange="payoutChanged()">
-			<span><strong>Paid by hand — Wise, PayPal or bank transfer</strong>
-			<p>Works from anywhere in the world. We send it ourselves on the same schedule.</p></span>
+			<input type="radio" name="pm" value="${r}" ${a.payout_method === r ? "checked" : ""} onchange="payoutChanged()">
+			<span><strong>${esc(RAILS[r].title)}</strong>
+			<p>${esc(RAILS[r].blurb)}</p></span>
+		</label>`).join("") + `
+		<label class="choice">
+			<input type="radio" name="pm" value="manual" ${!on.includes(a.payout_method) ? "checked" : ""} onchange="payoutChanged()">
+			<span><strong>Paid by hand — Wise, PayPal, Payoneer or bank transfer</strong>
+			<p>Works from anywhere at all, whatever the automatic options say. We send it
+			ourselves, same commission and same schedule — it just is not instant.</p></span>
 		</label>
-		${stripeOn ? `
-		<label class="choice">
-			<input type="radio" name="pm" value="stripe" ${a.payout_method === "stripe" ? "checked" : ""} onchange="payoutChanged()">
-			<span><strong>Automatically, through Stripe</strong>
-			<p>Stripe collects your details and pays you directly. Available in around fifty
-			countries — not Pakistan, Bangladesh or Nigeria, among others. If yours is not one,
-			pick the option above; the commission is identical.</p></span>
-		</label>` : `
+		${on.length ? "" : `
 		<p class="hint" style="margin-top:0">
-			Automatic Stripe payouts are not switched on yet, so everyone is paid by hand for
-			now. Same commission, same schedule.
+			Automatic payouts are not switched on yet, so everyone is paid by hand for now.
+			Same commission, same schedule.
 		</p>`}
 	`;
-	$("payoutTo").value = a.payout_to || "";
+	$("payoutTo").value = a.payout_method === "manual" ? a.payout_to || "" : "";
+	$("paypalEmail").value = a.paypal_email || "";
+	$("wiseCurrency").value = a.wise_currency || "";
+	$("wiseHint").textContent = rails.wise_only
+		? "The currency your Wise balance should receive, and the email address on that Wise " +
+			"account. Nothing else — no bank details, and nothing for you to wait for."
+		: "Your own bank account, in your own country. Type the currency and we will ask Wise " +
+			"exactly what your country's banks need.";
 	payoutChanged();
+	renderAsk();
+}
+
+/** The "ask to be paid" button, and the four things it can honestly say.
+ *
+ * Every state that is not "you can press this" explains itself and, where there
+ * is one, names the fix. A greyed-out button with no reason beside it is read as
+ * the money being withheld, which is the opposite of what this card is for.
+ */
+function renderAsk() {
+	const a = me.affiliate;
+	const t = me.totals;
+	const btn = $("askBtn");
+	// For an automatic rail this is the server's own answer to "would pressing
+	// Pay work" — the same function the admin button uses, so this page cannot
+	// promise something the other one refuses.
+	const noDestination = a.payout_method === "manual"
+		? !(a.payout_to || "").trim()
+		: !a.payout_ready;
+
+	if (a.payout_requested_at) {
+		btn.hidden = true;
+		$("askHint").textContent =
+			`You asked on ${new Date(a.payout_requested_at * 1000).toLocaleDateString("en-GB")}. ` +
+			"We have it, and it clears from here the moment the money is sent. Payouts are sent by " +
+			"hand, so give it a few days before chasing.";
+		return;
+	}
+
+	btn.hidden = false;
+	btn.disabled = !t.due || noDestination;
+	btn.classList.toggle("primary", !btn.disabled);
+
+	$("askHint").textContent = !t.due
+		? `Nothing is payable yet — commission clears ${me.programme.hold_days} days after each sale. ` +
+			"The dates are in the table below."
+		: noDestination
+			? "Fill in where the money should go above and save — this turns on once we have somewhere to send it."
+			: a.payout_method === "manual"
+				? `You have ${money(t.due, t.currency)} ready. Asking tells us to send it; ` +
+					"we do it by hand, so it is not instant."
+				: `You have ${money(t.due, t.currency)} ready, and it goes out automatically once we ` +
+					"release it. Asking is what tells us to.";
 }
 
 function payoutChanged() {
 	const picked = document.querySelector('input[name="pm"]:checked');
-	const stripe = picked && picked.value === "stripe";
-	$("manualBox").hidden = stripe;
-	$("stripeBox").hidden = !stripe;
-	if (!stripe) return;
+	const method = picked ? picked.value : "manual";
+	$("manualBox").hidden = method !== "manual";
+	$("stripeBox").hidden = method !== "stripe";
+	$("paypalBox").hidden = method !== "paypal";
+	$("wiseBox").hidden = method !== "wise";
+	// Wise's form is fetched from Wise, so it is only asked for when it is being
+	// looked at — and only once, or every click on the radio would be a call.
+	if (method === "wise" && $("wiseCurrency").value.trim() && !$("wiseFields").dataset.currency) {
+		loadWiseFields();
+	}
+	if (method !== "stripe") return;
 
 	const a = me.affiliate;
 	$("stripeState").textContent = a.stripe_ready
@@ -638,20 +764,155 @@ function payoutChanged() {
 			: "You will be handed over to Stripe, who collect your identity and bank details. We never see either.";
 	$("stripeBtn").textContent = a.stripe_account ? "Continue with Stripe" : "Set up Stripe payouts";
 	$("stripeBtn").hidden = !!a.stripe_ready;
+	// Offered only in the one state it helps: Stripe has them, has not said yes
+	// yet, and the page would otherwise keep saying so until a webhook arrives —
+	// including when no webhook is ever going to.
+	$("stripeCheck").hidden = !a.stripe_account || !!a.stripe_ready;
+}
+
+async function checkStripe() {
+	try {
+		const d = await api("/api/partner/stripe/refresh", { method: "POST" });
+		say(
+			d.ready
+				? "Stripe has verified you. Payouts can be sent automatically now."
+				: "Stripe is still waiting on: " + (d.needs.join(", ") || "a check on their side") +
+					". Continue with Stripe to finish it.",
+			d.ready,
+		);
+		load();
+	} catch (e) {
+		say(e.message, false);
+	}
+}
+
+/** Ask Wise what a bank account in this currency looks like, and draw that.
+ *
+ * The fields are not ours and are deliberately not hard-coded here: a bank
+ * account is a different shape in every country, and a list kept in this file
+ * would be quietly wrong for every currency nobody here has tested. Wise sends
+ * the labels, the allowed values and its own validation pattern — so the form is
+ * defined by the people who will reject the account.
+ */
+async function loadWiseFields() {
+	const currency = $("wiseCurrency").value.trim().toUpperCase();
+	const box = $("wiseFields");
+	if (currency.length !== 3) {
+		box.innerHTML = "";
+		delete box.dataset.currency;
+		return;
+	}
+
+	box.innerHTML = '<p class="hint">Asking Wise what your banks need…</p>';
+	try {
+		const d = await api(`/api/partner/wise/fields?currency=${encodeURIComponent(currency)}`);
+		wiseTypes = d.types || [];
+		box.dataset.currency = currency;
+	} catch (e) {
+		box.innerHTML = `<p class="hint">${esc(e.message)}</p>`;
+		delete box.dataset.currency;
+		return;
+	}
+	drawWiseFields();
+}
+
+let wiseTypes = [];
+
+function drawWiseFields() {
+	const box = $("wiseFields");
+	if (!wiseTypes.length) {
+		box.innerHTML = '<p class="hint">Wise does not pay into that currency. Try another, or pick being paid by hand.</p>';
+		return;
+	}
+
+	// More than one shape is normal — "IBAN" and "local bank details" both reach
+	// the same account in several countries, at different speeds and costs. Their
+	// bank knows which they have; we do not.
+	const chosen = Math.min(Number(box.dataset.type || 0), wiseTypes.length - 1);
+	const picker = wiseTypes.length > 1
+		? `<label class="field grow"><span>How do you have the account?</span>
+			<select id="wiseType" onchange="pickWiseType(this.selectedIndex)">
+				${wiseTypes.map((t, i) => `<option ${i === chosen ? "selected" : ""}>${esc(t.title || t.type)}</option>`).join("")}
+			</select></label>`
+		: "";
+
+	const t = wiseTypes[chosen];
+	box.innerHTML = picker +
+		`<label class="field grow"><span>Account holder's full name</span>
+			<input id="wiseHolder" placeholder="Exactly as your bank has it"></label>` +
+		t.fields.map((f) => {
+			const id = `wf_${f.key}`;
+			if (f.options && f.options.length) {
+				return `<label class="field grow"><span>${esc(f.name)}</span>
+					<select id="${esc(id)}" data-wise="${esc(f.key)}">
+						${f.options.map((o) => `<option value="${esc(o.key)}">${esc(o.name)}</option>`).join("")}
+					</select></label>`;
+			}
+			return `<label class="field grow"><span>${esc(f.name)}${f.required ? "" : " (optional)"}</span>
+				<input id="${esc(id)}" data-wise="${esc(f.key)}" placeholder="${esc(f.example || "")}"></label>`;
+		}).join("") +
+		'<p class="hint">Wise checks these the moment you save, so a typo is caught here rather than by a transfer that fails next week.</p>';
+
+	$("wiseHolder").value = me.affiliate.name || "";
+}
+
+function pickWiseType(index) {
+	$("wiseFields").dataset.type = String(index);
+	drawWiseFields();
 }
 
 async function savePayout() {
 	const picked = document.querySelector('input[name="pm"]:checked');
 	const method = picked ? picked.value : "manual";
-	try {
-		await api("/api/partner/payout", {
-			method: "POST",
-			body: JSON.stringify({ payout_method: method, payout_to: $("payoutTo").value.trim() }),
+	const body = { payout_method: method };
+
+	if (method === "manual") {
+		body.payout_to = $("payoutTo").value.trim();
+	} else if (method === "paypal") {
+		body.paypal_email = $("paypalEmail").value.trim();
+	} else if (method === "wise") {
+		const box = $("wiseFields");
+		const index = Math.min(Number(box.dataset.type || 0), Math.max(wiseTypes.length - 1, 0));
+		const type = wiseTypes[index];
+		if (!type) return say("Type the currency you want to be paid in first.", false);
+		body.wise_currency = $("wiseCurrency").value.trim().toUpperCase();
+		body.wise_type = type.type;
+		body.wise_holder = $("wiseHolder").value.trim();
+		body.wise_details = {};
+		// Empty optional fields are left out rather than sent as "": Wise
+		// validates what it is given, and an empty string is a value it rejects.
+		box.querySelectorAll("[data-wise]").forEach((el) => {
+			if (el.value.trim()) body.wise_details[el.dataset.wise] = el.value.trim();
 		});
+	}
+
+	try {
+		await api("/api/partner/payout", { method: "POST", body: JSON.stringify(body) });
 		say("Saved. That is where your commission goes from now on.", true);
 		load();
 	} catch (e) {
 		say(e.message, false);
+	}
+}
+
+async function requestPayout() {
+	const btn = $("askBtn");
+	btn.disabled = true;
+	try {
+		const d = await api("/api/partner/payout/request", {
+			method: "POST",
+			body: JSON.stringify({ note: "" }),
+		});
+		say(
+			d.already
+				? "You had already asked — we still have it, nothing is lost."
+				: `Asked. We will send ${money(d.amount, d.currency)} and it will show as paid here.`,
+			true,
+		);
+		load();
+	} catch (e) {
+		say(e.message, false);
+		btn.disabled = false;
 	}
 }
 
