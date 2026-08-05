@@ -36,6 +36,41 @@ and `/api/site-config` (what the marketing site reads at build time).
   the update-check rework) the app version the desktop apps get told about —
   see the desktop repo's CLAUDE.md § Release process for the full flow.
 
+## Where the payout work stands (2026-08-05)
+
+Deployed to the server and running. What is *switched on* is a separate question
+from what is *built*, and the difference is where the remaining work is:
+
+| Rail | Built | Live on the server | Blocked on |
+|---|---|---|---|
+| Manual (Wise/PayPal/Payoneer by hand) | ✅ | ✅ always | — |
+| **Wise** (Wise-to-Wise, `WISE_WISE_ONLY=1`) | ✅ | ✅ keys set | **an untested first transfer** |
+| PayPal | ✅ | ❌ off | owner has no PayPal Business account yet |
+| Stripe Connect | ✅ | ❌ off | `STRIPE_SECRET_KEY` never set |
+
+Owner-side steps still outstanding, none of them code:
+
+1. **Fund the Wise balance in USD.** Commission is recorded in the currency the
+   customer paid, and `WISE_SOURCE_CURRENCY=USD`. Wise does not lend — an empty
+   balance is a refused transfer, in Wise's own words, on the admin page.
+2. **Make one small real payout end to end** before an affiliate does. The first
+   live transfer is where anything left over surfaces, and it surfaces more
+   cheaply at $2 than at $200.
+3. Optionally register `account.updated` on the Stripe webhook *if* Stripe
+   Connect is ever switched on — without it a connected affiliate never flips to
+   verified on its own.
+
+Two decisions already taken, worth not re-litigating:
+
+- **`WISE_WISE_ONLY=1` is deliberate.** The owner pays Wise accounts only, not
+  arbitrary bank accounts. It trades reach for simplicity: Wise *sends* to ~160
+  countries but *opens accounts* in far fewer, so Pakistani affiliates — the ones
+  the Wise rail was added for — fall back to manual. Flipping the flag off later
+  changes nothing for anyone already set up.
+- **PayPal is built but intentionally unfunded.** Every rail needs its own float;
+  a Stripe balance cannot fund a PayPal payout. Two rails means money parked in
+  two places, so the second one waits until an affiliate actually asks for it.
+
 ## The affiliate programme
 
 Runs entirely out of `licence/` plus the marketing site — nothing in `core/`,
